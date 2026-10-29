@@ -1,0 +1,1680 @@
+from __future__ import annotations
+
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
+import ctypes
+import functools
+import logging
+import math
+import multiprocessing
+from multiprocessing import shared_memory
+import os
+import pickle
+import struct
+import libtbx
+from libtbx.introspection import number_of_processors
+import numpy as np
+import torch
+
+try:
+    import hdf5plugin  # noqa: F401
+except ImportError:
+    hdf5plugin = None
+
+try:
+    import h5py
+except ImportError:
+    h5py = None
+
+CPU_COUNT = number_of_processors(return_value_if_unknown=1)
+from dxtbx import flumpy
+from dxtbx.format.image import ImageBool
+from dxtbx.imageset import ImageSequence, ImageSet
+from dxtbx.model import ExperimentList
+from iotbx.phil import parse
+
+import dials.extensions
+import dials.util.masking
+from dials.algorithms.spot_finding.factory import (
+    BackgroundGradientFilter,
+    SpotFinderFactory,
+    phil_scope,
+)
+from dials.algorithms.spot_finding.finder import (
+    LaueSpotFinder,
+    SpotFinder,
+    TOFSpotFinder,
+)
+from dials.array_family import flex
+from dials.util import Sorry
+from dials_gpu.spot_finding.connected_components import (
+    GPUFramePixelList,
+    PixelListLabellerGPU,
+    build_shoeboxes_from_gpu_spots,
+    extract_spots_from_labeller_gpu,
+)
+from dials_gpu.spot_finding.filters import (
+    FilterRunnerGPU,
+    PeakCentroidDistanceFilterGPU,
+    SpotDensityFilterGPU,
+)
+from dials_gpu.spot_finding.threshold import (
+    DispersionExtendedSpotFinderThresholdGPU,
+    DispersionSpotFinderThresholdGPU,
+    RadialProfileSpotFinderThresholdGPU,
+    estimate_global_threshold,
+    flex_to_tensor,
+    get_default_device,
+    tensor_to_flex_bool,
+)
+
+logger = logging.getLogger("dials.algorithms.spot_finding.finder")
+ext_logger = logging.getLogger("dials.extensions.dispersion_spotfinder_threshold_ext")
+
+
+_BSHUF_LIB = None
+_BSHUF_POOL: ThreadPoolExecutor | None = None
+_HDF5_GPU_VOLUME_CACHE: OrderedDict[tuple, torch.Tensor] = OrderedDict()
+_HDF5_GPU_MASK_CACHE: OrderedDict[tuple, torch.Tensor] = OrderedDict()
+_HDF5_COMPRESSED_CACHE: OrderedDict[tuple, tuple[list[bytes], int, int, np.dtype]] = OrderedDict()
+_BASE_STATIC_MASK_GPU_CACHE: OrderedDict[tuple, list[torch.Tensor]] = OrderedDict()
+_PINNED_HOST_VOL_CACHE: dict[tuple, torch.Tensor] = {}
+
+
+def _get_bshuf_decompress():
+    global _BSHUF_LIB
+    if _BSHUF_LIB is not None:
+        return _BSHUF_LIB
+    if hdf5plugin is None:
+        return None
+    try:
+        plugin_dir = os.path.join(os.path.dirname(hdf5plugin.__file__), "plugins")
+        lib_path = os.path.join(plugin_dir, "libh5bshuf.so")
+        if not os.path.exists(lib_path):
+            return None
+        lib = ctypes.CDLL(lib_path)
+        fn = lib.bshuf_decompress_lz4
+        fn.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+        ]
+        fn.restype = ctypes.c_int64
+        _BSHUF_LIB = fn
+        return _BSHUF_LIB
+    except Exception:
+        return None
+
+
+def _get_bshuf_pool() -> ThreadPoolExecutor:
+    global _BSHUF_POOL
+    if _BSHUF_POOL is None:
+        _BSHUF_POOL = ThreadPoolExecutor(max_workers=min(8, max(2, CPU_COUNT)))
+    return _BSHUF_POOL
+
+
+def _try_load_hdf5_raw_volume_gpu(
+    imageset, device: torch.device
+) -> torch.Tensor | None:
+    """
+    Fast path for single-panel HDF5/NeXus ImageSequences:
+    - Tier-1 LRU cache: keeps up to 8 uncompressed (B, H, W) int32 volumes on GPU VRAM
+      for zero-overhead RL parameter sweeps.
+    - Tier-2 LRU cache: keeps up to 100 compressed bitshuffle-LZ4 chunk lists in host RAM.
+    - Direct HDF5 chunk read + multithreaded bshuf_decompress_lz4 into contiguous memory.
+    """
+    if h5py is None or not isinstance(imageset, ImageSequence):
+        return None
+    if len(imageset.get_detector()) != 1:
+        return None
+    try:
+        path = imageset.get_path(0)
+    except Exception:
+        return None
+    if not path or not path.endswith((".nxs", ".h5", ".hdf5")):
+        return None
+
+    indices = tuple(imageset.indices())
+    B = len(indices)
+    if B == 0 or B > 64:
+        return None
+    z0 = int(indices[0])
+    if indices != tuple(range(z0, z0 + B)):
+        return None
+
+    dev_key = (device.type, device.index if device.index is not None else 0)
+    gpu_key = (path, z0, B, dev_key)
+    if gpu_key in _HDF5_GPU_VOLUME_CACHE:
+        _HDF5_GPU_VOLUME_CACHE.move_to_end(gpu_key)
+        return _HDF5_GPU_VOLUME_CACHE[gpu_key]
+
+    comp_key = (path, z0, B)
+    comp_entry = _HDF5_COMPRESSED_CACHE.get(comp_key)
+    bshuf_fn = _get_bshuf_decompress()
+
+    if comp_entry is not None and bshuf_fn is not None:
+        _HDF5_COMPRESSED_CACHE.move_to_end(comp_key)
+        chunks, H, W, dtype = comp_entry
+    else:
+        try:
+            with h5py.File(path, "r") as f:
+                if "/entry/data/data" not in f:
+                    return None
+                dset = f["/entry/data/data"]
+                if dset.ndim != 3:
+                    return None
+                _, H, W = dset.shape
+                dtype = dset.dtype
+                if dtype not in (np.uint32, np.int32, np.uint16, np.int16):
+                    return None
+
+                src_dset = None
+                src_z0 = z0
+                if dset.is_virtual:
+                    vs = dset.virtual_sources()
+                    if len(vs) == 1:
+                        v = vs[0]
+                        v_start, v_stride, _, v_block = v.vspace.get_regular_hyperslab()
+                        s_start, s_stride, _, s_block = v.src_space.get_regular_hyperslab()
+                        if (
+                            v_start == (0, 0, 0)
+                            and v_stride == (1, 1, 1)
+                            and s_stride == (1, 1, 1)
+                            and v_block == s_block
+                            and v.file_name == "."
+                            and v.dset_name in f
+                        ):
+                            src_dset = f[v.dset_name]
+                            src_z0 = int(s_start[0]) + z0
+                else:
+                    src_dset = dset
+                    src_z0 = z0
+
+                chunks = None
+                if src_dset is not None and bshuf_fn is not None and src_dset.chunks == (1, H, W):
+                    dcpl = src_dset.id.get_create_plist()
+                    if dcpl.get_nfilters() == 1 and dcpl.get_filter(0)[0] == 32008:
+                        dset_id = src_dset.id
+                        chunks = [
+                            dset_id.read_direct_chunk((src_z0 + i, 0, 0))[1]
+                            for i in range(B)
+                        ]
+                        if len(_HDF5_COMPRESSED_CACHE) >= 100:
+                            _HDF5_COMPRESSED_CACHE.popitem(last=False)
+                        _HDF5_COMPRESSED_CACHE[comp_key] = (chunks, H, W, dtype)
+
+                if chunks is None:
+                    arr = dset[z0 : z0 + B]
+                    if arr.dtype == np.uint32:
+                        arr = arr.view(np.int32)
+                    elif arr.dtype == np.uint16:
+                        arr = arr.astype(np.int32)
+                    vol_t = torch.from_numpy(np.ascontiguousarray(arr)).to(
+                        device=device, non_blocking=True
+                    )
+                    if device.type == "cuda":
+                        if len(_HDF5_GPU_VOLUME_CACHE) >= 8:
+                            _HDF5_GPU_VOLUME_CACHE.popitem(last=False)
+                        _HDF5_GPU_VOLUME_CACHE[gpu_key] = vol_t
+                    return vol_t
+        except Exception:
+            return None
+
+    # Decompress bitshuffle-LZ4 chunks in parallel using thread pool
+    elem_size = int(np.dtype(dtype).itemsize)
+    n_elems = H * W
+    out_dtype = np.int32 if dtype == np.uint32 else dtype
+    pin_key = (B, H, W, out_dtype)
+    pinned_t = _PINNED_HOST_VOL_CACHE.get(pin_key)
+    if pinned_t is None and out_dtype == np.int32 and device.type == "cuda":
+        if len(_PINNED_HOST_VOL_CACHE) >= 2:
+            _PINNED_HOST_VOL_CACHE.clear()
+        pinned_t = torch.empty((B, H, W), dtype=torch.int32, pin_memory=True)
+        _PINNED_HOST_VOL_CACHE[pin_key] = pinned_t
+
+    if pinned_t is not None:
+        out_np = pinned_t.numpy()
+    else:
+        out_np = np.empty((B, H, W), dtype=out_dtype)
+
+    out_base = out_np.ctypes.data
+    frame_nbytes = n_elems * elem_size
+
+    def _decomp_one(i: int):
+        raw_bytes = chunks[i]
+        _, block_size = struct.unpack(">QI", raw_bytes[:12])
+        in_ptr = ctypes.cast(ctypes.c_char_p(raw_bytes), ctypes.c_void_p).value + 12
+        out_ptr = out_base + i * frame_nbytes
+        res = bshuf_fn(in_ptr, out_ptr, n_elems, elem_size, block_size // elem_size)
+        if res < 0:
+            raise RuntimeError(f"bshuf_decompress_lz4 failed with code {res}")
+
+    list(_get_bshuf_pool().map(_decomp_one, range(B)))
+
+    if pinned_t is not None:
+        vol_t = pinned_t.to(device=device, non_blocking=True)
+    else:
+        if out_np.dtype == np.uint16:
+            out_np = out_np.astype(np.int32)
+        vol_t = torch.from_numpy(out_np).to(device=device, non_blocking=True)
+    if device.type == "cuda":
+        if len(_HDF5_GPU_VOLUME_CACHE) >= 8:
+            _HDF5_GPU_VOLUME_CACHE.popitem(last=False)
+        _HDF5_GPU_VOLUME_CACHE[gpu_key] = vol_t
+    return vol_t
+
+
+class DispersionThresholdExtGPU:
+    """
+    GPU replacement for DispersionSpotFinderThresholdExt and DispersionExtendedSpotFinderThresholdExt.
+    """
+
+    def __init__(self, params, extended: bool = True, device: torch.device | None = None):
+        self.params = params
+        self.extended = extended
+        self.device = device or get_default_device()
+
+    def _get_strategy(self, image, mask):
+        params = self.params
+        if params.spotfinder.threshold.dispersion.global_threshold is libtbx.Auto:
+            params.spotfinder.threshold.dispersion.global_threshold = int(
+                estimate_global_threshold(image, mask, device=self.device)
+            )
+            ext_logger.info(
+                "Setting global_threshold: %i",
+                params.spotfinder.threshold.dispersion.global_threshold,
+            )
+
+        cls = (
+            DispersionExtendedSpotFinderThresholdGPU
+            if self.extended
+            else DispersionSpotFinderThresholdGPU
+        )
+        return cls(
+            kernel_size=params.spotfinder.threshold.dispersion.kernel_size,
+            gain=params.spotfinder.threshold.dispersion.gain,
+            mask=params.spotfinder.lookup.mask,
+            n_sigma_b=params.spotfinder.threshold.dispersion.sigma_background,
+            n_sigma_s=params.spotfinder.threshold.dispersion.sigma_strong,
+            min_count=params.spotfinder.threshold.dispersion.min_local,
+            global_threshold=params.spotfinder.threshold.dispersion.global_threshold,
+            device=self.device,
+        )
+
+    def compute_threshold(self, image, mask, **kwargs):
+        strategy = self._get_strategy(image, mask)
+        return strategy.compute_threshold(image, mask, gain=kwargs.get("gain"))
+
+    def compute_threshold_tensor(self, img_t: torch.Tensor, mask_t: torch.Tensor, gain=None, **kwargs) -> torch.Tensor:
+        strategy = self._get_strategy(img_t, mask_t)
+        return strategy.compute_threshold_tensor(img_t, mask_t, gain=gain)
+
+    def compute_threshold_batch_tensor(
+        self, img_vol: torch.Tensor, mask_vol: torch.Tensor, gain=None, **kwargs
+    ) -> torch.Tensor:
+        strategy = self._get_strategy(img_vol[0], mask_vol[0])
+        return strategy.compute_threshold_batch_tensor(img_vol, mask_vol, gain=gain)
+
+
+def build_reflection_table_from_gpu_results(
+    panel_t: torch.Tensor,
+    bbox_t: torch.Tensor,
+    xyzobs_px_val_t: torch.Tensor,
+    xyzobs_px_var_t: torch.Tensor,
+    intensity_val_t: torch.Tensor,
+    intensity_var_t: torch.Tensor,
+    shoeboxes: flex.shoebox | None = None,
+    n_signal_t: torch.Tensor | None = None,
+    include_id_flags: bool = True,
+) -> flex.reflection_table:
+    """
+    Construct a dials.array_family.flex.reflection_table from filtered GPU tensors.
+    """
+    K = int(panel_t.shape[0])
+    rlist = flex.reflection_table()
+    if K == 0:
+        if include_id_flags:
+            rlist["id"] = flex.int()
+            rlist["flags"] = flex.size_t()
+        rlist["panel"] = flex.size_t()
+        rlist["xyzobs.px.value"] = flex.vec3_double()
+        rlist["xyzobs.px.variance"] = flex.vec3_double()
+        rlist["intensity.sum.value"] = flex.double()
+        rlist["intensity.sum.variance"] = flex.double()
+        rlist["bbox"] = flex.int6()
+        if shoeboxes is not None:
+            rlist["shoebox"] = shoeboxes
+        if n_signal_t is not None:
+            rlist["n_signal"] = flex.int()
+        return rlist
+
+    panel_np = np.ascontiguousarray(panel_t.detach().cpu().numpy(), dtype=np.uint64)
+    bbox_np = np.ascontiguousarray(bbox_t.detach().cpu().numpy(), dtype=np.int32)
+    xyz_val_np = np.ascontiguousarray(xyzobs_px_val_t.detach().cpu().numpy(), dtype=np.float64)
+    xyz_var_np = np.ascontiguousarray(xyzobs_px_var_t.detach().cpu().numpy(), dtype=np.float64)
+    int_val_np = np.ascontiguousarray(intensity_val_t.detach().cpu().numpy(), dtype=np.float64)
+    int_var_np = np.ascontiguousarray(intensity_var_t.detach().cpu().numpy(), dtype=np.float64)
+
+    if include_id_flags:
+        rlist["id"] = flex.int(K, 0)
+        rlist["flags"] = flex.size_t(K, 0)
+
+    rlist["panel"] = flumpy.from_numpy(panel_np)
+    rlist["xyzobs.px.value"] = flumpy.vec_from_numpy(xyz_val_np)
+    rlist["xyzobs.px.variance"] = flumpy.vec_from_numpy(xyz_var_np)
+    rlist["intensity.sum.value"] = flumpy.from_numpy(int_val_np)
+    rlist["intensity.sum.variance"] = flumpy.from_numpy(int_var_np)
+    rlist["bbox"] = flex.int6(
+        flumpy.from_numpy(np.ascontiguousarray(bbox_np[:, 0])),
+        flumpy.from_numpy(np.ascontiguousarray(bbox_np[:, 1])),
+        flumpy.from_numpy(np.ascontiguousarray(bbox_np[:, 2])),
+        flumpy.from_numpy(np.ascontiguousarray(bbox_np[:, 3])),
+        flumpy.from_numpy(np.ascontiguousarray(bbox_np[:, 4])),
+        flumpy.from_numpy(np.ascontiguousarray(bbox_np[:, 5])),
+    )
+    if shoeboxes is not None:
+        rlist["shoebox"] = shoeboxes
+    if n_signal_t is not None:
+        n_sig_np = np.ascontiguousarray(n_signal_t.detach().cpu().numpy(), dtype=np.int32)
+        rlist["n_signal"] = flumpy.from_numpy(n_sig_np)
+
+    return rlist
+
+
+class ExtractPixelsFromImageGPU:
+    """
+    GPU-accelerated replacement for ExtractPixelsFromImage.
+    Thresholds each panel on the GPU and returns GPUFramePixelList objects.
+    """
+
+    def __init__(
+        self,
+        imageset,
+        threshold_function,
+        mask,
+        region_of_interest,
+        max_strong_pixel_fraction: float,
+        compute_mean_background: bool,
+        device: torch.device | None = None,
+    ):
+        self.threshold_function = threshold_function
+        self.imageset = imageset
+        self.mask = mask
+        self.region_of_interest = region_of_interest
+        self.max_strong_pixel_fraction = max_strong_pixel_fraction
+        self.compute_mean_background = compute_mean_background
+        self.device = device or get_default_device()
+
+        if self.mask is not None:
+            detector = self.imageset.get_detector()
+            assert len(self.mask) == len(detector)
+            self._static_mask_tensors = [
+                flex_to_tensor(m, device=self.device, dtype=torch.bool) for m in self.mask
+            ]
+        else:
+            self._static_mask_tensors = None
+
+        self._masker = (
+            self.imageset.masker()
+            if hasattr(self.imageset, "masker")
+            else None
+        )
+        self._can_use_fast_gpu_raw = (
+            isinstance(self.imageset, ImageSequence)
+            and (not self.imageset.has_dynamic_mask() or self._masker is not None)
+            and hasattr(self.threshold_function, "compute_threshold_tensor")
+        )
+        if self._can_use_fast_gpu_raw:
+            self._detector = self.imageset.get_detector()
+            self._scan = self.imageset.get_scan()
+            self._image_range_start = self._scan.get_image_range()[0]
+            ext_mask_data = self.imageset.external_lookup.mask.data
+            has_ext_mask = not ext_mask_data.empty()
+            self._full_static_mask_tensors = []
+            self._trusted_ranges = []
+
+            try:
+                path_key = self.imageset.get_path(0)
+            except Exception:
+                path_key = None
+            dev_key = (self.device.type, self.device.index if self.device.index is not None else 0)
+            cache_key = (
+                path_key,
+                len(self._detector),
+                has_ext_mask,
+                tuple(tuple(p.get_image_size()) for p in self._detector),
+                dev_key,
+            )
+            base_masks = _BASE_STATIC_MASK_GPU_CACHE.get(cache_key) if path_key else None
+            if base_masks is not None:
+                _BASE_STATIC_MASK_GPU_CACHE.move_to_end(cache_key)
+            else:
+                base_masks = []
+                for i_panel, panel in enumerate(self._detector):
+                    sm = flex_to_tensor(
+                        panel.get_untrusted_rectangle_mask(),
+                        device=self.device,
+                        dtype=torch.bool,
+                    )
+                    if has_ext_mask:
+                        em = flex_to_tensor(
+                            ext_mask_data[i_panel].data(),
+                            device=self.device,
+                            dtype=torch.bool,
+                        )
+                        sm = sm & em
+                    base_masks.append(sm)
+                if path_key:
+                    if len(_BASE_STATIC_MASK_GPU_CACHE) >= 32:
+                        _BASE_STATIC_MASK_GPU_CACHE.popitem(last=False)
+                    _BASE_STATIC_MASK_GPU_CACHE[cache_key] = base_masks
+
+            self._base_static_mask_tensors = base_masks
+            self._path_key = path_key
+            for i_panel, panel in enumerate(self._detector):
+                sm = base_masks[i_panel]
+                if self._static_mask_tensors is not None:
+                    sm = sm & self._static_mask_tensors[i_panel]
+                self._full_static_mask_tensors.append(sm)
+                self._trusted_ranges.append(panel.get_trusted_range())
+
+            gain_img = self.imageset.get_gain(0)
+            if gain_img:
+                self._gain_tensors = [
+                    flex_to_tensor(gain_img[i], device=self.device, dtype=torch.float64)
+                    for i in range(len(self._detector))
+                ]
+            else:
+                self._gain_tensors = None
+
+            ped_img = self.imageset.get_pedestal(0)
+            if ped_img:
+                self._pedestal_tensors = [
+                    flex_to_tensor(ped_img[i], device=self.device, dtype=torch.float64)
+                    for i in range(len(self._detector))
+                ]
+            else:
+                self._pedestal_tensors = None
+
+    def process_raw_tensors(
+        self,
+        index: int,
+        raw_tensors: list[torch.Tensor] | None,
+        emit_log: bool = True,
+    ) -> tuple[list[GPUFramePixelList], list[str]]:
+        frame = self.imageset.get_array_range()[0] + index
+        rejected = raw_tensors is None or self.imageset.is_marked_for_rejection(index)
+        num_panels = len(self._full_static_mask_tensors)
+
+        dyn_mask_tuple = None
+        if not rejected and self._masker is not None:
+            angle = self._scan.get_angle_from_image_index(
+                index + self._image_range_start, deg=True
+            )
+            ext = self._masker.project_extrema(self._detector, angle)
+            if any(len(e) > 0 for e in ext):
+                dyn_mask_tuple = self._masker.get_mask(self._detector, angle)
+
+        result = []
+        num_strong = 0
+        average_background = 0.0
+
+        for i_panel in range(num_panels):
+            static_mask_t = self._full_static_mask_tensors[i_panel]
+            H, W = static_mask_t.shape
+
+            if rejected:
+                img_t = torch.empty((0, 0), dtype=torch.float64, device=self.device)
+                mask_t = static_mask_t
+                threshold_mask = torch.zeros_like(static_mask_t)
+            else:
+                raw_t = raw_tensors[i_panel]
+                tr0, tr1 = self._trusted_ranges[i_panel]
+                mask_t = static_mask_t & (raw_t >= tr0) & (raw_t <= tr1)
+                if dyn_mask_tuple is not None and len(dyn_mask_tuple[i_panel]) > 0:
+                    dm_t = flex_to_tensor(
+                        dyn_mask_tuple[i_panel], device=self.device, dtype=torch.bool
+                    )
+                    mask_t = mask_t & dm_t
+                if (
+                    self._pedestal_tensors is None
+                    and self._gain_tensors is None
+                    and self.region_of_interest is None
+                    and not self.compute_mean_background
+                    and isinstance(self.threshold_function, DispersionThresholdExtGPU)
+                ):
+                    img_t = raw_t
+                else:
+                    img_t = raw_t.to(torch.float64)
+                    if self._pedestal_tensors is not None:
+                        img_t = img_t - self._pedestal_tensors[i_panel]
+                    if self._gain_tensors is not None:
+                        img_t = img_t / self._gain_tensors[i_panel]
+
+                if self.region_of_interest is not None:
+                    x0, x1, y0, y1 = self.region_of_interest
+                    assert x0 < x1 and y0 < y1, "Invalid region of interest"
+                    assert x0 >= 0 and y0 >= 0 and x1 <= W and y1 <= H, "ROI out of bounds"
+                    thresh_roi = self.threshold_function.compute_threshold_tensor(
+                        img_t[y0:y1, x0:x1],
+                        mask_t[y0:y1, x0:x1],
+                        imageset=self.imageset,
+                        i_panel=i_panel,
+                        region_of_interest=self.region_of_interest,
+                    )
+                    threshold_mask = torch.zeros_like(mask_t)
+                    threshold_mask[y0:y1, x0:x1] = thresh_roi
+                else:
+                    threshold_mask = self.threshold_function.compute_threshold_tensor(
+                        img_t,
+                        mask_t,
+                        imageset=self.imageset,
+                        i_panel=i_panel,
+                        region_of_interest=self.region_of_interest,
+                    )
+
+            yx = torch.nonzero(threshold_mask, as_tuple=False)
+            n_strong_panel = int(yx.shape[0])
+            if n_strong_panel > 0:
+                vals = img_t[threshold_mask].to(torch.float64)
+                z = torch.full((n_strong_panel, 1), frame, dtype=torch.int64, device=self.device)
+                coords = torch.cat([z, yx.to(torch.int64)], dim=1)
+            else:
+                coords = torch.empty((0, 3), dtype=torch.int64, device=self.device)
+                vals = torch.empty((0,), dtype=torch.float64, device=self.device)
+
+            plist = GPUFramePixelList(frame=frame, size=(H, W), coords=coords, values=vals)
+            result.append(plist)
+
+            if self.compute_mean_background and not rejected:
+                bg_sel = mask_t & (~threshold_mask)
+                bg_vals = img_t[bg_sel]
+                if bg_vals.numel() > 0:
+                    average_background += float(bg_vals.mean().item())
+
+            num_strong += n_strong_panel
+
+            if self.max_strong_pixel_fraction < 1:
+                num_image = H * W
+                max_strong = int(math.ceil(self.max_strong_pixel_fraction * num_image))
+                if n_strong_panel > max_strong:
+                    raise RuntimeError(
+                        f"\n  The number of strong pixels found ({n_strong_panel}) is greater than the\n"
+                        f"  maximum allowed ({max_strong}). Try changing spot finding parameters\n"
+                    )
+
+        average_background /= num_panels
+        frame_log = frame + 1
+        log_msgs = [f"Found {num_strong} strong pixels on image {frame_log}"]
+        if self.compute_mean_background:
+            log_msgs.append(f"Average background on image {frame_log} is {average_background}")
+        if emit_log:
+            for msg in log_msgs:
+                logger.info(msg)
+        return result, log_msgs
+
+    def __call__(self, index: int) -> list[GPUFramePixelList]:
+        if self._can_use_fast_gpu_raw:
+            if self.imageset.is_marked_for_rejection(index):
+                raw_tensors = None
+            else:
+                raw_image = self.imageset.get_raw_data(index)
+                raw_tensors = [
+                    flex_to_tensor(raw_image[i], device=self.device)
+                    for i in range(len(raw_image))
+                ]
+            res, _ = self.process_raw_tensors(index, raw_tensors, emit_log=True)
+            return res
+
+        if isinstance(self.imageset, ImageSequence):
+            frame = self.imageset.get_array_range()[0] + index
+        else:
+            ind = self.imageset.indices()
+            if len(ind) > 1:
+                assert all(i1 + 1 == i2 for i1, i2 in zip(ind[:-1], ind[1:-1]))
+            frame = ind[index]
+
+        image = self.imageset.get_corrected_data(index)
+        mask = self.imageset.get_mask(index)
+
+        result = []
+        num_strong = 0
+        average_background = 0.0
+        rejected = self.imageset.is_marked_for_rejection(index)
+
+        for i_panel in range(len(image)):
+            im_panel = image[i_panel]
+            mk_panel = mask[i_panel]
+            img_t = flex_to_tensor(im_panel, device=self.device, dtype=torch.float64)
+            mask_t = flex_to_tensor(mk_panel, device=self.device, dtype=torch.bool)
+            if self._static_mask_tensors is not None:
+                mask_t = mask_t & self._static_mask_tensors[i_panel]
+
+            H, W = img_t.shape
+
+            if rejected:
+                threshold_mask = torch.zeros_like(mask_t)
+            elif self.region_of_interest is not None:
+                x0, x1, y0, y1 = self.region_of_interest
+                assert x0 < x1 and y0 < y1, "Invalid region of interest"
+                assert x0 >= 0 and y0 >= 0 and x1 <= W and y1 <= H, "ROI out of bounds"
+                img_roi = img_t[y0:y1, x0:x1]
+                mask_roi = mask_t[y0:y1, x0:x1]
+                if hasattr(self.threshold_function, "compute_threshold_tensor"):
+                    thresh_roi = self.threshold_function.compute_threshold_tensor(
+                        img_roi,
+                        mask_roi,
+                        imageset=self.imageset,
+                        i_panel=i_panel,
+                        region_of_interest=self.region_of_interest,
+                    )
+                else:
+                    im_flex = im_panel[y0:y1, x0:x1]
+                    mk_flex = tensor_to_flex_bool(mask_roi)
+                    tr_flex = self.threshold_function.compute_threshold(
+                        im_flex,
+                        mk_flex,
+                        imageset=self.imageset,
+                        i_panel=i_panel,
+                        region_of_interest=self.region_of_interest,
+                    )
+                    thresh_roi = flex_to_tensor(tr_flex, device=self.device, dtype=torch.bool)
+                threshold_mask = torch.zeros_like(mask_t)
+                threshold_mask[y0:y1, x0:x1] = thresh_roi
+            else:
+                if hasattr(self.threshold_function, "compute_threshold_tensor"):
+                    threshold_mask = self.threshold_function.compute_threshold_tensor(
+                        img_t,
+                        mask_t,
+                        imageset=self.imageset,
+                        i_panel=i_panel,
+                        region_of_interest=self.region_of_interest,
+                    )
+                else:
+                    mk_flex = tensor_to_flex_bool(mask_t)
+                    tr_flex = self.threshold_function.compute_threshold(
+                        im_panel,
+                        mk_flex,
+                        imageset=self.imageset,
+                        i_panel=i_panel,
+                    )
+                    threshold_mask = flex_to_tensor(tr_flex, device=self.device, dtype=torch.bool)
+
+            yx = torch.nonzero(threshold_mask, as_tuple=False)
+            n_strong_panel = int(yx.shape[0])
+            if n_strong_panel > 0:
+                vals = img_t[threshold_mask]
+                z = torch.full((n_strong_panel, 1), frame, dtype=torch.int64, device=self.device)
+                coords = torch.cat([z, yx.to(torch.int64)], dim=1)
+            else:
+                coords = torch.empty((0, 3), dtype=torch.int64, device=self.device)
+                vals = torch.empty((0,), dtype=torch.float64, device=self.device)
+
+            plist = GPUFramePixelList(frame=frame, size=(H, W), coords=coords, values=vals)
+            result.append(plist)
+
+            if self.compute_mean_background:
+                bg_sel = mask_t & (~threshold_mask)
+                bg_vals = img_t[bg_sel]
+                if bg_vals.numel() > 0:
+                    average_background += float(bg_vals.mean().item())
+
+            num_strong += n_strong_panel
+
+            if self.max_strong_pixel_fraction < 1:
+                num_image = H * W
+                max_strong = int(math.ceil(self.max_strong_pixel_fraction * num_image))
+                if n_strong_panel > max_strong:
+                    raise RuntimeError(
+                        f"\n  The number of strong pixels found ({n_strong_panel}) is greater than the\n"
+                        f"  maximum allowed ({max_strong}). Try changing spot finding parameters\n"
+                    )
+
+        average_background /= len(image)
+
+        if isinstance(self.imageset, ImageSequence):
+            frame_log = frame + 1
+        else:
+            frame_log = index + 1
+        logger.info(f"Found {num_strong} strong pixels on image {frame_log}")
+        if self.compute_mean_background:
+            logger.info(f"Average background on image {frame_log} is {average_background}")
+
+        return result
+
+
+class ExtractPixelsFromImage2DNoShoeboxesGPU(ExtractPixelsFromImageGPU):
+    """
+    GPU-accelerated replacement for ExtractPixelsFromImage2DNoShoeboxes.
+    """
+
+    def __init__(
+        self,
+        imageset,
+        threshold_function,
+        mask,
+        region_of_interest,
+        max_strong_pixel_fraction: float,
+        compute_mean_background: bool,
+        min_spot_size: int,
+        max_spot_size: int,
+        filter_spots,
+        device: torch.device | None = None,
+    ):
+        super().__init__(
+            imageset=imageset,
+            threshold_function=threshold_function,
+            mask=mask,
+            region_of_interest=region_of_interest,
+            max_strong_pixel_fraction=max_strong_pixel_fraction,
+            compute_mean_background=compute_mean_background,
+            device=device,
+        )
+        self.min_spot_size = min_spot_size
+        self.max_spot_size = max_spot_size
+        self.filter_spots = filter_spots
+
+    def __call__(self, index: int) -> list[flex.reflection_table]:
+        pixel_labeller = [
+            PixelListLabellerGPU(device=self.device)
+            for _ in range(len(self.imageset.get_detector()))
+        ]
+        result = super().__call__(index)
+        for plabeller, plist in zip(pixel_labeller, result):
+            plabeller.add(plist)
+
+        rlist, _ = pixel_list_to_reflection_table_gpu(
+            self.imageset,
+            pixel_labeller,
+            filter_spots=self.filter_spots,
+            min_spot_size=self.min_spot_size,
+            max_spot_size=self.max_spot_size,
+            write_hot_pixel_mask=False,
+            include_shoeboxes=True,
+            include_n_signal=False,
+            force_2d=True,
+            device=self.device,
+        )
+        return [rlist]
+
+
+def pixel_list_to_reflection_table_gpu(
+    imageset,
+    pixel_labeller: list[PixelListLabellerGPU],
+    filter_spots,
+    min_spot_size: int,
+    max_spot_size: int,
+    write_hot_pixel_mask: bool,
+    include_shoeboxes: bool = True,
+    include_n_signal: bool = False,
+    force_2d: bool = False,
+    device: torch.device | None = None,
+) -> tuple[flex.reflection_table, tuple]:
+    """
+    GPU replacement for dials.algorithms.spot_finding.finder.pixel_list_to_reflection_table.
+    """
+    device = device or get_default_device()
+    if isinstance(imageset, ImageSequence) and not force_2d:
+        twod = imageset.get_scan().is_still()
+    else:
+        twod = True
+
+    hot_pixels = tuple(flex.size_t() for _ in range(len(imageset.get_detector())))
+
+    num_total = 0
+    num_below_min = 0
+    num_above_max = 0
+    num_valid = 0
+
+    panel_list = []
+    bbox_list = []
+    xyz_val_list = []
+    xyz_var_list = []
+    int_val_list = []
+    int_var_list = []
+    n_signal_list = []
+    peak_coords_list = []
+    panel_spot_results = []
+
+    for i, labeller in enumerate(pixel_labeller):
+        if labeller.num_pixels() > 0:
+            res = extract_spots_from_labeller_gpu(
+                labeller=labeller,
+                panel_id=i,
+                zstart=0,
+                twod=twod,
+                min_pixels=min_spot_size,
+                max_pixels=max_spot_size,
+                find_hot_pixels=write_hot_pixel_mask,
+                compute_shoeboxes=include_shoeboxes,
+            )
+            num_total += res["num_total_spots"]
+            num_below_min += res["num_below_min"]
+            num_above_max += res["num_above_max"]
+            num_valid += res["num_valid_spots"]
+            if write_hot_pixel_mask and len(res["hot_pixels"]) > 0:
+                hot_pixels[i].extend(res["hot_pixels"])
+            if res["num_valid_spots"] > 0:
+                panel_list.append(res["panel"])
+                bbox_list.append(res["bbox"])
+                xyz_val_list.append(res["xyzobs_px_value"])
+                xyz_var_list.append(res["xyzobs_px_variance"])
+                int_val_list.append(res["intensity_sum_value"])
+                int_var_list.append(res["intensity_sum_variance"])
+                n_signal_list.append(res["n_signal"])
+                peak_coords_list.append(res["peak_coords"])
+                panel_spot_results.append(res)
+
+    logger.info(f"\nExtracted {num_total} spots")
+    logger.info(f"Removed {num_below_min} spots with size < {min_spot_size} pixels")
+    logger.info(f"Removed {num_above_max} spots with size > {max_spot_size} pixels")
+
+    if num_valid == 0:
+        empty_rlist = build_reflection_table_from_gpu_results(
+            panel_t=torch.empty((0,), dtype=torch.int64, device=device),
+            bbox_t=torch.empty((0, 6), dtype=torch.int32, device=device),
+            xyzobs_px_val_t=torch.empty((0, 3), dtype=torch.float64, device=device),
+            xyzobs_px_var_t=torch.empty((0, 3), dtype=torch.float64, device=device),
+            intensity_val_t=torch.empty((0,), dtype=torch.float64, device=device),
+            intensity_var_t=torch.empty((0,), dtype=torch.float64, device=device),
+            shoeboxes=flex.shoebox() if include_shoeboxes else None,
+            n_signal_t=torch.empty((0,), dtype=torch.int32, device=device) if include_n_signal else None,
+            include_id_flags=True,
+        )
+        return empty_rlist, hot_pixels
+
+    panel_t = torch.cat(panel_list, dim=0)
+    bbox_t = torch.cat(bbox_list, dim=0)
+    xyz_val_t = torch.cat(xyz_val_list, dim=0)
+    xyz_var_t = torch.cat(xyz_var_list, dim=0)
+    int_val_t = torch.cat(int_val_list, dim=0)
+    int_var_t = torch.cat(int_var_list, dim=0)
+    n_sig_t = torch.cat(n_signal_list, dim=0)
+    peak_t = torch.cat(peak_coords_list, dim=0)
+
+    if include_shoeboxes:
+        logger.info(f"Calculated {num_valid} spot centroids")
+        logger.info(f"Calculated {num_valid} spot intensities")
+
+    # Check if filter needs shoeboxes prior to filtering (e.g. BackgroundGradientFilter)
+    needs_pre_shoeboxes = getattr(filter_spots, "needs_shoeboxes_for_filtering", False)
+    pre_shoeboxes = None
+    if needs_pre_shoeboxes:
+        sbox_all = flex.shoebox()
+        for res in panel_spot_results:
+            sb = build_shoeboxes_from_gpu_spots(
+                panel_t=res["panel"],
+                bbox_t=res["bbox"],
+                pixel_coords=res["pixel_coords"],
+                pixel_values_f32=res["pixel_values"],
+                pixel_spot_idx=res["pixel_spot_idx"],
+                zstart=res["zstart"],
+                selected_spot_mask=None,
+            )
+            sbox_all.extend(sb)
+        pre_shoeboxes = sbox_all
+
+    # Run spot filters on GPU
+    if filter_spots is not None:
+        init_flags = torch.ones((num_valid,), dtype=torch.bool, device=device)
+        flags_t = filter_spots(
+            init_flags,
+            peak_coords=peak_t,
+            centroids=xyz_val_t,
+            sequence=imageset,
+            shoeboxes=pre_shoeboxes,
+        )
+    else:
+        flags_t = torch.ones((num_valid,), dtype=torch.bool, device=device)
+
+    # Select filtered spots
+    panel_sel = panel_t[flags_t]
+    bbox_sel = bbox_t[flags_t]
+    xyz_val_sel = xyz_val_t[flags_t]
+    xyz_var_sel = xyz_var_t[flags_t]
+    int_val_sel = int_val_t[flags_t]
+    int_var_sel = int_var_t[flags_t]
+    n_sig_sel = n_sig_t[flags_t] if include_n_signal else None
+
+    shoeboxes_sel = None
+    if include_shoeboxes:
+        if pre_shoeboxes is not None:
+            flags_np = np.ascontiguousarray(flags_t.detach().cpu().numpy(), dtype=bool)
+            shoeboxes_sel = pre_shoeboxes.select(flumpy.from_numpy(flags_np))
+        else:
+            shoeboxes_sel = flex.shoebox()
+            offset = 0
+            for res in panel_spot_results:
+                k_panel = res["num_valid_spots"]
+                panel_mask = flags_t[offset : offset + k_panel]
+                offset += k_panel
+                sb = build_shoeboxes_from_gpu_spots(
+                    panel_t=res["panel"],
+                    bbox_t=res["bbox"],
+                    pixel_coords=res["pixel_coords"],
+                    pixel_values_f32=res["pixel_values"],
+                    pixel_spot_idx=res["pixel_spot_idx"],
+                    zstart=res["zstart"],
+                    selected_spot_mask=panel_mask,
+                )
+                shoeboxes_sel.extend(sb)
+
+    rlist = build_reflection_table_from_gpu_results(
+        panel_t=panel_sel,
+        bbox_t=bbox_sel,
+        xyzobs_px_val_t=xyz_val_sel,
+        xyzobs_px_var_t=xyz_var_sel,
+        intensity_val_t=int_val_sel,
+        intensity_var_t=int_var_sel,
+        shoeboxes=shoeboxes_sel,
+        n_signal_t=n_sig_sel,
+        include_id_flags=True,
+    )
+
+    return rlist, hot_pixels
+
+
+class ExtractSpotsGPU:
+    """
+    GPU-accelerated replacement for ExtractSpots in dials/algorithms/spot_finding/finder.py.
+    """
+
+    def __init__(
+        self,
+        threshold_function=None,
+        mask=None,
+        region_of_interest=None,
+        max_strong_pixel_fraction: float = 0.1,
+        compute_mean_background: bool = False,
+        mp_method=None,
+        mp_nproc: int = 1,
+        mp_njobs: int = 1,
+        mp_chunksize: int = 1,
+        min_spot_size: int = 1,
+        max_spot_size: int = 20,
+        filter_spots=None,
+        no_shoeboxes_2d: bool = False,
+        min_chunksize: int = 50,
+        write_hot_pixel_mask: bool = False,
+        force_2d: bool = False,
+        device: torch.device | None = None,
+    ):
+        self.threshold_function = threshold_function
+        self.mask = mask
+        self.mp_method = mp_method
+        self.mp_chunksize = mp_chunksize
+        self.mp_nproc = mp_nproc
+        self.mp_njobs = mp_njobs
+        self.max_strong_pixel_fraction = max_strong_pixel_fraction
+        self.compute_mean_background = compute_mean_background
+        self.region_of_interest = region_of_interest
+        self.min_spot_size = min_spot_size
+        self.max_spot_size = max_spot_size
+        self.filter_spots = filter_spots
+        self.no_shoeboxes_2d = no_shoeboxes_2d
+        self.min_chunksize = min_chunksize
+        self.write_hot_pixel_mask = write_hot_pixel_mask
+        self.force_2d = force_2d
+        self.device = device or get_default_device()
+
+    def __call__(self, imageset):
+        if self.no_shoeboxes_2d:
+            return self._find_spots_2d_no_shoeboxes(imageset)
+        return self._find_spots(imageset)
+
+    def _find_spots(self, imageset):
+        function = ExtractPixelsFromImageGPU(
+            imageset=imageset,
+            threshold_function=self.threshold_function,
+            mask=self.mask,
+            max_strong_pixel_fraction=self.max_strong_pixel_fraction,
+            compute_mean_background=self.compute_mean_background,
+            region_of_interest=self.region_of_interest,
+            device=self.device,
+        )
+
+        indices = list(range(len(imageset)))
+        num_panels = len(imageset.get_detector())
+        pixel_labeller = [
+            PixelListLabellerGPU(device=self.device) for _ in range(num_panels)
+        ]
+
+        mp_nproc = self.mp_nproc
+        if mp_nproc is libtbx.Auto:
+            mp_nproc = CPU_COUNT
+
+        logger.info("Extracting strong pixels from images on GPU")
+        vol_t = None
+        if (
+            function._can_use_fast_gpu_raw
+            and num_panels == 1
+            and self.device.type == "cuda"
+        ):
+            vol_t = _try_load_hdf5_raw_volume_gpu(imageset, self.device)
+
+        if vol_t is not None and hasattr(
+            self.threshold_function, "compute_threshold_batch_tensor"
+        ):
+            self._run_batch_volume_gpu(
+                imageset=imageset,
+                function=function,
+                vol_t=vol_t,
+                pixel_labeller=pixel_labeller,
+            )
+        elif vol_t is not None:
+            for task in indices:
+                res, _ = function.process_raw_tensors(
+                    task, [vol_t[task]], emit_log=True
+                )
+                for plabeller, plist in zip(pixel_labeller, res):
+                    plabeller.add(plist)
+                res.clear()
+        else:
+            is_hdf5 = False
+            try:
+                p0 = imageset.get_path(0)
+                if p0 and p0.endswith((".nxs", ".h5", ".hdf5")):
+                    is_hdf5 = True
+            except Exception:
+                pass
+
+            if (
+                function._can_use_fast_gpu_raw
+                and not is_hdf5
+                and len(indices) > 1
+                and isinstance(mp_nproc, int)
+                and mp_nproc > 1
+            ):
+                self._run_parallel_raw_prefetch(
+                    imageset=imageset,
+                    function=function,
+                    indices=indices,
+                    pixel_labeller=pixel_labeller,
+                    nproc=min(mp_nproc, len(indices) - 1, 16),
+                )
+            else:
+                for task in indices:
+                    result = function(task)
+                    assert len(pixel_labeller) == len(result), "Inconsistent size"
+                    for plabeller, plist in zip(pixel_labeller, result):
+                        plabeller.add(plist)
+                    result.clear()
+
+        return pixel_list_to_reflection_table_gpu(
+            imageset,
+            pixel_labeller,
+            filter_spots=self.filter_spots,
+            min_spot_size=self.min_spot_size,
+            max_spot_size=self.max_spot_size,
+            write_hot_pixel_mask=self.write_hot_pixel_mask,
+            include_shoeboxes=True,
+            include_n_signal=False,
+            force_2d=self.force_2d,
+            device=self.device,
+        )
+
+    def _run_batch_volume_gpu(
+        self,
+        imageset,
+        function: ExtractPixelsFromImageGPU,
+        vol_t: torch.Tensor,
+        pixel_labeller: list[PixelListLabellerGPU],
+    ):
+        B, H, W = vol_t.shape
+        first_frame = imageset.get_array_range()[0]
+        tr0, tr1 = function._trusted_ranges[0]
+
+        dev_key = (self.device.type, self.device.index if self.device.index is not None else 0)
+        z0 = int(imageset.indices()[0])
+        m_key = (function._path_key, z0, B, float(tr0), float(tr1), dev_key)
+        base_mask_vol = _HDF5_GPU_MASK_CACHE.get(m_key) if function._path_key else None
+        if base_mask_vol is not None:
+            _HDF5_GPU_MASK_CACHE.move_to_end(m_key)
+        else:
+            base_sm = function._base_static_mask_tensors[0]
+            base_mask_vol = base_sm.unsqueeze(0) & (vol_t >= tr0) & (vol_t <= tr1)
+            if function._path_key and self.device.type == "cuda":
+                if len(_HDF5_GPU_MASK_CACHE) >= 8:
+                    _HDF5_GPU_MASK_CACHE.popitem(last=False)
+                _HDF5_GPU_MASK_CACHE[m_key] = base_mask_vol
+
+        if function._static_mask_tensors is not None:
+            mask_vol = base_mask_vol & function._static_mask_tensors[0].unsqueeze(0)
+        else:
+            mask_vol = base_mask_vol
+
+        rejected_flags = [imageset.is_marked_for_rejection(i) for i in range(B)]
+        if function._masker is not None:
+            cloned_mask = False
+            for i in range(B):
+                if not rejected_flags[i]:
+                    angle = function._scan.get_angle_from_image_index(
+                        i + function._image_range_start, deg=True
+                    )
+                    ext = function._masker.project_extrema(function._detector, angle)
+                    if any(len(e) > 0 for e in ext):
+                        dyn_mask_tuple = function._masker.get_mask(
+                            function._detector, angle
+                        )
+                        if len(dyn_mask_tuple[0]) > 0:
+                            if not cloned_mask and mask_vol is base_mask_vol:
+                                mask_vol = base_mask_vol.clone()
+                                cloned_mask = True
+                            dm_t = flex_to_tensor(
+                                dyn_mask_tuple[0],
+                                device=self.device,
+                                dtype=torch.bool,
+                            )
+                            mask_vol[i] &= dm_t
+
+        if function._pedestal_tensors is None and function._gain_tensors is None:
+            work_vol = vol_t
+        else:
+            work_vol = vol_t.to(torch.float32)
+            if function._pedestal_tensors is not None:
+                work_vol = work_vol - function._pedestal_tensors[0].to(
+                    torch.float32
+                ).unsqueeze(0)
+            if function._gain_tensors is not None:
+                work_vol = work_vol / function._gain_tensors[0].to(
+                    torch.float32
+                ).unsqueeze(0)
+
+        if self.region_of_interest is not None:
+            x0, x1, y0, y1 = self.region_of_interest
+            assert x0 < x1 and y0 < y1, "Invalid region of interest"
+            assert x0 >= 0 and y0 >= 0 and x1 <= W and y1 <= H, "ROI out of bounds"
+            thresh_roi = self.threshold_function.compute_threshold_batch_tensor(
+                work_vol[:, y0:y1, x0:x1].contiguous(),
+                mask_vol[:, y0:y1, x0:x1].contiguous(),
+                imageset=imageset,
+                i_panel=0,
+                region_of_interest=self.region_of_interest,
+            )
+            out_vol = torch.zeros_like(mask_vol)
+            out_vol[:, y0:y1, x0:x1] = thresh_roi
+        else:
+            out_vol = self.threshold_function.compute_threshold_batch_tensor(
+                work_vol,
+                mask_vol,
+                imageset=imageset,
+                i_panel=0,
+                region_of_interest=None,
+            )
+
+        if any(rejected_flags):
+            for i, rej in enumerate(rejected_flags):
+                if rej:
+                    out_vol[i].zero_()
+
+        frame_counts = out_vol.reshape(B, -1).sum(dim=1).cpu().tolist()
+        max_strong = (
+            int(math.ceil(self.max_strong_pixel_fraction * (H * W)))
+            if self.max_strong_pixel_fraction < 1
+            else None
+        )
+
+        for i, n_strong in enumerate(frame_counts):
+            if max_strong is not None and n_strong > max_strong:
+                raise RuntimeError(
+                    f"\n  The number of strong pixels found ({n_strong}) is greater than the\n"
+                    f"  maximum allowed ({max_strong}). Try changing spot finding parameters\n"
+                )
+            frame_log = first_frame + i + 1
+            logger.info(f"Found {n_strong} strong pixels on image {frame_log}")
+            if self.compute_mean_background and not rejected_flags[i]:
+                bg_sel = mask_vol[i] & (~out_vol[i])
+                bg_vals = work_vol[i][bg_sel]
+                avg_bg = (
+                    float(bg_vals.to(torch.float64).mean().item())
+                    if bg_vals.numel() > 0
+                    else 0.0
+                )
+                logger.info(f"Average background on image {frame_log} is {avg_bg}")
+
+        zyx = torch.nonzero(out_vol, as_tuple=False)
+        if zyx.shape[0] > 0:
+            vals = work_vol[out_vol].to(torch.float64)
+            if first_frame != 0:
+                zyx = zyx.clone()
+                zyx[:, 0] += first_frame
+            coords = zyx.to(torch.int64)
+        else:
+            coords = torch.empty((0, 3), dtype=torch.int64, device=self.device)
+            vals = torch.empty((0,), dtype=torch.float64, device=self.device)
+
+        pixel_labeller[0].add_volume(
+            first_frame=first_frame,
+            last_frame=first_frame + B,
+            size=(H, W),
+            coords=coords,
+            values=vals,
+        )
+
+    def _run_parallel_raw_prefetch(
+        self,
+        imageset,
+        function: ExtractPixelsFromImageGPU,
+        indices: list[int],
+        pixel_labeller: list[PixelListLabellerGPU],
+        nproc: int,
+    ):
+        # Process first frame on main process (handles global_threshold=Auto and inspects raw dtype/shapes)
+        first_idx = indices[0]
+        first_raw = imageset.get_raw_data(first_idx)
+        panel_specs = []
+        frame_nbytes = 0
+        for p in range(len(first_raw)):
+            arr = flumpy.to_numpy(first_raw[p])
+            panel_specs.append((arr.shape, arr.dtype, frame_nbytes, arr.nbytes))
+            frame_nbytes += arr.nbytes
+
+        if imageset.is_marked_for_rejection(first_idx):
+            first_tensors = None
+        else:
+            first_tensors = [
+                flex_to_tensor(first_raw[p], device=self.device)
+                for p in range(len(first_raw))
+            ]
+        first_res, first_logs = function.process_raw_tensors(
+            first_idx, first_tensors, emit_log=False
+        )
+        del first_raw, first_tensors
+
+        rem_indices = indices[1:]
+        num_slots = min(len(rem_indices), max(8, nproc * 2))
+        shm = shared_memory.SharedMemory(create=True, size=num_slots * frame_nbytes)
+        ctx = multiprocessing.get_context("fork")
+        task_q = ctx.Queue()
+        free_q = ctx.Queue()
+        done_q = ctx.Queue()
+
+        for s in range(num_slots):
+            free_q.put(s)
+        for idx in rem_indices:
+            task_q.put(idx)
+        for _ in range(nproc):
+            task_q.put(None)
+
+        shm_name = shm.name
+
+        def _worker():
+            local_shm = shared_memory.SharedMemory(name=shm_name)
+            buf = local_shm.buf
+            try:
+                while True:
+                    idx = task_q.get()
+                    if idx is None:
+                        break
+                    try:
+                        if imageset.is_marked_for_rejection(idx):
+                            done_q.put((idx, -1, None))
+                            continue
+                        raw = imageset.get_raw_data(idx)
+                        np_panels = [flumpy.to_numpy(raw[p]) for p in range(len(raw))]
+                        slot = free_q.get()
+                        base = slot * frame_nbytes
+                        for p, (shape, dtype, offset, nbytes) in enumerate(panel_specs):
+                            dst = np.ndarray(
+                                shape, dtype=dtype, buffer=buf, offset=base + offset
+                            )
+                            np.copyto(dst, np_panels[p])
+                        done_q.put((idx, slot, None))
+                    except Exception as e:
+                        done_q.put((idx, -2, str(e)))
+            finally:
+                local_shm.close()
+
+        workers = [ctx.Process(target=_worker) for _ in range(nproc)]
+        results_by_idx: dict[int, tuple[list[GPUFramePixelList], list[str]]] = {
+            first_idx: (first_res, first_logs)
+        }
+        try:
+            for w in workers:
+                w.start()
+
+            parent_buf = shm.buf
+            error_msg = None
+            for _ in range(len(rem_indices)):
+                idx, slot, err = done_q.get()
+                if slot == -2 or err is not None:
+                    error_msg = err or f"Worker failed on image index {idx}"
+                    continue
+                if slot == -1:
+                    raw_tensors = None
+                else:
+                    base = slot * frame_nbytes
+                    raw_tensors = []
+                    for shape, dtype, offset, _ in panel_specs:
+                        arr = np.ndarray(
+                            shape, dtype=dtype, buffer=parent_buf, offset=base + offset
+                        )
+                        raw_tensors.append(torch.from_numpy(arr).to(self.device))
+                    free_q.put(slot)
+
+                if error_msg is None:
+                    try:
+                        res, logs = function.process_raw_tensors(
+                            idx, raw_tensors, emit_log=False
+                        )
+                        results_by_idx[idx] = (res, logs)
+                    except Exception as e:
+                        error_msg = str(e)
+
+            if error_msg is not None:
+                raise RuntimeError(error_msg)
+        finally:
+            for w in workers:
+                w.join(timeout=2.0)
+                if w.is_alive():
+                    w.terminate()
+            shm.close()
+            shm.unlink()
+
+        for idx in indices:
+            res, logs = results_by_idx[idx]
+            for msg in logs:
+                logger.info(msg)
+            assert len(pixel_labeller) == len(res), "Inconsistent size"
+            for plabeller, plist in zip(pixel_labeller, res):
+                plabeller.add(plist)
+            res.clear()
+
+    def _find_spots_2d_no_shoeboxes(self, imageset):
+        function = ExtractPixelsFromImage2DNoShoeboxesGPU(
+            imageset=imageset,
+            threshold_function=self.threshold_function,
+            mask=self.mask,
+            max_strong_pixel_fraction=self.max_strong_pixel_fraction,
+            compute_mean_background=self.compute_mean_background,
+            region_of_interest=self.region_of_interest,
+            min_spot_size=self.min_spot_size,
+            max_spot_size=self.max_spot_size,
+            filter_spots=self.filter_spots,
+            device=self.device,
+        )
+
+        indices = list(range(len(imageset)))
+        reflections = flex.reflection_table()
+
+        logger.info("Extracting strong spots from images on GPU")
+        for task in indices:
+            reflections.extend(function(task)[0])
+
+        return reflections, None
+
+
+class _SpotFinderGPUMixin:
+    """
+    Overrides _find_spots_in_imageset on SpotFinder/TOFSpotFinder/LaueSpotFinder
+    to use ExtractSpotsGPU on the GPU.
+    """
+
+    def _find_spots_in_imageset(self, imageset):
+        skip_cpu_mask_gen = False
+        if (
+            isinstance(self.mask_generator, functools.partial)
+            and self.mask_generator.func is dials.util.masking.generate_mask
+        ):
+            fp = self.mask_generator.keywords.get("params")
+            if (
+                fp is not None
+                and getattr(fp, "border", 0) == 0
+                and not getattr(fp, "untrusted", None)
+                and getattr(fp, "d_min", None) is None
+                and getattr(fp, "d_max", None) is None
+                and not getattr(fp, "resolution_range", None)
+                and not getattr(getattr(fp, "ice_rings", None), "filter", False)
+            ):
+                skip_cpu_mask_gen = True
+
+        if skip_cpu_mask_gen:
+            mask = self.mask
+        else:
+            mask = self.mask_generator(imageset)
+            if self.mask is not None:
+                mask = tuple(m1 & m2 for m1, m2 in zip(mask, self.mask))
+
+        extract_spots = ExtractSpotsGPU(
+            threshold_function=self.threshold_function,
+            mask=mask,
+            region_of_interest=self.region_of_interest,
+            max_strong_pixel_fraction=self.max_strong_pixel_fraction,
+            compute_mean_background=self.compute_mean_background,
+            mp_method=self.mp_method,
+            mp_nproc=self.mp_nproc,
+            mp_njobs=self.mp_njobs,
+            mp_chunksize=self.mp_chunksize,
+            min_spot_size=self.min_spot_size,
+            max_spot_size=self.max_spot_size,
+            filter_spots=self.filter_spots,
+            no_shoeboxes_2d=self.no_shoeboxes_2d,
+            min_chunksize=self.min_chunksize,
+            write_hot_pixel_mask=self.write_hot_mask,
+            force_2d=getattr(self, "force_2d", False),
+            device=getattr(self, "device", None),
+        )
+
+        if isinstance(imageset, ImageSequence):
+            max_scan_range = imageset.get_array_range()
+        else:
+            max_scan_range = (0, len(imageset))
+
+        if not self.scan_range or self.scan_range[0] is None:
+            scan_range = [(max_scan_range[0] + 1, max_scan_range[1])]
+        else:
+            scan_range = self.scan_range
+
+        hot_pixels = tuple(flex.size_t() for _ in range(len(imageset.get_detector())))
+        reflections = flex.reflection_table()
+        for j0, j1 in scan_range:
+            if j1 < j0:
+                raise Sorry("Scan range must be in ascending order")
+            elif j0 < max_scan_range[0] or j1 > max_scan_range[1]:
+                raise Sorry(
+                    f"Scan range must be within image range {max_scan_range[0] + 1}..{max_scan_range[1]}"
+                )
+
+            logger.info(f"\nFinding spots in image {j0} to {j1}...")
+            j0 -= 1
+            if isinstance(imageset, ImageSequence):
+                j0 -= imageset.get_array_range()[0]
+                j1 -= imageset.get_array_range()[0]
+            if len(imageset) == 1 or (j0 == 0 and j1 == len(imageset)):
+                r, h = extract_spots(imageset)
+            else:
+                r, h = extract_spots(imageset[j0:j1])
+            reflections.extend(r)
+            if h is not None:
+                for h1, h2 in zip(hot_pixels, h):
+                    h1.extend(h2)
+
+        hot_mask = self._create_hot_mask(imageset, hot_pixels)
+        return reflections, hot_mask
+
+
+class SpotFinderGPU(_SpotFinderGPUMixin, SpotFinder):
+    def __init__(self, *args, force_2d: bool = False, device: torch.device | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.force_2d = force_2d
+        self.device = device or get_default_device()
+
+
+class TOFSpotFinderGPU(_SpotFinderGPUMixin, TOFSpotFinder):
+    def __init__(self, *args, force_2d: bool = False, device: torch.device | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.force_2d = force_2d
+        self.device = device or get_default_device()
+
+
+class LaueSpotFinderGPU(_SpotFinderGPUMixin, LaueSpotFinder):
+    def __init__(self, *args, force_2d: bool = False, device: torch.device | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.force_2d = force_2d
+        self.device = device or get_default_device()
+
+
+class SpotFinderFactoryGPU(SpotFinderFactory):
+    """
+    Factory class to create GPU-accelerated spot finders.
+    """
+
+    @staticmethod
+    def from_parameters(params=None, experiments=None, is_stills=False, device: torch.device | None = None):
+        if params is None:
+            params = phil_scope.fetch(source=parse("")).extract()
+
+        output_shoeboxes = getattr(getattr(params, "output", None), "shoeboxes", True)
+        if params.spotfinder.force_2d and output_shoeboxes is False:
+            no_shoeboxes_2d = True
+        elif experiments is not None and output_shoeboxes is False:
+            no_shoeboxes_2d = False
+            all_stills = True
+            for experiment in experiments:
+                if isinstance(experiment.imageset, ImageSequence):
+                    all_stills = False
+                    break
+            if all_stills:
+                no_shoeboxes_2d = True
+        else:
+            no_shoeboxes_2d = False
+
+        mask = SpotFinderFactory.load_image(params.spotfinder.lookup.mask)
+        params.spotfinder.lookup.mask = mask
+
+        threshold_function = SpotFinderFactoryGPU.configure_threshold(params, device=device)
+
+        mask_generator = functools.partial(
+            dials.util.masking.generate_mask, params=params.spotfinder.filter
+        )
+
+        if params.spotfinder.mp.method == "none":
+            params.spotfinder.mp.method = None
+
+        contains_tof_experiments = False
+        if experiments is not None:
+            for experiment in experiments:
+                if experiment.scan is None:
+                    continue
+                if experiment.scan.has_property("time_of_flight"):
+                    contains_tof_experiments = True
+                elif contains_tof_experiments:
+                    raise RuntimeError("All experiment scans must contain time_of_flight")
+
+        if experiments is not None and experiments.all_tof():
+            if params.spotfinder.filter.max_separation < 6:
+                logger.info("Increasing max allowed peak-centroid distance to 6px")
+                params.spotfinder.filter.max_separation = 6
+            filter_spots = SpotFinderFactoryGPU.configure_filter(params)
+
+            return TOFSpotFinderGPU(
+                experiments=experiments,
+                threshold_function=threshold_function,
+                mask=params.spotfinder.lookup.mask,
+                filter_spots=filter_spots,
+                scan_range=params.spotfinder.scan_range,
+                write_hot_mask=params.spotfinder.write_hot_mask,
+                hot_mask_prefix=params.spotfinder.hot_mask_prefix,
+                mp_method=params.spotfinder.mp.method,
+                mp_nproc=params.spotfinder.mp.nproc,
+                mp_njobs=params.spotfinder.mp.njobs,
+                mp_chunksize=params.spotfinder.mp.chunksize,
+                max_strong_pixel_fraction=params.spotfinder.filter.max_strong_pixel_fraction,
+                compute_mean_background=params.spotfinder.compute_mean_background,
+                region_of_interest=params.spotfinder.region_of_interest,
+                mask_generator=mask_generator,
+                min_spot_size=params.spotfinder.filter.min_spot_size,
+                max_spot_size=params.spotfinder.filter.max_spot_size,
+                min_chunksize=params.spotfinder.mp.min_chunksize,
+                rs_proximity_threshold_multiplier=params.spotfinder.tof.rs_proximity_threshold_multiplier,
+                force_2d=params.spotfinder.force_2d,
+                device=device,
+            )
+
+        if experiments is not None and experiments.all_laue():
+            filter_spots = SpotFinderFactoryGPU.configure_filter(params)
+
+            return LaueSpotFinderGPU(
+                experiments=experiments,
+                threshold_function=threshold_function,
+                mask=params.spotfinder.lookup.mask,
+                filter_spots=filter_spots,
+                scan_range=params.spotfinder.scan_range,
+                write_hot_mask=params.spotfinder.write_hot_mask,
+                hot_mask_prefix=params.spotfinder.hot_mask_prefix,
+                mp_method=params.spotfinder.mp.method,
+                mp_nproc=params.spotfinder.mp.nproc,
+                mp_njobs=params.spotfinder.mp.njobs,
+                mp_chunksize=params.spotfinder.mp.chunksize,
+                max_strong_pixel_fraction=params.spotfinder.filter.max_strong_pixel_fraction,
+                compute_mean_background=params.spotfinder.compute_mean_background,
+                region_of_interest=params.spotfinder.region_of_interest,
+                mask_generator=mask_generator,
+                min_spot_size=params.spotfinder.filter.min_spot_size,
+                max_spot_size=params.spotfinder.filter.max_spot_size,
+                min_chunksize=params.spotfinder.mp.min_chunksize,
+                initial_wavelength=params.spotfinder.laue.initial_wavelength,
+                force_2d=params.spotfinder.force_2d,
+                device=device,
+            )
+
+        filter_spots = SpotFinderFactoryGPU.configure_filter(params)
+
+        return SpotFinderGPU(
+            threshold_function=threshold_function,
+            mask=params.spotfinder.lookup.mask,
+            filter_spots=filter_spots,
+            scan_range=params.spotfinder.scan_range,
+            write_hot_mask=params.spotfinder.write_hot_mask,
+            hot_mask_prefix=params.spotfinder.hot_mask_prefix,
+            mp_method=params.spotfinder.mp.method,
+            mp_nproc=params.spotfinder.mp.nproc,
+            mp_njobs=params.spotfinder.mp.njobs,
+            mp_chunksize=params.spotfinder.mp.chunksize,
+            max_strong_pixel_fraction=params.spotfinder.filter.max_strong_pixel_fraction,
+            compute_mean_background=params.spotfinder.compute_mean_background,
+            region_of_interest=params.spotfinder.region_of_interest,
+            mask_generator=mask_generator,
+            min_spot_size=params.spotfinder.filter.min_spot_size,
+            max_spot_size=params.spotfinder.filter.max_spot_size,
+            no_shoeboxes_2d=no_shoeboxes_2d,
+            min_chunksize=params.spotfinder.mp.min_chunksize,
+            is_stills=is_stills,
+            force_2d=params.spotfinder.force_2d,
+            device=device,
+        )
+
+    @staticmethod
+    def configure_threshold(params, device: torch.device | None = None):
+        alg = params.spotfinder.threshold.algorithm
+        if alg == "dispersion_extended":
+            return DispersionThresholdExtGPU(params, extended=True, device=device)
+        elif alg == "dispersion":
+            return DispersionThresholdExtGPU(params, extended=False, device=device)
+        elif alg == "radial_profile":
+            return RadialProfileSpotFinderThresholdGPU(params, device=device)
+        else:
+            Algorithm = dials.extensions.SpotFinderThreshold.load(alg)
+            return Algorithm(params)
+
+    @staticmethod
+    def configure_filter(params):
+        filters = []
+        if params.spotfinder.filter.max_separation is not None:
+            filters.append(
+                PeakCentroidDistanceFilterGPU(params.spotfinder.filter.max_separation)
+            )
+        if params.spotfinder.filter.background_gradient.filter:
+            bg_filter_params = params.spotfinder.filter.background_gradient
+            filters.append(
+                BackgroundGradientFilter(
+                    background_size=bg_filter_params.background_size,
+                    gradient_cutoff=bg_filter_params.gradient_cutoff,
+                )
+            )
+        if params.spotfinder.filter.spot_density.filter:
+            filters.append(SpotDensityFilterGPU())
+
+        return FilterRunnerGPU(filters)

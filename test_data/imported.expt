@@ -1,0 +1,306 @@
+{
+  "__id__": "ExperimentList",
+  "experiment": [
+    {
+      "__id__": "Experiment",
+      "identifier": "17923989-b039-b7db-6365-75d4fba930d3",
+      "beam": 0,
+      "detector": 0,
+      "goniometer": 0,
+      "scan": 0,
+      "imageset": 0
+    }
+  ],
+  "history": [
+    "2026-10-29T09:46:51Z|dials.import|v3.25.dev0"
+  ],
+  "imageset": [
+    {
+      "__id__": "ImageSequence",
+      "template": "/home/davidm/dials_gpu/test_data/C2sum_1_####.cbf.gz",
+      "mask": null,
+      "gain": null,
+      "pedestal": null,
+      "dx": null,
+      "dy": null,
+      "params": {
+        "dynamic_shadowing": "Auto",
+        "multi_panel": false
+      }
+    }
+  ],
+  "beam": [
+    {
+      "__id__": "monochromatic",
+      "direction": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "wavelength": 1.23985,
+      "divergence": 0.0,
+      "sigma_divergence": 0.0,
+      "polarization_normal": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization_fraction": 0.999,
+      "flux": 0.0,
+      "transmission": 1.0,
+      "probe": "x-ray",
+      "sample_to_source_distance": 0.0
+    }
+  ],
+  "detector": [
+    {
+      "panels": [
+        {
+          "name": "Panel",
+          "type": "SENSOR_PAD",
+          "fast_axis": [
+            1.0,
+            0.0,
+            0.0
+          ],
+          "slow_axis": [
+            0.0,
+            -1.0,
+            0.0
+          ],
+          "origin": [
+            -218.66704000000001,
+            209.22080000000003,
+            -170.0
+          ],
+          "raw_image_offset": [
+            0,
+            0
+          ],
+          "image_size": [
+            2463,
+            2527
+          ],
+          "pixel_size": [
+            0.17200000000000001,
+            0.17200000000000001
+          ],
+          "trusted_range": [
+            0.0,
+            1224245.0
+          ],
+          "thickness": 0.32,
+          "material": "Si",
+          "mu": 7.896517868233737,
+          "identifier": "",
+          "mask": [
+            [
+              487,
+              0,
+              494,
+              2527
+            ],
+            [
+              981,
+              0,
+              988,
+              2527
+            ],
+            [
+              1475,
+              0,
+              1482,
+              2527
+            ],
+            [
+              1969,
+              0,
+              1976,
+              2527
+            ],
+            [
+              0,
+              195,
+              2463,
+              212
+            ],
+            [
+              0,
+              407,
+              2463,
+              424
+            ],
+            [
+              0,
+              619,
+              2463,
+              636
+            ],
+            [
+              0,
+              831,
+              2463,
+              848
+            ],
+            [
+              0,
+              1043,
+              2463,
+              1060
+            ],
+            [
+              0,
+              1255,
+              2463,
+              1272
+            ],
+            [
+              0,
+              1467,
+              2463,
+              1484
+            ],
+            [
+              0,
+              1679,
+              2463,
+              1696
+            ],
+            [
+              0,
+              1891,
+              2463,
+              1908
+            ],
+            [
+              0,
+              2103,
+              2463,
+              2120
+            ],
+            [
+              0,
+              2315,
+              2463,
+              2332
+            ]
+          ],
+          "gain": 1.0,
+          "pedestal": 0.0,
+          "px_mm_strategy": {
+            "type": "ParallaxCorrectedPxMmStrategy"
+          }
+        }
+      ],
+      "hierarchy": {
+        "name": "",
+        "type": "",
+        "fast_axis": [
+          1.0,
+          0.0,
+          0.0
+        ],
+        "slow_axis": [
+          0.0,
+          1.0,
+          0.0
+        ],
+        "origin": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "raw_image_offset": [
+          0,
+          0
+        ],
+        "image_size": [
+          0,
+          0
+        ],
+        "pixel_size": [
+          0.0,
+          0.0
+        ],
+        "trusted_range": [
+          0.0,
+          0.0
+        ],
+        "thickness": 0.0,
+        "material": "",
+        "mu": 0.0,
+        "identifier": "",
+        "mask": [],
+        "gain": 1.0,
+        "pedestal": 0.0,
+        "px_mm_strategy": {
+          "type": "SimplePxMmStrategy"
+        },
+        "children": [
+          {
+            "panel": 0
+          }
+        ]
+      }
+    }
+  ],
+  "goniometer": [
+    {
+      "axes": [
+        [
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.914,
+          0.279,
+          -0.297
+        ],
+        [
+          1.0,
+          0.0,
+          0.0
+        ]
+      ],
+      "angles": [
+        102.6,
+        37.9,
+        0.0
+      ],
+      "names": [
+        "GON_PHI",
+        "GON_KAPPA",
+        "GON_OMEGA"
+      ],
+      "scan_axis": 2
+    }
+  ],
+  "scan": [
+    {
+      "image_range": [
+        1,
+        1
+      ],
+      "batch_offset": 0,
+      "properties": {
+        "epochs": [
+          1463068557.904
+        ],
+        "exposure_time": [
+          0.5
+        ],
+        "oscillation": [
+          0.0
+        ],
+        "oscillation_width": [
+          0.5
+        ]
+      },
+      "valid_image_ranges": {}
+    }
+  ],
+  "crystal": [],
+  "profile": [],
+  "scaling_model": []
+}

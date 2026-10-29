@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dials_gpu"
+version = "0.1.0"
+description = "GPU-accelerated DIALS algorithms using PyTorch"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "torch",
+]
+
+[project.scripts]
+"dials_gpu.find_spots" = "dials_gpu.command_line.find_spots:run"
+
+[tool.setuptools.packages.find]
+where = ["src"]

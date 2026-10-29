@@ -1,0 +1,30 @@
+DIALS (2018) Acta Cryst. D74, 85-97. https://doi.org/10.1107/S2059798317017235
+DIALS 3.dev.1556-g929b88d9a
+The following parameters have been modified:
+
+input {
+  experiments = imported.expt
+}
+
+Setting spotfinder.filter.min_spot_size=3
+Configuring spot finder from input parameters (GPU)
+--------------------------------------------------------------------------------
+Finding strong spots in imageset 0
+--------------------------------------------------------------------------------
+
+Finding spots in image 1 to 1...
+Extracting strong pixels from images on GPU
+Found 1818 strong pixels on image 1
+
+Extracted 329 spots
+Removed 45 spots with size < 3 pixels
+Removed 0 spots with size > 1000 pixels
+Calculated 284 spot centroids
+Calculated 284 spot intensities
+Filtered 284 of 284 spots by peak-centroid distance
+
+Histogram of per-image spot count for imageset 0:
+284 spots found on 1 image
+
+--------------------------------------------------------------------------------
+Saved 284 reflections to strong.refl

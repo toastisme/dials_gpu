@@ -1,0 +1,21 @@
+DIALS (2018) Acta Cryst. D74, 85-97. https://doi.org/10.1107/S2059798317017235
+DIALS 3.dev.1556-g929b88d9a
+The following parameters have been modified:
+
+output {
+  experiments = "/tmp/c2sum_imported.expt"
+}
+input {
+  experiments = <image files>
+}
+
+--------------------------------------------------------------------------------
+  format: <class 'dxtbx.format.FormatCBFMiniPilatusDLS6MSN100.FormatCBFMiniPilatusDLS6MSN100'>
+  template: /home/davidm/diffraction/test_data/C2sum_1/C2sum_1_####.cbf.gz:1:720
+  num images: 720
+  sequences:
+    still:    0
+    sweep:    1
+  num stills: 0
+--------------------------------------------------------------------------------
+Writing experiments to /tmp/c2sum_imported.expt
