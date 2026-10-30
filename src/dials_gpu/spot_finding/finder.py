@@ -215,7 +215,7 @@ def _try_load_hdf5_raw_volume_gpu(
                         device=device, non_blocking=True
                     )
                     if device.type == "cuda":
-                        if len(_HDF5_GPU_VOLUME_CACHE) >= 8:
+                        if len(_HDF5_GPU_VOLUME_CACHE) >= 2:
                             _HDF5_GPU_VOLUME_CACHE.popitem(last=False)
                         _HDF5_GPU_VOLUME_CACHE[gpu_key] = vol_t
                     return vol_t
@@ -260,7 +260,7 @@ def _try_load_hdf5_raw_volume_gpu(
             out_np = out_np.astype(np.int32)
         vol_t = torch.from_numpy(out_np).to(device=device, non_blocking=True)
     if device.type == "cuda":
-        if len(_HDF5_GPU_VOLUME_CACHE) >= 8:
+        if len(_HDF5_GPU_VOLUME_CACHE) >= 2:
             _HDF5_GPU_VOLUME_CACHE.popitem(last=False)
         _HDF5_GPU_VOLUME_CACHE[gpu_key] = vol_t
     return vol_t
