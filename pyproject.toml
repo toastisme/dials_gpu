@@ -15,6 +15,7 @@ dependencies = [
 [project.scripts]
 "dials_gpu.find_spots" = "dials_gpu.command_line.find_spots:run"
 "dials_gpu.index" = "dials_gpu.command_line.index:run"
+"dials_gpu.refine" = "dials_gpu.command_line.refine:run"
 
 [tool.setuptools.packages.find]
 where = ["src"]

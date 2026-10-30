@@ -5,11 +5,12 @@ GPU-accelerated implementations of [DIALS](https://dials.github.io/) crystallogr
 ## Command-Line Tools
 
 - `dials_gpu.find_spots`: Drop-in GPU replacement for `dials.find_spots` supporting all standard DIALS PHIL parameters and spot-finding algorithms (`dispersion_extended`, `dispersion`, `radial_profile`, 2D/3D connected component labelling, centroiding, intensity summation, shoebox extraction, and spot filtering).
-- `dials_gpu.index`: Drop-in GPU replacement for `dials.index` supporting all standard DIALS PHIL parameters and indexing algorithms (`fft3d`, `fft1d`, `real_space_grid_search`, `low_res_spot_match`, `find_max_cell`, `optimise_basis_vectors`, `candidate_orientation_matrices`, `AssignIndicesGlobal` / `AssignIndicesLocal`, `non_primitive_basis`, rotation sequences, stills, and multi-lattice indexing).
+- `dials_gpu.index`: Drop-in GPU replacement for `dials.index` supporting all standard DIALS PHIL parameters and indexing algorithms (`fft3d`, `fft1d`, `real_space_grid_search`, `low_res_spot_match`, `find_max_cell`, `optimise_basis_vectors`, `candidate_orientation_matrices`, `AssignIndicesGlobal` / `AssignIndicesLocal`, `non_primitive_basis`, rotation sequences, stills, and multi-lattice indexing), with all internal candidate orientation evaluation (`choose_best_orientation_matrix` / `ModelEvaluation`) and macro-cycle refinement (`Indexer.refine`) mapped to the GPU.
+- `dials_gpu.refine`: Drop-in GPU replacement for `dials.refine` supporting all standard DIALS PHIL parameters and refinement algorithms (scan-static and scan-varying refinement, stills and spherical-relp stills refinement, single/multi-panel and hierarchical detectors, `mcd` / `tukey` / `sauter_poon` GPU centroid outlier rejection, `LevMar` / `GaussNewton` / `SimpleLBFGS` / `LBFGScurvs` / `SparseLevMar` engines, restraints, constraints, and `AutoReduce`).
 
 ## Usage
 
-Activate the DIALS environment and run `dials_gpu.find_spots` and `dials_gpu.index` with the exact same arguments as `dials.find_spots` and `dials.index`:
+Activate the DIALS environment and run `dials_gpu.find_spots`, `dials_gpu.index`, and `dials_gpu.refine` with the exact same arguments as `dials.find_spots`, `dials.index`, and `dials.refine`:
 
 ```bash
 source /home/davidm/diffraction/dials/dials
@@ -22,23 +23,29 @@ dials_gpu.index imported.expt strong.refl
 dials_gpu.index imported.expt strong.refl indexing.method=fft1d
 dials_gpu.index imported.expt strong.refl indexing.method=real_space_grid_search \
     known_symmetry.unit_cell=11.39,13.30,15.82,90,99.02,90 known_symmetry.space_group=P21/n
+
+# 3. Refinement (scan-static or scan-varying)
+dials_gpu.refine indexed.expt indexed.refl scan_varying=False
+dials_gpu.refine indexed.expt indexed.refl scan_varying=True
 ```
 
 ---
 
 ## Performance Optimization Tips
 
-### 1. In-Process Python API for RL / ML Training Loops (Spot-Finding + Indexing in ~270 ms per `.nxs` file)
-Spawning new CLI subprocesses (`dials_gpu.find_spots ...`, `dials_gpu.index ...`) on every RL step incurs ~1.5–2.0 s of Python, `dxtbx`, and CUDA context initialization overhead. For Reinforcement Learning (RL) or hyperparameter optimization, call [`from_observations_gpu`](src/dials_gpu/command_line/find_spots.py) and [`index`](src/dials_gpu/command_line/index.py) directly inside your long-lived Python training process:
+### 1. In-Process Python API for RL / ML Training Loops (Spot-Finding + Indexing + Refinement in ~330 ms per `.nxs` file)
+Spawning new CLI subprocesses (`dials_gpu.find_spots ...`, `dials_gpu.index ...`, `dials_gpu.refine ...`) on every RL step incurs ~1.5–2.0 s of Python, `dxtbx`, and CUDA context initialization overhead. For Reinforcement Learning (RL) or hyperparameter optimization, call [`from_observations_gpu`](src/dials_gpu/command_line/find_spots.py), [`index`](src/dials_gpu/command_line/index.py), and [`RefinerFactoryGPU`](src/dials_gpu/refinement/refiner.py) directly inside your long-lived Python training process:
 
 ```python
 import copy
-from dxtbx.model.experiment_list import ExperimentList, ExperimentListFactory
+from dxtbx.model.experiment_list import ExperimentList
 from iotbx.phil import parse
 from dials.command_line.find_spots import phil_scope as spot_phil_scope
 from dials.command_line.index import phil_scope as index_phil_scope
+from dials.command_line.refine import working_phil as refine_phil_scope
 from dials_gpu.command_line.find_spots import from_observations_gpu
 from dials_gpu.command_line.index import index as index_gpu
+from dials_gpu.refinement import RefinerFactoryGPU
 
 # 1. Load ExperimentList once per dataset (from imported.expt or .nxs) and keep in memory
 expts = ExperimentList.from_file("imported.expt")
@@ -51,6 +58,9 @@ base_index_phil = index_phil_scope.fetch(
         "indexing.basis_vector_combinations.max_refine=5\n"
         "indexing.refinement_protocol.n_macro_cycles=2"
     )
+)
+base_refine_phil = refine_phil_scope.fetch(
+    source=parse("refinement.parameterisation.scan_varying=False")
 )
 
 def rl_episode(sigma_b: float, sigma_s: float, kernel_xy: int, min_spot_size: int):
@@ -68,19 +78,23 @@ def rl_episode(sigma_b: float, sigma_s: float, kernel_xy: int, min_spot_size: in
     indexed_expts, indexed_refl = index_gpu(
         copy.deepcopy(expts), [strong_refl], idx_params
     )
-    return indexed_expts, indexed_refl
+
+    # Refinement on GPU (~64 ms scan-static, ~118 ms scan-varying)
+    refiner = RefinerFactoryGPU.from_parameters_data_experiments(
+        base_refine_phil.extract(), indexed_refl, indexed_expts
+    )
+    refiner.run()
+    return refiner.get_experiments(), refiner.rmsds()
 ```
 
-### 2. Optimizing `dials_gpu.index` for Many Small `.expt` Files (RL / ML Workloads)
-In `dials_gpu.index`, all basis-vector search and indexing steps (`find_max_cell`, `fft3d` / `fft1d` / `real_space_grid_search`, `optimise_basis_vectors`, `candidate_orientation_matrices`, `assign_indices`, `non_primitive_basis`) run on the GPU in **~40–60 ms total** (down from ~1,630 ms on CPU for `fft3d`, a **38.3× speedup**).
+### 2. Optimizing `dials_gpu.index` and `dials_gpu.refine` for Many Small `.expt` Files (RL / ML Workloads)
+In `dials_gpu.index`, all basis-vector search, indexing, and refinement steps run on the GPU:
+- **Basis-vector search & index assignment** (`find_max_cell`, `fft3d` / `fft1d` / `real_space_grid_search`, `optimise_basis_vectors`, `candidate_orientation_matrices`, `assign_indices`, `non_primitive_basis`) execute on the GPU in **~40–60 ms total** (down from ~1,630 ms on CPU for `fft3d`, a **38.3× speedup**).
+- **Candidate orientation evaluation (`choose_best_orientation_matrix`) & macro-cycle refinement (`Indexer.refine`)** use [`RefinerFactoryGPU`](src/dials_gpu/refinement/refiner.py) and [`ExperimentsPredictorFactoryGPU`](src/dials_gpu/refinement/predictor.py), computing reflections predictions, analytical state/prediction derivatives, dense Jacobians, and centroid outlier rejection (`MCD` / `Tukey` / `SauterPoon`) on the GPU without subprocess fork overhead.
 
-The remaining runtime in default `dials.index` (~1,200 ms) is spent in **CPU crystal/geometry refinement**:
-1. `choose_best_orientation_matrix` (`ModelEvaluation`): refines up to `max_refine=50` candidate orientation matrices sequentially when `nproc=1` (~850 ms).
-2. `Indexer.refine`: runs `n_macro_cycles=5` full refinement macro-cycles (~350 ms).
-
-To achieve maximum indexing throughput on many small `.expt` files:
-- **Reduce `max_refine` and `n_macro_cycles`**: Because the winning orientation matrix is almost always among the top 3–5 candidates, setting `max_refine=5` and `n_macro_cycles=2` reduces `dials_gpu.index` runtime from `1,299 ms` to **`278 ms/file`** (**6.6× faster** than CPU `dials.index`, or **`217 ms/file` / 8.2× faster** with `max_refine=3, n_macro_cycles=1`) while producing the exact same unit cells as CPU `dials.index` (`0.00000` max unit cell difference).
-- **Parallelize `ModelEvaluation` with `nproc=4`**: If you need all 50 candidate refinements (`max_refine=50`), pass `indexing.nproc=4` so `choose_best_orientation_matrix` evaluates candidates across 4 CPU cores in parallel while the GPU handles the FFT / grid search.
+To achieve maximum indexing and refinement throughput on many small `.expt` files:
+- **Reduce `max_refine` and `n_macro_cycles` in `dials_gpu.index`**: Because the winning orientation matrix is almost always among the top 3–5 candidates, setting `max_refine=5` and `n_macro_cycles=2` reduces `dials_gpu.index` runtime to **`278–299 ms/file`** (**6.1–6.6× faster** than CPU `dials.index`, or **`217–229 ms/file` / ~8× faster** with `max_refine=3, n_macro_cycles=1`) while producing identical unit cells (`0.00000` max unit cell difference).
+- **Avoid `multiprocessing.fork()` in `dials.refine` on small wedges**: Standard CPU `dials.refine` defaults to `refinement.reflections.outlier.nproc=4`, spending ~560 ms per `.expt` file forking worker processes for MCD outlier rejection. `RefinerFactoryGPU` runs MCD, Tukey, and Sauter-Poon outlier rejection in-process on the GPU in < 2 ms, completing full scan-static refinement in **`64.0 ms/file`** (**11.1× faster** than default CPU `dials.refine`) and scan-varying refinement in **`118.0 ms/file`** (**7.1× faster** than default CPU `dials.refine`).
 
 ### 3. Understanding & Ordering Dataset Sweeps for the Two-Tier HDF5 Cache
 For single-panel HDF5/NeXus (`.nxs` / `.h5`) datasets (up to 64 frames per scan, such as 25-image wedges), `dials_gpu` uses a two-tier cache in [`finder.py`](src/dials_gpu/spot_finding/finder.py):
@@ -138,3 +152,16 @@ For single-panel HDF5/NeXus (`.nxs` / `.h5`) datasets (up to 64 frames per scan,
 | **`fft3d` (RL Fast: `max_refine=5, n_macro_cycles=2`)** | `1,846.8 ms/file` | **`278.5 ms/file`** | **`6.63×`** (`10.3×` vs default CPU) | `1,395` (CPU) / `1,395` (GPU) | `0.00000` |
 | **`fft1d` (RL Fast: `max_refine=5, n_macro_cycles=2`)** | `440.4 ms/file` | **`229.5 ms/file`** | **`1.92×`** (`5.2×` vs default CPU) | `1,600` (CPU) / `1,600` (GPU) | `0.00000` |
 | **`fft3d` (RL Ultra: `max_refine=3, n_macro_cycles=1`)** | `1,769.8 ms/file` | **`217.3 ms/file`** | **`8.15×`** (`13.2×` vs default CPU) | `1,250` (CPU) / `1,250` (GPU) | `0.00000` |
+
+### 4. Refinement (`dials_gpu.refine` on `i19` 25-image `.expt` Files & `from-xds-all` 27k Reflections)
+
+| Refinement Configuration | CPU (`dials.refine`) | GPU (`dials_gpu.refine`) | Speedup vs CPU | Max RMSD Diff vs CPU |
+| :--- | ---: | ---: | ---: | ---: |
+| `i19` Small Wedge (`scan_varying=False`, default PHIL) | `710.6 ms/file` | **`64.0 ms/file`** | **`11.10×`** | `2.69e-15` |
+| `i19` Small Wedge (`scan_varying=True`, default PHIL) | `837.3 ms/file` | **`118.0 ms/file`** | **`7.10×`** | `3.59e-15` |
+| `i19` Small Wedge (`scan_varying=False`, `outlier.nproc=1`) | `150.1 ms/file` | **`64.0 ms/file`** | **`2.34×`** | `2.69e-15` |
+| `i19` Small Wedge (`scan_varying=True`, `outlier.nproc=1`) | `256.6 ms/file` | **`118.0 ms/file`** | **`2.17×`** | `3.59e-15` |
+| `from-xds-all` (`26,993` refl, `scan_varying=False, nproc=1`) | `2,477.4 ms` | **`660.1 ms`** | **`3.75×`** | `2.07e-15` |
+| `from-xds-all` (`26,993` refl, `scan_varying=True, nproc=1`) | `6,553.6 ms` | **`2,890.6 ms`** | **`2.27×`** | `4.27e-15` |
+| Target Analytical Gradients + Dense Jacobian (`26,993` refl, `sv=False`) | `20.11 ms/step` | **`5.69 ms/step`** | **`3.53×`** | `< 1e-15` |
+| Target Analytical Gradients + Dense Jacobian (`26,993` refl, `sv=True`) | `20.24 ms/step` | **`5.61 ms/step`** | **`3.61×`** | `< 1e-15` |
