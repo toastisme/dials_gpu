@@ -227,7 +227,7 @@ def _try_load_hdf5_raw_volume_gpu(
     n_elems = H * W
     out_dtype = np.int32 if dtype == np.uint32 else dtype
     pin_key = (B, H, W, out_dtype)
-    pinned_t = _PINNED_HOST_VOL_CACHE.get(pin_key)
+    pinned_t = _PINNED_HOST_VOL_CACHE.get(pin_key) if device.type == "cuda" else None
     if pinned_t is None and out_dtype == np.int32 and device.type == "cuda":
         if len(_PINNED_HOST_VOL_CACHE) >= 2:
             _PINNED_HOST_VOL_CACHE.clear()
