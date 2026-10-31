@@ -18,6 +18,7 @@ dependencies = [
 "dials_gpu.refine" = "dials_gpu.command_line.refine:run"
 "dials_gpu.integrate" = "dials_gpu.command_line.integrate:run"
 "dials_gpu.interate" = "dials_gpu.command_line.integrate:run"
+"dials_gpu.scale" = "dials_gpu.command_line.scale:run"
 
 [tool.setuptools.packages.find]
 where = ["src"]

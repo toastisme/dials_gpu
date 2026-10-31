@@ -8,10 +8,11 @@ GPU-accelerated implementations of [DIALS](https://dials.github.io/) crystallogr
 - `dials_gpu.index`: Drop-in GPU replacement for `dials.index` supporting all standard DIALS PHIL parameters and indexing algorithms (`fft3d`, `fft1d`, `real_space_grid_search`, `low_res_spot_match`, `find_max_cell`, `optimise_basis_vectors`, `candidate_orientation_matrices`, `AssignIndicesGlobal` / `AssignIndicesLocal`, `non_primitive_basis`, rotation sequences, stills, and multi-lattice indexing), with all internal candidate orientation evaluation (`choose_best_orientation_matrix` / `ModelEvaluation`) and macro-cycle refinement (`Indexer.refine`) mapped to the GPU.
 - `dials_gpu.refine`: Drop-in GPU replacement for `dials.refine` supporting all standard DIALS PHIL parameters and refinement algorithms (scan-static and scan-varying refinement, stills and spherical-relp stills refinement, single/multi-panel and hierarchical detectors, `mcd` / `tukey` / `sauter_poon` GPU centroid outlier rejection, `LevMar` / `GaussNewton` / `SimpleLBFGS` / `LBFGScurvs` / `SparseLevMar` engines, restraints, constraints, and `AutoReduce`).
 - `dials_gpu.integrate` (and alias `dials_gpu.interate`): Drop-in GPU replacement for `dials.integrate` supporting all standard DIALS PHIL parameters and integration algorithms (`3d`, `flat3d`, `2d`, `single2d`, `stills`, `3d_threaded` integrators; `glm` Cantoni & Ronchetti robust Poisson IRLS background, `simple` `null`/`nsigma`/`tukey`/`truncated` + `constant2d`/`constant3d`/`linear2d`/`linear3d` background, `auto` / `null` background; `simple` 3D shoebox centroiding with parallax correction; 3D/2D summation integration; `gaussian_rs` scan-static and scan-varying profile modelling and fitting; Lorentz-polarization and QE corrections; `SignificanceFilter`, `kapton_2019` absorption correction, and `frame_slice_shoeboxes`).
+- `dials_gpu.scale`: Drop-in GPU replacement for `dials.scale` supporting all standard DIALS PHIL parameters and scaling algorithms (`physical`, `KB`, `array`, and `dose_decay` scaling models; 1D/2D/3D Gaussian smoothers, spherical harmonic `SHScaleComponent` absorption surface, `SingleScaleFactor`, `SingleBScaleFactor`, `QuadraticBScaleComponent`; `RefinerCalculatorGPU` multi-component product rule; `IhTableGPU` vectorized symmetry group blocking and `scatter_add_` `calc_Ih`; `ScalingTargetGPU` and `ScalingTargetFixedIHGPU` analytical L-BFGS gradients and dense Gauss-Newton / Levenberg-Marquardt Jacobians; `NormDevOutlierRejectionGPU`, `SimpleNormDevOutlierRejectionGPU`, and `TargetedOutlierRejectionGPU`; `SingleDatasetIntensityCombinerGPU` and `MultiDatasetIntensityCombinerGPU`; `ErrorModelRefineryGPU` and `ErrorModelTargetRegressionGPU`; `SingleScalerGPU`, `MultiScalerGPU`, `TargetScalerGPU`, `ScaleAndFilterAlgorithmGPU`, and cross-validation).
 
 ## Usage
 
-Activate the DIALS environment and run `dials_gpu.find_spots`, `dials_gpu.index`, `dials_gpu.refine`, and `dials_gpu.integrate` with the exact same arguments as `dials.find_spots`, `dials.index`, `dials.refine`, and `dials.integrate`:
+Activate the DIALS environment and run `dials_gpu.find_spots`, `dials_gpu.index`, `dials_gpu.refine`, `dials_gpu.integrate`, and `dials_gpu.scale` with the exact same arguments as `dials.find_spots`, `dials.index`, `dials.refine`, `dials.integrate`, and `dials.scale`:
 
 ```bash
 source /home/davidm/diffraction/dials/dials
@@ -32,14 +33,19 @@ dials_gpu.refine indexed.expt indexed.refl scan_varying=True
 # 4. Integration (full 3D + GLM + profile fitting, or fast summation-only)
 dials_gpu.integrate refined.expt refined.refl
 dials_gpu.integrate refined.expt refined.refl integration.profile.fitting=False
+
+# 5. Scaling (single sweep, multi-sweep, targeted scaling, or scale-and-filter)
+dials_gpu.scale integrated.refl integrated.expt
+dials_gpu.scale sweep1.refl sweep1.expt sweep2.refl sweep2.expt model=physical
+dials_gpu.scale integrated.refl integrated.expt model=dose_decay full_matrix=False
 ```
 
 ---
 
 ## Performance Optimization Tips
 
-### 1. In-Process Python API for RL / ML Training Loops (Full Spot-Finding → Indexing → Refinement → Integration Pipeline)
-Spawning new CLI subprocesses (`dials_gpu.find_spots ...`, `dials_gpu.index ...`, `dials_gpu.refine ...`, `dials_gpu.integrate ...`) on every RL step incurs ~1.5–2.0 s of Python, `dxtbx`, and CUDA context initialization overhead. For Reinforcement Learning (RL) or hyperparameter optimization, call [`from_observations_gpu`](src/dials_gpu/command_line/find_spots.py), [`index`](src/dials_gpu/command_line/index.py), [`RefinerFactoryGPU`](src/dials_gpu/refinement/refiner.py), and [`run_integration`](src/dials_gpu/command_line/integrate.py) directly inside your long-lived Python training process:
+### 1. In-Process Python API for RL / ML Training Loops (Full Spot-Finding → Indexing → Refinement → Integration → Scaling Pipeline)
+Spawning new CLI subprocesses (`dials_gpu.find_spots ...`, `dials_gpu.index ...`, `dials_gpu.refine ...`, `dials_gpu.integrate ...`, `dials_gpu.scale ...`) on every RL step incurs ~1.5–2.0 s of Python, `dxtbx`, and CUDA context initialization overhead. For Reinforcement Learning (RL) or hyperparameter optimization, call [`from_observations_gpu`](src/dials_gpu/command_line/find_spots.py), [`index`](src/dials_gpu/command_line/index.py), [`RefinerFactoryGPU`](src/dials_gpu/refinement/refiner.py), [`run_integration`](src/dials_gpu/command_line/integrate.py), and [`run_scaling`](src/dials_gpu/command_line/scale.py) directly inside your long-lived Python training process:
 
 ```python
 import copy
@@ -49,10 +55,12 @@ from dials.command_line.find_spots import phil_scope as spot_phil_scope
 from dials.command_line.index import phil_scope as index_phil_scope
 from dials.command_line.refine import working_phil as refine_phil_scope
 from dials.command_line.integrate import phil_scope as integrate_phil_scope
+from dials.command_line.scale import phil_scope as scale_phil_scope
 from dials_gpu.command_line.find_spots import from_observations_gpu
 from dials_gpu.command_line.index import index as index_gpu
 from dials_gpu.refinement import RefinerFactoryGPU
 from dials_gpu.command_line.integrate import run_integration as integrate_gpu
+from dials_gpu.command_line.scale import run_scaling as scale_gpu
 
 # 1. Load ExperimentList once per dataset (from imported.expt or .nxs) and keep in memory
 expts = ExperimentList.from_file("imported.expt")
@@ -71,6 +79,9 @@ base_refine_phil = refine_phil_scope.fetch(
 )
 base_integrate_phil = integrate_phil_scope.fetch(
     source=parse("integration.mp.nproc=1\nintegration.profile.fitting=False")
+)
+base_scale_phil = scale_phil_scope.fetch(
+    source=parse("scaling_options.nproc=1\nscaling_options.full_matrix=False\noutput.html=None")
 )
 
 def rl_episode(sigma_b: float, sigma_s: float, kernel_xy: int, min_spot_size: int):
@@ -101,7 +112,12 @@ def rl_episode(sigma_b: float, sigma_s: float, kernel_xy: int, min_spot_size: in
     integrated_expts, integrated_refl, _ = integrate_gpu(
         base_integrate_phil.extract(), refined_expts, refined_refl
     )
-    return integrated_expts, integrated_refl
+
+    # Scaling on GPU (~65–85 ms/file single sweep, or ~185–700 ms joint multi-sweep)
+    scaled_expts, scaled_refl = scale_gpu(
+        base_scale_phil.extract(), integrated_expts, [integrated_refl]
+    )
+    return scaled_expts, scaled_refl
 ```
 
 ### 2. Optimizing `dials_gpu.index`, `dials_gpu.refine`, and `dials_gpu.integrate` for Many Small `.expt` Files (RL / ML Workloads)
@@ -203,8 +219,36 @@ For single-panel HDF5/NeXus (`.nxs` / `.h5`) datasets (up to 64 frames per scan,
 #### 5b. End-to-End Integration across 5 `i19` 25-image `.nxs` Datasets (`301_Nidppe_f3_phi0`)
 
 | Configuration | CPU (`dials.integrate`) | GPU (`dials_gpu.integrate`) | Speedup vs CPU | Total Integrated Reflections |
-| :--- | ---: | ---: | ---: | ---: |
+| :--- | ---: | ---: | ---: | :--- |
 | **Default (`3D + GLM + Profile Fitting`, `nproc=1` vs GPU)** | `2,909.2 ms/file` | **`327.6 ms/file`** | **`8.88×`** | `13,587` (CPU) / `13,587` (GPU) |
 | **Default (`3D + GLM + Profile Fitting`, `nproc=4` vs GPU)** | `2,820.1 ms/file` | **`438.4 ms/file`** | **`6.43×`** | `13,680` (CPU) / `13,587` (GPU) |
 | **Summation Only (`3D + GLM, profile.fitting=False`, `nproc=4` vs GPU)** | `1,468.9 ms/file` | **`250.9 ms/file`** | **`5.86×`** | `13,459` (CPU) / `13,367` (GPU) |
 | **Summation Only (`3D + GLM, profile.fitting=False`, `nproc=1` vs GPU)** | `1,485.8 ms/file` | **`282.3 ms/file`** | **`5.26×`** | `13,367` (CPU) / `13,367` (GPU) |
+
+### 6. Scaling (`dials_gpu.scale` on `i19` 25-image `.nxs` Sweeps & 50k Reflection Blocks)
+
+#### 6a. Per-Algorithm / Kernel Micro-Benchmarks (`N = 50,000` Reflections)
+
+| Scaling Kernel / Algorithm | CPU (`dials.scale`) | GPU (`dials_gpu.scale`) | Speedup | Max Numerical Diff vs CPU |
+| :--- | ---: | ---: | ---: | ---: |
+| `ScalingTarget.compute_functional_gradients` (L-BFGS analytical gradients) | `15.48 ms` | **`0.35 ms`** | **`43.81×`** | `6.29e-09` |
+| `ScalingTarget.compute_residuals_and_gradients` (LevMar dense Jacobian) | `46.56 ms` | **`1.22 ms`** | **`38.03×`** | `5.68e-13` |
+| `RefinerCalculator` (multi-component product rule scales + derivatives) | `15.93 ms` | **`1.26 ms`** | **`12.63×`** | `8.88e-16` |
+| `SmoothBScaleComponent1D` (1D Gaussian smoother B-factor + derivatives) | `5.48 ms` | **`0.48 ms`** | **`11.45×`** | `4.44e-16` |
+| `SmoothScaleComponent1D` (1D Gaussian smoother scale + derivatives) | `3.70 ms` | **`0.38 ms`** | **`9.64×`** | `6.66e-16` |
+| `NormDevOutlierRejection` (iterative round-robin z-score outlier rejection) | `50.94 ms` | **`14.16 ms`** | **`3.60×`** | `0` outlier diffs |
+| `IhTableBlock.calc_Ih` (`scatter_add_` symmetry group intensity averaging) | `0.63 ms` | **`0.26 ms`** | **`2.44×`** | `4.55e-13` |
+
+#### 6b. End-to-End Scaling across 10 `i19` 25-image `.nxs` Sweeps (`301_Nidppe_f3_phi0`, 13,242 Reflections)
+
+| Scaling Configuration | CPU (`dials.scale`) | GPU (`dials_gpu.scale`) | Speedup vs CPU | Mean Relative Scale Diff |
+| :--- | ---: | ---: | ---: | ---: |
+| **Single-file loop (`dose_decay, SimpleLBFGS, full_mat=True`)** | `203.68 ms/file` | **`66.12 ms/file`** | **`3.08×`** | `6.11e-08` |
+| **Single-file loop (`physical, SimpleLBFGS, full_mat=False`)** | `213.90 ms/file` | **`76.30 ms/file`** | **`2.80×`** | `8.11e-08` |
+| **Single-file loop (`physical, SimpleLBFGS, full_mat=True`)** | `224.23 ms/file` | **`84.47 ms/file`** | **`2.65×`** | `7.34e-08` |
+| **Joint 10-sweep (`dose_decay, full_mat=False`)** | `1,799.31 ms` | **`676.81 ms`** | **`2.66×`** | `4.29e-02` |
+| **Joint 5-sweep (`dose_decay, full_mat=False`)** | `617.47 ms` | **`240.59 ms`** | **`2.57×`** | `2.40e-09` |
+| **Joint 5-sweep (`KB, full_mat=False`)** | `468.92 ms` | **`189.06 ms`** | **`2.48×`** | `9.09e-15` |
+| **Joint 10-sweep (`KB, full_mat=False`)** | `1,016.42 ms` | **`485.53 ms`** | **`2.09×`** | `5.65e-07` |
+| **Joint 10-sweep (`physical, full_mat=False`)** | `1,384.96 ms` | **`735.45 ms`** | **`1.88×`** | `4.06e-02` |
+| **Joint 10-sweep (`physical, full_mat=True`)** | `1,298.18 ms` | **`698.69 ms`** | **`1.86×`** | `4.26e-02` |
