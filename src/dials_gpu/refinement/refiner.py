@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import logging
 
+from dxtbx import flumpy
 import libtbx
+import numpy as np
 from scitbx.array_family import flex
 
 from dials.algorithms.refinement import DialsRefineConfigError
@@ -33,7 +35,10 @@ from dials_gpu.refinement.engine import (
     SimpleLBFGSGPU,
     SparseLevenbergMarquardtIterationsGPU,
 )
-from dials_gpu.refinement.outlier_detection import ReflectionManagerFactoryGPU
+from dials_gpu.refinement.outlier_detection import (
+    BlockCalculatorGPU,
+    ReflectionManagerFactoryGPU,
+)
 from dials_gpu.refinement.parameterisation import build_prediction_parameterisation_gpu
 from dials_gpu.refinement.predictor import ExperimentsPredictorFactoryGPU
 from dials_gpu.refinement.target import TargetFactoryGPU
@@ -41,13 +46,36 @@ from dials_gpu.refinement.target import TargetFactoryGPU
 logger = logging.getLogger(__name__)
 
 
-class RefinerGPU(Refiner):
+class _GPURefinerMixin:
+    """Mixin for Refiner avoiding redundant 25-column deep copies and sorts."""
+
+    def selection_used_for_refinement(self):
+        obs = self._refman.get_obs()
+        used = obs.get_flags(obs.flags.used_in_refinement)
+        isel = obs["iobs"] if used.count(False) == 0 else obs["iobs"].select(used)
+        selection = flex.bool(len(self._refman.get_indexed()), False)
+        selection.set_selected(isel, True)
+        return selection
+
+    def predict_for_indexed(self):
+        reflections = self.predict_for_reflection_table(
+            self._refman.get_indexed(), skip_derivatives=True
+        )
+        iobs_np = flumpy.to_numpy(reflections["iobs"])
+        if len(iobs_np) > 1 and np.any(iobs_np[:-1] > iobs_np[1:]):
+            reflections.sort("iobs")
+        mask = self.selection_used_for_refinement()
+        reflections.set_flags(mask, reflections.flags.used_in_refinement)
+        return reflections
+
+
+class RefinerGPU(_GPURefinerMixin, Refiner):
     """GPU-accelerated Refiner."""
 
     pass
 
 
-class ScanVaryingRefinerGPU(ScanVaryingRefiner):
+class ScanVaryingRefinerGPU(_GPURefinerMixin, ScanVaryingRefiner):
     """GPU-accelerated ScanVaryingRefiner."""
 
     pass
@@ -89,7 +117,7 @@ class RefinerFactoryGPU(RefinerFactory):
             if params.refinement.parameterisation.trim_scan_to_observations:
                 experiments = _trim_scans_to_observations(experiments, reflections)
 
-            block_calculator = BlockCalculator(experiments, reflections)
+            block_calculator = BlockCalculatorGPU(experiments, reflections)
             if params.refinement.parameterisation.compose_model_per == "block":
                 reflections = block_calculator.per_width(
                     params.refinement.parameterisation.block_width, deg=True
@@ -213,7 +241,8 @@ class RefinerFactoryGPU(RefinerFactory):
 
         nparam = len(pred_param)
         ndim = target.dim
-        nref = len(refman.get_matches())
+        obs = refman.get_obs()
+        nref = obs.get_flags(obs.flags.used_in_refinement).count(True)
         logger.info(
             "There are %s parameters to refine against %s reflections in %s dimensions",
             nparam,

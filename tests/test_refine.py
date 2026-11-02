@@ -29,8 +29,20 @@ TEST_I19_NXS = pathlib.Path(
 def i19_indexed_fixture():
     if not TEST_I19_NXS.exists():
         pytest.skip("i19 .nxs test dataset not present")
+    flex.set_random_seed(42)
     expts = ExperimentListFactory.from_filenames([str(TEST_I19_NXS)])
     refl = from_observations_gpu(expts)
+    from dials_gpu.spot_finding.finder import _cleanup_spotfinding_caches
+    from dials_gpu.spot_finding.threshold import (
+        _TRITON_BATCH_SCRATCH_CACHE,
+        _TRITON_SCRATCH_CACHE,
+    )
+
+    _cleanup_spotfinding_caches()
+    _TRITON_SCRATCH_CACHE.clear()
+    _TRITON_BATCH_SCRATCH_CACHE.clear()
+    torch.cuda.empty_cache()
+
     idx_params = index_phil_scope.fetch(source=parse("indexing.method=fft3d")).extract()
     idx_expts, idx_refl = index_experiments_gpu(
         copy.deepcopy(expts), [copy.deepcopy(refl)], idx_params

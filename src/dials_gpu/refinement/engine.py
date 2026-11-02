@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 
+from dxtbx import flumpy
 from libtbx import easy_mp
 from scitbx import sparse
 
@@ -37,7 +38,8 @@ logger = logging.getLogger(__name__)
 
 class AdaptLstbxGPU(AdaptLstbx):
     """GPU-accelerated AdaptLstbx that bypasses scitbx.sparse.matrix construction
-    whenever dense normal equations (GaussNewton, LevMar) are used.
+    and computes normal equations directly on GPU whenever dense normal equations
+    (GaussNewton, LevMar) are used.
     """
 
     def prepare_for_step(self):
@@ -60,15 +62,44 @@ class AdaptLstbxGPU(AdaptLstbx):
             self.add_residuals(residuals, weights)
         else:
             blocks = self._target.split_matches_into_blocks(nproc=1)
+            need_explicit_jacobian = (
+                "jacobian_structure" in self.history
+                or "parameter_correlation" in self.history
+                or "condition_number" in self.history
+            )
+            use_gpu_normal_eqns = (
+                not isinstance(self, AdaptLstbxSparse)
+                and not need_explicit_jacobian
+                and hasattr(self._target, "compute_residuals_and_normal_equations_gpu")
+                and hasattr(
+                    self._target._prediction_parameterisation, "get_gradients_gpu"
+                )
+            )
             use_fast_dense = (
                 not isinstance(self, AdaptLstbxSparse)
                 and "jacobian_structure" not in self.history
                 and hasattr(self._target, "compute_residuals_and_dense_jacobian_gpu")
-                and hasattr(self._target._prediction_parameterisation, "get_gradients_gpu")
+                and hasattr(
+                    self._target._prediction_parameterisation, "get_gradients_gpu"
+                )
             )
 
+            jacobian = None
             for block in blocks:
-                if use_fast_dense:
+                if use_gpu_normal_eqns:
+                    (
+                        residuals,
+                        weights,
+                        a_packed,
+                        rhs_np,
+                    ) = self._target.compute_residuals_and_normal_equations_gpu(
+                        block, constr_manager=self._constr_manager
+                    )
+                    self.add_residuals(residuals, weights)
+                    step_eqns = self.step_equations()
+                    flumpy.to_numpy(step_eqns.normal_matrix_packed_u())[:] += a_packed
+                    flumpy.to_numpy(step_eqns.right_hand_side())[:] += rhs_np
+                elif use_fast_dense:
                     (
                         residuals,
                         jacobian,
@@ -78,6 +109,7 @@ class AdaptLstbxGPU(AdaptLstbx):
                         jacobian = ConstraintManager.constrain_jacobian(
                             self._constr_manager, jacobian
                         )
+                    self.add_equations(residuals, jacobian, weights)
                 else:
                     (
                         residuals,
@@ -86,8 +118,7 @@ class AdaptLstbxGPU(AdaptLstbx):
                     ) = self._target.compute_residuals_and_gradients(block)
                     if self._constr_manager is not None:
                         jacobian = self._constr_manager.constrain_jacobian(jacobian)
-
-                self.add_equations(residuals, jacobian, weights)
+                    self.add_equations(residuals, jacobian, weights)
 
             self._jacobian = jacobian
 

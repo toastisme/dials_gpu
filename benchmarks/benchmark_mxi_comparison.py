@@ -278,8 +278,8 @@ def benchmark_i19_5sweeps():
     i19_work.mkdir(parents=True, exist_ok=True)
 
     timings = {
-        "dials_cpu": {"find": [], "index": [], "refine": [], "integrate": []},
-        "dials_gpu": {"find": [], "index": [], "refine": [], "integrate": []},
+        "dials_cpu": {"find": [], "index": [], "refine": [], "refine_static": [], "integrate": []},
+        "dials_gpu": {"find": [], "index": [], "refine": [], "refine_static": [], "integrate": []},
         "mxi_cpu": {"find": [], "index": [], "refine": [], "integrate": []},
         "mxi_gpu": {"find": [], "find_active": [], "integrate": [], "integrate_active": []},
     }
@@ -401,7 +401,21 @@ def benchmark_i19_5sweeps():
         )
         timings["mxi_cpu"]["index"].append(dt_mxi_idx)
 
-        # --- 3. Refinement (scan-varying) ---
+        # --- 3. Refinement (scan-varying & static) ---
+        ref_static_cpu = refine_phil_scope.fetch(
+            source=parse("refinement.parameterisation.scan_varying=False")
+        ).extract()
+        t0 = time.perf_counter()
+        run_dials_refine_cpu(copy.deepcopy(ie_cpu), ir_cpu.copy(), ref_static_cpu)
+        timings["dials_cpu"]["refine_static"].append(time.perf_counter() - t0)
+
+        ref_static_gpu = refine_phil_scope.fetch(
+            source=parse("refinement.parameterisation.scan_varying=False")
+        ).extract()
+        t0 = time.perf_counter()
+        run_dials_refine_gpu(copy.deepcopy(ie_gpu), ir_gpu.copy(), ref_static_gpu)
+        timings["dials_gpu"]["refine_static"].append(time.perf_counter() - t0)
+
         ref_params_cpu = refine_phil_scope.fetch(source=parse("")).extract()
         t0 = time.perf_counter()
         re_cpu, rr_cpu, _, _ = run_dials_refine_cpu(
@@ -564,10 +578,13 @@ def benchmark_i19_5sweeps():
     print("\n--- i19 Per-Sweep Mean Wall Time (ms/sweep across 5 x 25-image sweeps) ---")
     print(f"{'Stage':<18} | {'dials (CPU)':>14} | {'dials_gpu':>14} | {'mxi (CPU 20T)':>15} | {'mxi (--gpu)':>22}")
     print("-" * 92)
-    for st in ("find", "index", "refine", "integrate"):
+    for st in ("find", "index", "refine", "refine_static", "integrate"):
         t_c = np.mean(timings["dials_cpu"][st]) * 1000
         t_g = np.mean(timings["dials_gpu"][st]) * 1000
-        t_mc = np.mean(timings["mxi_cpu"][st]) * 1000
+        t_mc = (
+            np.mean(timings["mxi_cpu"]["refine" if st == "refine_static" else st])
+            * 1000
+        )
         if st in timings["mxi_gpu"]:
             t_mg_tot = np.mean(timings["mxi_gpu"][st]) * 1000
             t_mg_act = np.mean(timings["mxi_gpu"][f"{st}_active"]) * 1000
@@ -822,13 +839,32 @@ def benchmark_c2sum_720():
         ex_c = ExperimentListFactory.from_json_file(str(cpu_int_expt_path), check_format=False)
         int_r_cpu = flex.reflection_table.from_file(str(cpu_int_refl_path))
 
+    # Time dials_gpu.refine (both static and scan-varying) on C2sum_1
+    ie_gpu = ExperimentListFactory.from_json_file(
+        str(SCRATCH_DIR / "c2sum_dials_gpu_indexed.expt"), check_format=True
+    )
+    ir_gpu = flex.reflection_table.from_file(
+        str(SCRATCH_DIR / "c2sum_dials_gpu_indexed.refl")
+    )
+    ref_static_gpu = refine_phil_scope.fetch(
+        source=parse("refinement.parameterisation.scan_varying=False")
+    ).extract()
+    t0 = time.perf_counter()
+    run_dials_refine_gpu(copy.deepcopy(ie_gpu), ir_gpu.copy(), ref_static_gpu)
+    t_gpu_ref_static = time.perf_counter() - t0
+    print(f"dials_gpu.refine (static, scan_varying=False): {t_gpu_ref_static:.3f}s")
+
+    ref_params_gpu = refine_phil_scope.fetch(source=parse("")).extract()
+    t0 = time.perf_counter()
+    re_gpu, rr_gpu, _, _ = run_dials_refine_gpu(
+        copy.deepcopy(ie_gpu), ir_gpu.copy(), ref_params_gpu
+    )
+    t_gpu_ref = time.perf_counter() - t0
+    re_gpu.as_file(str(SCRATCH_DIR / "c2sum_dials_gpu_refined.expt"))
+    rr_gpu.as_file(str(SCRATCH_DIR / "c2sum_dials_gpu_refined.refl"))
+    print(f"dials_gpu.refine (scan_varying=Auto): {t_gpu_ref:.3f}s")
+
     # Time dials_gpu.integrate with the new slabbed volume + parallel C++ profile fitting path
-    re_gpu = ExperimentListFactory.from_json_file(
-        str(SCRATCH_DIR / "c2sum_dials_gpu_refined.expt"), check_format=True
-    )
-    rr_gpu = flex.reflection_table.from_file(
-        str(SCRATCH_DIR / "c2sum_dials_gpu_refined.refl")
-    )
     int_params_gpu = integrate_phil_scope.fetch(
         source=parse("integration.mp.nproc=1")
     ).extract()

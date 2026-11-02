@@ -199,6 +199,34 @@ class ScansExperimentsPredictorGPU(ScansExperimentsPredictor):
     def __init__(self, experiments):
         super().__init__(experiments)
 
+    def __call__(self, reflections):
+        if len(self._experiments) == 1:
+            e = self._experiments[0]
+            self._predict_one_experiment(e, reflections)
+            reflections = self._post_predict_one_experiment(e, reflections)
+            return self._post_prediction(reflections)
+        return super().__call__(reflections)
+
+    def _match_full_turns(self, reflections):
+        if len(self._experiments) == 1:
+            two_pi = 2.0 * math.pi
+            x_obs, y_obs, phi_obs = reflections["xyzobs.mm.value"].parts()
+            x_calc, y_calc, phi_calc = reflections["xyzcal.mm"].parts()
+            resid = phi_calc - (flex.fmod_positive(phi_obs, two_pi))
+            resid = flex.fmod_positive((resid + math.pi), two_pi) - math.pi
+            phi_calc = phi_obs + resid
+            reflections["xyzcal.mm"] = flex.vec3_double(x_calc, y_calc, phi_calc)
+
+            x_px, y_px, _ = reflections["xyzcal.px"].parts()
+            scan = self._experiments[0].scan
+            if scan is not None:
+                z_px = scan.get_array_index_from_angle(phi_calc, deg=False)
+            else:
+                z_px = phi_calc
+            reflections["xyzcal.px"] = flex.vec3_double(x_px, y_px, z_px)
+            return reflections
+        return super()._match_full_turns(reflections)
+
 
 class StillsExperimentsPredictorGPU(StillsExperimentsPredictor):
     """GPU-accelerated StillsExperimentsPredictor with C++ fallback."""
@@ -206,6 +234,14 @@ class StillsExperimentsPredictorGPU(StillsExperimentsPredictor):
     def __init__(self, experiments, spherical_relp=False):
         super().__init__(experiments)
         self.spherical_relp_model = spherical_relp
+
+    def __call__(self, reflections):
+        if len(self._experiments) == 1:
+            e = self._experiments[0]
+            self._predict_one_experiment(e, reflections)
+            reflections = self._post_predict_one_experiment(e, reflections)
+            return self._post_prediction(reflections)
+        return super().__call__(reflections)
 
 
 class ExperimentsPredictorFactoryGPU(ExperimentsPredictorFactory):

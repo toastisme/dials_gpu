@@ -200,8 +200,10 @@ For single-panel HDF5/NeXus (`.nxs` / `.h5`) datasets (up to 64 frames per scan,
 | `i19` Small Wedge (`scan_varying=True`, `outlier.nproc=1`) | `256.6 ms/file` | **`118.0 ms/file`** | **`2.17×`** | `3.59e-15` |
 | `from-xds-all` (`26,993` refl, `scan_varying=False, nproc=1`) | `2,477.4 ms` | **`660.1 ms`** | **`3.75×`** | `2.07e-15` |
 | `from-xds-all` (`26,993` refl, `scan_varying=True, nproc=1`) | `6,553.6 ms` | **`2,890.6 ms`** | **`2.27×`** | `4.27e-15` |
-| Target Analytical Gradients + Dense Jacobian (`26,993` refl, `sv=False`) | `20.11 ms/step` | **`5.69 ms/step`** | **`3.53×`** | `< 1e-15` |
-| Target Analytical Gradients + Dense Jacobian (`26,993` refl, `sv=True`) | `20.24 ms/step` | **`5.61 ms/step`** | **`3.61×`** | `< 1e-15` |
+| **`C2sum_1` (`112,023` refl, `scan_varying=False` static)** | `8,420.0 ms` | **`1,435.0 ms`** | **`5.87×`** | `< 1e-14` |
+| **`C2sum_1` (`112,023` refl, `scan_varying=Auto` 2-macrocycle)** | `25,554.0 ms` | **`3,878.9 ms`** | **`6.59×`** | `< 1e-14` |
+| Target Analytical Gradients + GPU Normal Eqns (`112,023` refl, `sv=False`) | `20.11 ms/step` | **`9.80 ms/step`** | **`2.05×`** | `< 1e-15` |
+| Target Analytical Gradients + GPU Normal Eqns (`112,023` refl, `sv=True`) | `1,150.0 ms/step` | **`25.60 ms/step`** | **`44.9×`** | `< 1e-15` |
 
 ### 5. Integration (`dials_gpu.integrate` on `i19` 25-image `.nxs` Sweeps)
 
@@ -269,7 +271,7 @@ For single-panel HDF5/NeXus (`.nxs` / `.h5`) datasets (up to 64 frames per scan,
 | :--- | ---: | ---: | ---: | ---: |
 | **Spotfinding (`find_spots` / `find`)** | `3,905.9 ms` (`3.71 s` 1T) | **`50.8 ms`** warm (`342.4 ms` cold avg) | `472.0–593.0 ms` | `469.0–550.4 ms` (`2,327 ms` w/ CUDA init) |
 | **Indexing (`index`, `fft3d`)** | `2,022.7 ms` | **`565.0 ms`** (`217.3 ms` RL fast) | `1,844.0–2,097.4 ms` | *(CPU only)* |
-| **Refinement (`refine`)** | `2,671.1 ms` (`710.6 ms` static) | **`212.0 ms`** (`64.0 ms` static) | **`15.2–23.0 ms`** (static 17p) | *(CPU only)* |
+| **Refinement (`refine`)** | `2,671.1 ms` (`710.6 ms` static) | **`164.6–188.1 ms`** (`64.0 ms` static) | **`15.2–23.0 ms`** (static 17p) | *(CPU only)* |
 | **Integration (`integrate`)** | `2,838.3 ms` | **`286.2–314.8 ms`** (`154.1 ms` sum) | **`164.0–183.0 ms`** | `165.0–313.0 ms` (`102 ms` GPU prf vs `18 ms` CPU) |
 | **Scaling (`scale`, 5 sweeps / 1 sweep)** | `825.2 ms` / `175.8 ms` | `321.3 ms` / **`66.1 ms`** | **`135.8 ms`** / **`13.0 ms`** | *(CPU only)* |
 
@@ -279,7 +281,7 @@ For single-panel HDF5/NeXus (`.nxs` / `.h5`) datasets (up to 64 frames per scan,
 | :--- | ---: | ---: | ---: | ---: |
 | **Spotfinding (`112,023` spots)** | `18.146 s` (20T) / `36.408 s` (8T) | **`2.832 s` warm** (`3.479 s` cold) | `12.171 s` (`12.089 s` active) | `6.780 s` active (`8.695 s` total) |
 | **Indexing (`112,023` spots)** | `49.336 s` (`19.003 s` `max_refine=5`) | **`10.761 s`** (`max_refine=5`) | **`7.629 s`** | *(CPU only)* |
-| **Refinement (`~100k` reflections)** | `25.554 s` (scan-varying) | **`4.662 s`** (static) / **`12.612 s`** (SV) | **`2.051 s`** (`0.223 s` static + `1.652 s` SV) | *(CPU only)* |
+| **Refinement (`~100k` reflections)** | `25.554 s` (`8.420 s` static) | **`1.435 s`** (static) / **`3.879 s`** (SV) | **`2.051 s`** (`0.223 s` static + `1.652 s` SV) | *(CPU only)* |
 | **Integration (`~327k` reflections)** | `233.802 s` | **`12.439 s`** (`8.05 s` Pass 2; **`7.285 s`** sum-only) | **`7.008 s`** (`3.008 s` CPU prf) | **`5.206 s`** active (`7.602 s` total; `1.488 s` GPU prf) |
 | **Scaling (`~327k` obs, `~49k` unique)** | `15.404 s` | **`3.609 s`** (`4.27×` vs `dials.scale`) | **`1.555 s`** (`0.625 s` fit + `0.564 s` sym) | *(CPU only)* |
 
