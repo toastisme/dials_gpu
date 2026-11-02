@@ -5,6 +5,7 @@ import math
 import numpy as np
 import torch
 from cctbx.array_family import flex
+from dxtbx import flumpy
 
 import dials_algorithms_indexing_ext as ext
 from dials.algorithms.indexing import DialsIndexError
@@ -195,8 +196,12 @@ class AssignIndicesGlobalGPU(AssignIndicesGlobal):
                     tolerance=self._tolerance,
                     device=self.device,
                 )
-                miller_indices = flex.miller_index(miller_np)
-                crystal_ids = flex.int(cryst_np)
+                miller_indices = flex.miller_index(
+                    flumpy.from_numpy(np.ascontiguousarray(miller_np[:, 0])),
+                    flumpy.from_numpy(np.ascontiguousarray(miller_np[:, 1])),
+                    flumpy.from_numpy(np.ascontiguousarray(miller_np[:, 2])),
+                )
+                crystal_ids = flumpy.from_numpy(np.ascontiguousarray(cryst_np))
             else:
                 ub_matrices = flex.mat3_double([cm.get_A() for cm in crystals])
                 result = ext.AssignIndices(

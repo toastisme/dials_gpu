@@ -42,7 +42,9 @@ def detect_gpu(miller_indices, threshold=0.9, device=None):
             return None
         dev = miller_indices.device
         vecs_t, mods_t = _get_r_tensors(dev)
-        dots = miller_indices.to(torch.int64) @ vecs_t  # (N, 28)
+        dots = (
+            miller_indices.to(torch.int64).unsqueeze(2) * vecs_t.unsqueeze(0)
+        ).sum(dim=1)  # (N, 28)
         rem_zero = (torch.remainder(dots, mods_t[None, :]) == 0).sum(dim=0)
         fracs = rem_zero.to(torch.float64) / float(n_hkl)
         hits = torch.nonzero(fracs > threshold).squeeze(1)
@@ -61,6 +63,28 @@ def detect_gpu(miller_indices, threshold=0.9, device=None):
 
     n_hkl = len(miller_indices)
     if n_hkl == 0:
+        return None
+    if device is None and n_hkl >= 4096 and torch.cuda.is_available():
+        device = torch.device("cuda")
+    if device is not None and device.type == "cuda":
+        hkl_np = miller_indices.as_vec3_double().as_numpy_array()
+        hkl_t = torch.from_numpy(hkl_np).to(device=device, dtype=torch.int64)
+        vecs_t, mods_t = _get_r_tensors(device)
+        dots = (hkl_t.unsqueeze(2) * vecs_t.unsqueeze(0)).sum(dim=1)
+        rem_zero = (torch.remainder(dots, mods_t[None, :]) == 0).sum(dim=0)
+        fracs = rem_zero.to(torch.float64) / float(n_hkl)
+        hits = torch.nonzero(fracs > threshold).squeeze(1)
+        if hits.numel() > 0:
+            idx = int(hits[0].item())
+            test = tools.R[idx]
+            logger.debug(
+                "Detected exclusive presence of %dH %dK %dL = %dn, remainder 0",
+                test["vec"][0],
+                test["vec"][1],
+                test["vec"][2],
+                test["mod"],
+            )
+            return test["trans"]
         return None
     hkl_np = miller_indices.as_vec3_double().as_numpy_array().astype(np.int64)
     dots = hkl_np @ _R_VECS_NP  # (N, 28)

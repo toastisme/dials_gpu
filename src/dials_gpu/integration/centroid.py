@@ -103,7 +103,7 @@ def compute_centroid_gpu(
         and experiments[0].detector is not None
         and len(experiments[0].detector) == 1
         and experiments[0].detector[0].get_px_mm_strategy().name()
-        == "SimplePxMmStrategy"
+        in ("SimplePxMmStrategy", "ParallaxCorrectedPxMmStrategy")
         and tuple(experiments[0].detector[0].get_raw_image_offset()) == (0, 0)
         and (
             experiments[0].scan is None
@@ -121,7 +121,38 @@ def compute_centroid_gpu(
             osc0, osc_w = scan.get_oscillation(deg=False)
             arr0 = float(scan.get_array_range()[0])
             z_rad = osc0 + (pos_z - arr0) * osc_w
-        mm_pos = torch.stack([pos_x * px_x, pos_y * px_y, z_rad], dim=1)
+        xy_0 = pos_x * px_x
+        xy_1 = pos_y * px_y
+        strat = panel.get_px_mm_strategy()
+        if strat.name() == "ParallaxCorrectedPxMmStrategy":
+            mu = float(strat.mu())
+            t0 = float(strat.t0())
+            f0, f1, f2 = panel.get_fast_axis()
+            s0, s1, s2 = panel.get_slow_axis()
+            o0, o1, o2 = panel.get_origin()
+            n0 = f1 * s2 - f2 * s1
+            n1 = f2 * s0 - f0 * s2
+            n2 = f0 * s1 - f1 * s0
+            if o0 * n0 + o1 * n1 + o2 * n2 < 0.0:
+                n0, n1, n2 = -n0, -n1, -n2
+            s1_x = o0 + xy_0 * f0 + xy_1 * s0
+            s1_y = o1 + xy_0 * f1 + xy_1 * s1
+            s1_z = o2 + xy_0 * f2 + xy_1 * s2
+            inv_len = 1.0 / torch.sqrt(s1_x * s1_x + s1_y * s1_y + s1_z * s1_z)
+            s1_x = s1_x * inv_len
+            s1_y = s1_y * inv_len
+            s1_z = s1_z * inv_len
+            cos_t = s1_x * n0 + s1_y * n1 + s1_z * n2
+            inv_mu = 1.0 / mu
+            t0_over_cos_t = t0 / cos_t
+            atten_o = inv_mu - (t0_over_cos_t + inv_mu) * torch.exp(
+                -mu * t0_over_cos_t
+            )
+            s1_dot_f = s1_x * f0 + s1_y * f1 + s1_z * f2
+            s1_dot_s = s1_x * s0 + s1_y * s1 + s1_z * s2
+            xy_0 = xy_0 - s1_dot_f * atten_o
+            xy_1 = xy_1 - s1_dot_s * atten_o
+        mm_pos = torch.stack([xy_0, xy_1, z_rad], dim=1)
         mm_var = torch.stack(
             [
                 var_x * (px_x * px_x),

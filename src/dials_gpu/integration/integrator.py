@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+import ctypes
 import functools
 import logging
 import math
+import os
 import pickle
 
 import dxtbx.flumpy as flumpy
@@ -15,6 +17,7 @@ import dials.algorithms.integration.processor as _dials_processor
 from dials_gpu.integration import _shoebox_pack_ext
 from dials_gpu.spot_finding.finder import (
     _HDF5_GPU_VOLUME_CACHE,
+    _get_cbf_batch_reader,
     _try_load_hdf5_raw_volume_gpu,
 )
 from dials_gpu.spot_finding.threshold import get_default_device
@@ -189,17 +192,140 @@ def _parallel_model_reflections(fitter, reflections):
     fitter.model(reflections)
 
 
+def _check_overloads_fast(reflections, experiments):
+    if len(reflections) == 0:
+        return
+    try:
+        if len(experiments) == 1 and len(experiments[0].detector) == 1:
+            sat = float(experiments[0].detector[0].get_trusted_range()[1])
+            flags = reflections["flags"]
+            _shoebox_pack_ext.parallel_check_overloads_single_panel(
+                reflections["shoebox"], flags, sat
+            )
+            reflections["flags"] = flags
+            return
+    except Exception:
+        pass
+    reflections.is_overloaded(experiments)
+
+
+def _compute_mask_fast(reflections, experiments):
+    if len(reflections) == 0:
+        return
+    try:
+        if len(experiments) == 1:
+            expt = experiments[0]
+            prof = expt.profile
+            if (
+                hasattr(prof, "_n_sigma")
+                and hasattr(prof, "_sigma_b")
+                and hasattr(prof, "_sigma_m")
+            ):
+                if (
+                    isinstance(prof._sigma_b, (int, float))
+                    and isinstance(prof._sigma_m, (int, float))
+                    and expt.goniometer is not None
+                    and expt.scan is not None
+                    and not expt.scan.is_still()
+                ):
+                    delta_b = float(prof._n_sigma * prof._sigma_b)
+                    _shoebox_pack_ext.parallel_compute_mask_3d_fast(
+                        expt.beam,
+                        expt.detector,
+                        expt.goniometer,
+                        expt.scan,
+                        delta_b,
+                        reflections["shoebox"],
+                        reflections["s1"],
+                        reflections["xyzcal.px"],
+                        reflections["panel"],
+                    )
+                    return
+                from dials.algorithms.profile_model.gaussian_rs import MaskCalculator
+
+                delta_b = prof._n_sigma * prof._sigma_b
+                delta_m = prof._n_sigma * prof._sigma_m
+                calc = MaskCalculator(
+                    expt.crystal,
+                    expt.beam,
+                    expt.detector,
+                    expt.goniometer,
+                    expt.scan,
+                    delta_b,
+                    delta_m,
+                )
+                _shoebox_pack_ext.parallel_compute_mask_vec3(
+                    calc,
+                    reflections["shoebox"],
+                    reflections["s1"],
+                    reflections["xyzcal.px"],
+                    reflections["panel"],
+                )
+                return
+    except Exception:
+        pass
+    reflections.compute_mask(experiments)
+
+
+def _compute_bbox_fast(reflections, experiments, sigma_b_multiplier=2.0):
+    if len(reflections) == 0:
+        reflections["bbox"] = flex.int6()
+        return reflections["bbox"]
+    try:
+        if len(experiments) == 1:
+            expt = experiments[0]
+            prof = expt.profile
+            if (
+                hasattr(prof, "_n_sigma")
+                and hasattr(prof, "_sigma_b")
+                and hasattr(prof, "_sigma_m")
+                and isinstance(prof._sigma_b, (int, float))
+                and isinstance(prof._sigma_m, (int, float))
+                and expt.goniometer is not None
+                and expt.scan is not None
+                and not expt.scan.is_still()
+            ):
+                delta_b = float(prof._n_sigma * prof._sigma_b * sigma_b_multiplier)
+                delta_m = float(prof._n_sigma * prof._sigma_m)
+                reflections["bbox"] = _shoebox_pack_ext.parallel_compute_bbox_3d_fast(
+                    expt.beam,
+                    expt.detector,
+                    expt.goniometer,
+                    expt.scan,
+                    delta_b,
+                    delta_m,
+                    reflections["s1"],
+                    reflections["xyzcal.px"],
+                    reflections["panel"],
+                )
+                return reflections["bbox"]
+            reflections["bbox"] = prof.compute_bbox(
+                reflections,
+                expt.crystal,
+                expt.beam,
+                expt.detector,
+                expt.goniometer,
+                expt.scan,
+                sigma_b_multiplier=sigma_b_multiplier,
+            )
+            return reflections["bbox"]
+    except Exception:
+        pass
+    return reflections.compute_bbox(
+        experiments, sigma_b_multiplier=sigma_b_multiplier
+    )
+
+
 class ProfileModellerExecutorGPU(ProfileModellerExecutor):
     """
-    GPU-accelerated ProfileModellerExecutor that uses GPU background,
-    centroid, and summation integration before accumulating reference profiles.
+    GPU-accelerated ProfileModellerExecutor that uses GPU background
+    and summation integration before accumulating reference profiles.
     """
 
     def process(self, frame, reflections):
-        reflections.is_overloaded(self.experiments)
-        reflections.compute_mask(self.experiments)
+        _check_overloads_fast(reflections, self.experiments)
+        _compute_mask_fast(reflections, self.experiments)
         reflections.compute_background(self.experiments)
-        compute_centroid_gpu(reflections, self.experiments)
         compute_summed_intensity_gpu(reflections)
         if hasattr(self.profile_fitter, "modellers"):
             if "profile.index" not in reflections:
@@ -225,8 +351,8 @@ class ProfileValidatorExecutorGPU(ProfileValidatorExecutor):
     """
 
     def process(self, frame, reflections):
-        reflections.is_overloaded(self.experiments)
-        reflections.compute_mask(self.experiments)
+        _check_overloads_fast(reflections, self.experiments)
+        _compute_mask_fast(reflections, self.experiments)
         reflections.compute_background(self.experiments)
         compute_centroid_gpu(reflections, self.experiments)
         compute_summed_intensity_gpu(reflections)
@@ -254,16 +380,17 @@ class IntegratorExecutorGPU(IntegratorExecutor):
     """
 
     def process(self, frame, reflections):
-        reflections.is_overloaded(self.experiments)
-        reflections.compute_mask(self.experiments)
-        reflections.contains_invalid_pixels()
+        _check_overloads_fast(reflections, self.experiments)
+        _compute_mask_fast(reflections, self.experiments)
 
         sbox = reflections["shoebox"]
-        nvalfg = sbox.count_mask_values(MaskCode.Valid | MaskCode.Foreground)
-        nforeg = sbox.count_mask_values(MaskCode.Foreground)
-        fraction_valid = nvalfg.as_double() / nforeg.as_double()
-        selection = fraction_valid < self.valid_foreground_threshold
-        reflections.set_flags(selection, reflections.flags.dont_integrate)
+        n_r = len(reflections)
+        nvalfg = flex.int(n_r, 0)
+        flags = reflections["flags"]
+        _shoebox_pack_ext.parallel_pre_background_mask_flags(
+            sbox, flags, float(self.valid_foreground_threshold), nvalfg
+        )
+        reflections["flags"] = flags
 
         # Compute background on GPU (via flex.reflection_table.background_algorithm)
         reflections.compute_background(self.experiments)
@@ -275,13 +402,13 @@ class IntegratorExecutorGPU(IntegratorExecutor):
         if self.profile_fitter:
             _parallel_fit_reflections(self.profile_fitter, reflections)
 
-        reflections["num_pixels.valid"] = sbox.count_mask_values(MaskCode.Valid)
-        reflections["num_pixels.background"] = sbox.count_mask_values(
-            MaskCode.Valid | MaskCode.Background
-        )
-        reflections["num_pixels.background_used"] = sbox.count_mask_values(
-            MaskCode.Valid | MaskCode.Background | MaskCode.BackgroundUsed
-        )
+        nvalid = flex.int(n_r, 0)
+        nbg = flex.int(n_r, 0)
+        nbg_used = flex.int(n_r, 0)
+        _shoebox_pack_ext.parallel_post_mask_counts(sbox, nvalid, nbg, nbg_used)
+        reflections["num_pixels.valid"] = nvalid
+        reflections["num_pixels.background"] = nbg
+        reflections["num_pixels.background_used"] = nbg_used
         reflections["num_pixels.foreground"] = nvalfg
 
 
@@ -330,9 +457,16 @@ def _initialize_rotation_gpu(experiments, params, reflections):
     else:
         reflections.compute_zeta_multi(experiments)
     reflections["d"] = compute_d_gpu(experiments, reflections)
-    reflections.compute_bbox(
-        experiments, sigma_b_multiplier=params.profile.sigma_b_multiplier
-    )
+    if (
+        "bbox" not in reflections
+        or getattr(reflections, "_bbox_precomputed_sigma_b_mult", None)
+        != float(params.profile.sigma_b_multiplier)
+    ):
+        _compute_bbox_fast(
+            reflections,
+            experiments,
+            sigma_b_multiplier=params.profile.sigma_b_multiplier,
+        )
 
     mask = flex.abs(reflections["zeta"]) < params.filter.min_zeta
     reflections.set_flags(mask, reflections.flags.dont_integrate)
@@ -348,9 +482,16 @@ def _initialize_stills_gpu(experiments, params, reflections):
     Matches `_initialize_stills` in `dials.algorithms.integration.integrator`.
     """
     reflections["d"] = compute_d_gpu(experiments, reflections)
-    reflections.compute_bbox(
-        experiments, sigma_b_multiplier=params.profile.sigma_b_multiplier
-    )
+    if (
+        "bbox" not in reflections
+        or getattr(reflections, "_bbox_precomputed_sigma_b_mult", None)
+        != float(params.profile.sigma_b_multiplier)
+    ):
+        _compute_bbox_fast(
+            reflections,
+            experiments,
+            sigma_b_multiplier=params.profile.sigma_b_multiplier,
+        )
 
     z0, z1 = reflections["bbox"].parts()[4:6]
     assert (z1 - z0).all_eq(1), "bbox is invalid"
@@ -375,51 +516,26 @@ _HOST_VOL_CACHE: OrderedDict[tuple, np.ndarray] = OrderedDict()
 _HOST_STATIC_MASK_CACHE: OrderedDict[tuple, np.ndarray] = OrderedDict()
 
 
-def _try_get_hdf5_volume_and_mask_cpu(imageset, lookup_mask):
-    """
-    Fast path for single-panel HDF5/NeXus sweeps (e.g. i19 25-image .nxs files):
-    returns `(vol_np, static_mask_np, tr_min, tr_max, H, W)` where `vol_np` is a
-    contiguous `(B, H, W)` int32 numpy array and `static_mask_np` is a contiguous
-    `(H, W)` uint8 numpy array.
-    """
-    detector = imageset.get_detector()
-    if len(detector) != 1 or imageset.has_dynamic_mask():
-        return None
-    if (
-        not imageset.external_lookup.pedestal.data.empty()
-        or not imageset.external_lookup.gain.data.empty()
-    ):
-        return None
-    try:
-        path = imageset.get_path(0)
-        indices = tuple(imageset.indices())
-    except Exception:
-        return None
-    if not path or not path.endswith((".nxs", ".h5", ".hdf5")) or len(indices) == 0:
-        return None
-    B = len(indices)
-    z0 = int(indices[0])
-    vol_key = (path, z0, B)
-    vol_np = _HOST_VOL_CACHE.get(vol_key)
-    if vol_np is not None:
-        _HOST_VOL_CACHE.move_to_end(vol_key)
-    else:
-        # Check if already resident in GPU volume cache from dials_gpu.find_spots
-        dev = get_default_device()
-        dev_key = (dev.type, dev.index if dev.index is not None else 0)
-        gpu_key = (path, z0, B, dev_key)
-        if gpu_key in _HDF5_GPU_VOLUME_CACHE:
-            vol_t = _HDF5_GPU_VOLUME_CACHE[gpu_key]
-            vol_np = np.ascontiguousarray(vol_t.cpu().numpy())
-        else:
-            vol_t = _try_load_hdf5_raw_volume_gpu(imageset, torch.device("cpu"))
-            if vol_t is None or vol_t.dtype != torch.int32:
-                return None
-            vol_np = np.ascontiguousarray(vol_t.numpy())
-        if len(_HOST_VOL_CACHE) >= 8:
-            _HOST_VOL_CACHE.popitem(last=False)
-        _HOST_VOL_CACHE[vol_key] = vol_np
+_CBF_NUM_THREADS = min(20, max(2, os.cpu_count() or 8))
 
+
+def _read_cbf_batch_fast(cbf_fn, paths, dst_ptr: int, n_elems: int) -> bool:
+    if cbf_fn is None:
+        return False
+    B = len(paths)
+    if B == 0:
+        return True
+    try:
+        paths_b = [p.encode("utf-8") if isinstance(p, str) else p for p in paths]
+        c_paths = (ctypes.c_char_p * B)(*paths_b)
+        rc = cbf_fn(c_paths, B, n_elems, dst_ptr, _CBF_NUM_THREADS)
+        return rc == 0
+    except Exception:
+        return False
+
+
+def _get_static_mask_and_trusted_range_cpu(imageset, path, lookup_mask):
+    detector = imageset.get_detector()
     panel = detector[0]
     W, H = panel.get_image_size()
     ext_mask_data = imageset.external_lookup.mask.data
@@ -451,7 +567,349 @@ def _try_get_hdf5_volume_and_mask_cpu(imageset, lookup_mask):
     tr0, tr1 = panel.get_trusted_range()
     tr_min = int(math.ceil(tr0))
     tr_max = int(math.floor(tr1))
+    return static_mask, tr_min, tr_max, H, W
+
+
+def _try_get_hdf5_volume_and_mask_cpu(imageset, lookup_mask, cache_host_vol: bool = True):
+    """
+    Fast path for single-panel HDF5/NeXus or CBF sweeps:
+    returns `(vol_np, static_mask_np, tr_min, tr_max, H, W)` where `vol_np` is a
+    contiguous `(B, H, W)` int32 numpy array and `static_mask_np` is a contiguous
+    `(H, W)` uint8 numpy array.
+    """
+    detector = imageset.get_detector()
+    if len(detector) != 1 or imageset.has_dynamic_mask():
+        return None
+    if (
+        not imageset.external_lookup.pedestal.data.empty()
+        or not imageset.external_lookup.gain.data.empty()
+    ):
+        return None
+    try:
+        path = imageset.get_path(0)
+        indices = tuple(imageset.indices())
+    except Exception:
+        return None
+    if not path or len(indices) == 0 or len(indices) > 64:
+        return None
+    is_hdf5 = path.endswith((".nxs", ".h5", ".hdf5"))
+    is_cbf = path.endswith((".cbf", ".cbf.gz"))
+    if not (is_hdf5 or is_cbf):
+        return None
+    B = len(indices)
+    z0 = int(indices[0])
+    vol_key = (path, z0, B)
+    vol_np = _HOST_VOL_CACHE.get(vol_key)
+    if vol_np is not None:
+        _HOST_VOL_CACHE.move_to_end(vol_key)
+    elif is_hdf5:
+        # Check if already resident in GPU volume cache from dials_gpu.find_spots
+        dev = get_default_device()
+        dev_key = (dev.type, dev.index if dev.index is not None else 0)
+        gpu_key = (path, z0, B, dev_key)
+        if gpu_key in _HDF5_GPU_VOLUME_CACHE:
+            vol_t = _HDF5_GPU_VOLUME_CACHE[gpu_key]
+            vol_np = np.ascontiguousarray(vol_t.cpu().numpy())
+        else:
+            vol_t = _try_load_hdf5_raw_volume_gpu(imageset, torch.device("cpu"))
+            if vol_t is None or vol_t.dtype != torch.int32:
+                return None
+            vol_np = np.ascontiguousarray(vol_t.numpy())
+        if cache_host_vol:
+            if len(_HOST_VOL_CACHE) >= 8:
+                _HOST_VOL_CACHE.popitem(last=False)
+            _HOST_VOL_CACHE[vol_key] = vol_np
+    else:
+        try:
+            cbf_ext = _get_cbf_batch_reader()
+            panel = detector[0]
+            W, H = panel.get_image_size()
+            paths = [imageset.get_path(i) for i in range(B)]
+            if cbf_ext is not None and all(p and p.endswith((".cbf", ".cbf.gz")) for p in paths):
+                vol_np = np.empty((B, H, W), dtype=np.int32)
+                ok = _read_cbf_batch_fast(cbf_ext, paths, int(vol_np.ctypes.data), H * W)
+                if not ok:
+                    return None
+            else:
+                frames = [flumpy.to_numpy(imageset.get_raw_data(i)[0]) for i in range(B)]
+                if frames[0].dtype != np.int32:
+                    return None
+                vol_np = np.stack(frames, axis=0)
+            if cache_host_vol:
+                if len(_HOST_VOL_CACHE) >= 8:
+                    _HOST_VOL_CACHE.popitem(last=False)
+                _HOST_VOL_CACHE[vol_key] = vol_np
+        except Exception:
+            return None
+
+    static_mask, tr_min, tr_max, H, W = _get_static_mask_and_trusted_range_cpu(
+        imageset, path, lookup_mask
+    )
     return vol_np, static_mask, tr_min, tr_max, H, W
+
+
+def _try_run_slabbed_volume_integration(task_self, imageset, frame0, frame1, time_fn):
+    """
+    Fast multi-threaded slabbed volume extraction + GPU integration for large sweeps
+    (> 64 frames) on single-panel static-mask HDF5/NeXus or CBF/CBF.GZ detectors.
+    Streams frames in overlapping slabs so each frame in [frame0, frame1) is decoded
+    from disk only ONCE per pass using OpenMP/multi-threaded C++ readers, extracts
+    shoeboxes in parallel in C++, and batches GPU background + summation + profile
+    fitting per slab.
+    """
+    if task_self.params.debug.output:
+        return None
+    detector = imageset.get_detector()
+    if len(detector) != 1 or imageset.has_dynamic_mask():
+        return None
+    if (
+        not imageset.external_lookup.pedestal.data.empty()
+        or not imageset.external_lookup.gain.data.empty()
+    ):
+        return None
+    try:
+        path0 = imageset.get_path(0)
+        n_frames = len(imageset)
+    except Exception:
+        return None
+    if not path0 or n_frames <= 64 or (frame1 - frame0) != n_frames:
+        return None
+    is_hdf5 = path0.endswith((".nxs", ".h5", ".hdf5"))
+    is_cbf = path0.endswith((".cbf", ".cbf.gz"))
+    if not (is_hdf5 or is_cbf):
+        return None
+
+    cbf_ext = _get_cbf_batch_reader() if is_cbf else None
+    cbf_paths = None
+    if is_cbf:
+        try:
+            cbf_paths = [imageset.get_path(i) for i in range(n_frames)]
+            if not all(p and p.endswith((".cbf", ".cbf.gz")) for p in cbf_paths):
+                cbf_ext = None
+        except Exception:
+            cbf_ext = None
+
+    static_mask_np, tr_min, tr_max, H, W = _get_static_mask_and_trusted_range_cpu(
+        imageset, path0, task_self.params.lookup.mask
+    )
+    rejected_arr = np.array(
+        [1 if imageset.is_marked_for_rejection(i) else 0 for i in range(n_frames)],
+        dtype=np.uint8,
+    )
+
+    refls = task_self.reflections
+    n_total = len(refls)
+    if n_total == 0:
+        return 0.0, 0.0, 0.0
+
+    _, _, _, _, z0_flex, z1_flex = refls["bbox"].parts()
+    z0_arr = z0_flex.as_numpy_array()
+    z1_arr = z1_flex.as_numpy_array()
+    dz_arr = z1_arr - z0_arr
+
+    in_bounds = (z0_arr >= frame0) & (z1_arr <= frame1) & (dz_arr > 0)
+    slab_step = 64
+    norm_mask = in_bounds & (dz_arr <= slab_step)
+    wide_mask = in_bounds & (dz_arr > slab_step)
+
+    has_wide = bool(np.any(wide_mask))
+    wide_ind_np = np.nonzero(wide_mask)[0] if has_wide else None
+    wide_refl = None
+    wide_valid_flags = None
+    if has_wide:
+        wide_ind = flex.size_t(np.ascontiguousarray(wide_ind_np, dtype=np.uintp))
+        wide_refl = refls.select(wide_ind)
+        wide_refl["shoebox"] = flex.shoebox(
+            wide_refl["panel"],
+            wide_refl["bbox"],
+            allocate=True,
+            flatten=task_self.params.shoebox.flatten,
+        )
+        wide_valid_flags = np.zeros(len(wide_refl), dtype=np.uint8)
+
+    max_norm_dz = int(dz_arr[norm_mask].max()) if np.any(norm_mask) else 1
+    overlap = max(0, max_norm_dz - 1)
+    max_buf_frames = min(n_frames, slab_step + overlap)
+    slab_buf = np.empty((max_buf_frames, H, W), dtype=np.int32)
+
+    def _read_chunk_into(f_start, f_end, dst_slice):
+        count = f_end - f_start
+        if count <= 0:
+            return True
+        idx0 = f_start - frame0
+        idx1 = f_end - frame0
+        if is_cbf and cbf_ext is not None:
+            return _read_cbf_batch_fast(
+                cbf_ext, cbf_paths[idx0:idx1], int(dst_slice.ctypes.data), H * W
+            )
+        elif is_hdf5:
+            sub_iset = imageset[idx0:idx1]
+            vol_t = _try_load_hdf5_raw_volume_gpu(sub_iset, torch.device("cpu"))
+            if vol_t is None or vol_t.dtype != torch.int32:
+                return False
+            np.copyto(dst_slice, vol_t.numpy())
+            return True
+        else:
+            for k in range(count):
+                arr = flumpy.to_numpy(imageset.get_raw_data(idx0 + k)[0])
+                if arr.dtype != np.int32:
+                    return False
+                np.copyto(dst_slice[k], arr)
+            return True
+
+    read_time = 0.0
+    extract_time = 0.0
+    process_time = 0.0
+
+    prev_f0 = frame0
+    prev_f1 = frame0
+
+    for z0_start in range(frame0, frame1, slab_step):
+        z0_end = min(z0_start + slab_step, frame1)
+        slab_sel = norm_mask & (z0_arr >= z0_start) & (z0_arr < z0_end)
+        has_norm = bool(np.any(slab_sel))
+        if has_norm:
+            req_f1 = int(z1_arr[slab_sel].max())
+        else:
+            req_f1 = z0_end
+        if z0_end == frame1:
+            req_f1 = frame1
+        slab_f1 = max(req_f1, prev_f1)
+
+        if not has_norm and slab_f1 == prev_f1:
+            continue
+
+        st_r = time_fn()
+        n_ov = max(0, prev_f1 - z0_start)
+        if n_ov > 0:
+            ov_offset = z0_start - prev_f0
+            slab_buf[:n_ov] = slab_buf[ov_offset : ov_offset + n_ov]
+        new_f0 = max(z0_start, prev_f1)
+        n_new = slab_f1 - new_f0
+        if n_new > 0:
+            ok = _read_chunk_into(new_f0, slab_f1, slab_buf[n_ov : n_ov + n_new])
+            if not ok:
+                return None
+        read_time += time_fn() - st_r
+
+        if has_wide and n_new > 0:
+            st_e = time_fn()
+            new_view = slab_buf[n_ov : n_ov + n_new]
+            rej_new = np.ascontiguousarray(
+                rejected_arr[new_f0 - frame0 : slab_f1 - frame0]
+            )
+            _shoebox_pack_ext.extract_wide_shoeboxes_slice_from_volume(
+                wide_refl["shoebox"],
+                int(new_view.ctypes.data),
+                int(static_mask_np.ctypes.data),
+                int(rej_new.ctypes.data),
+                tr_min,
+                tr_max,
+                new_f0,
+                slab_f1,
+                H,
+                W,
+                int(wide_valid_flags.ctypes.data),
+            )
+            extract_time += time_fn() - st_e
+
+        prev_f0 = z0_start
+        prev_f1 = slab_f1
+
+        if has_norm:
+            slab_ind_np = np.nonzero(slab_sel)[0]
+            slab_ind = flex.size_t(np.ascontiguousarray(slab_ind_np, dtype=np.uintp))
+            sub_refl = refls.select(slab_ind)
+            sub_refl["shoebox"] = flex.shoebox(
+                sub_refl["panel"],
+                sub_refl["bbox"],
+                allocate=False,
+                flatten=task_self.params.shoebox.flatten,
+            )
+
+            st_e = time_fn()
+            n_sub = len(sub_refl)
+            valid_flags = np.empty(n_sub, dtype=np.uint8)
+            slab_len = slab_f1 - z0_start
+            slab_view = slab_buf[:slab_len]
+            rej_view = np.ascontiguousarray(
+                rejected_arr[z0_start - frame0 : slab_f1 - frame0]
+            )
+            n_valid = _shoebox_pack_ext.extract_shoeboxes_from_volume(
+                sub_refl["shoebox"],
+                int(slab_view.ctypes.data),
+                int(static_mask_np.ctypes.data),
+                int(rej_view.ctypes.data),
+                tr_min,
+                tr_max,
+                z0_start,
+                slab_f1,
+                H,
+                W,
+                int(valid_flags.ctypes.data),
+            )
+            extract_time += time_fn() - st_e
+
+            st_p = time_fn()
+            if n_valid == n_sub and n_sub > 0:
+                task_self.executor.process(slab_f1 - 1, sub_refl)
+            elif n_valid > 0:
+                v_ind = flex.size_t(
+                    np.ascontiguousarray(np.nonzero(valid_flags)[0], dtype=np.uintp)
+                )
+                v_refl = sub_refl.select(v_ind)
+                task_self.executor.process(slab_f1 - 1, v_refl)
+                sub_refl.set_selected(v_ind, v_refl)
+            del sub_refl["shoebox"]
+            refls.set_selected(slab_ind, sub_refl)
+            process_time += time_fn() - st_p
+
+    if has_wide:
+        if prev_f1 < frame1:
+            st_r = time_fn()
+            n_rem = frame1 - prev_f1
+            rem_buf = slab_buf[:n_rem] if n_rem <= max_buf_frames else np.empty((n_rem, H, W), dtype=np.int32)
+            ok = _read_chunk_into(prev_f1, frame1, rem_buf)
+            if not ok:
+                return None
+            read_time += time_fn() - st_r
+
+            st_e = time_fn()
+            rej_rem = np.ascontiguousarray(
+                rejected_arr[prev_f1 - frame0 : frame1 - frame0]
+            )
+            _shoebox_pack_ext.extract_wide_shoeboxes_slice_from_volume(
+                wide_refl["shoebox"],
+                int(rem_buf.ctypes.data),
+                int(static_mask_np.ctypes.data),
+                int(rej_rem.ctypes.data),
+                tr_min,
+                tr_max,
+                prev_f1,
+                frame1,
+                H,
+                W,
+                int(wide_valid_flags.ctypes.data),
+            )
+            extract_time += time_fn() - st_e
+
+        st_p = time_fn()
+        n_wide = len(wide_refl)
+        n_w_valid = int(np.count_nonzero(wide_valid_flags))
+        if n_w_valid == n_wide and n_wide > 0:
+            task_self.executor.process(frame1 - 1, wide_refl)
+        elif n_w_valid > 0:
+            wv_ind = flex.size_t(
+                np.ascontiguousarray(np.nonzero(wide_valid_flags)[0], dtype=np.uintp)
+            )
+            wv_refl = wide_refl.select(wv_ind)
+            task_self.executor.process(frame1 - 1, wv_refl)
+            wide_refl.set_selected(wv_ind, wv_refl)
+        del wide_refl["shoebox"]
+        refls.set_selected(wide_ind, wide_refl)
+        process_time += time_fn() - st_p
+
+    return read_time, extract_time, process_time
 
 
 class IntegratorGPU(Integrator):
@@ -460,23 +918,28 @@ class IntegratorGPU(Integrator):
     Caches `make_image(image, mask)` across the profile-modelling, validation, and integration
     passes when running single-process on short sweeps (<= 100 frames) so HDF5/CBF frames are
     only decompressed from disk once, and uses OpenMP C++ direct volume extraction + single-batch
-    GPU execution for single-panel HDF5/NeXus sweeps.
+    GPU execution for single-panel HDF5/NeXus and CBF sweeps.
     """
 
     ExecutorClass = IntegratorExecutorGPU
 
     def integrate(self):
+        if torch.cuda.is_available() and torch.get_num_threads() > 1:
+            torch.set_num_threads(1)
         orig_modeller_exec = _dials_integrator.ProfileModellerExecutor
         orig_validator_exec = _dials_integrator.ProfileValidatorExecutor
         _dials_integrator.ProfileModellerExecutor = ProfileModellerExecutorGPU
         _dials_integrator.ProfileValidatorExecutor = ProfileValidatorExecutorGPU
 
-        # Enable in-memory frame cache for short sweeps (e.g. 25-image i19 Nexus files)
-        # when nproc == 1 so ProfileModellerExecutor and IntegratorExecutor share decoded frames.
+        # Enable fast task execution when nproc == 1; only cache full decoded frames in RAM
+        # for short sweeps (<= 100 frames). For longer HDF5 sweeps, _HDF5_COMPRESSED_CACHE
+        # caches compressed bitshuffle-LZ4 chunks across passes and extracts shoeboxes in C++ OpenMP.
         use_frame_cache = (
             self.params.integration.mp.nproc == 1
             and self.params.integration.mp.njobs == 1
-            and sum(len(e.imageset) for e in self.experiments if e.imageset is not None) <= 100
+        )
+        can_cache_frames = (
+            sum(len(e.imageset) for e in self.experiments if e.imageset is not None) <= 100
         )
         frame_cache = {}
         orig_task_call = _dials_processor.Task.__call__
@@ -525,6 +988,22 @@ class IntegratorGPU(Integrator):
 
                 task_self.executor.initialize(frame0, frame1, task_self.reflections)
 
+                slab_res = _try_run_slabbed_volume_integration(
+                    task_self, imageset, frame0, frame1, time_fn
+                )
+                if slab_res is not None:
+                    read_time, extract_time, process_time = slab_res
+                    task_self.executor.finalize()
+                    return _dials_processor.dials.algorithms.integration.Result(
+                        index=task_self.index,
+                        reflections=task_self.reflections,
+                        data=task_self.executor.data(),
+                        read_time=read_time,
+                        extract_time=extract_time,
+                        process_time=process_time,
+                        total_time=time_fn() - start_time,
+                    )
+
                 task_self.reflections["shoebox"] = flex.shoebox(
                     task_self.reflections["panel"],
                     task_self.reflections["bbox"],
@@ -534,7 +1013,7 @@ class IntegratorGPU(Integrator):
 
                 st_read = time_fn()
                 fast_vol = _try_get_hdf5_volume_and_mask_cpu(
-                    imageset, task_self.params.lookup.mask
+                    imageset, task_self.params.lookup.mask, cache_host_vol=can_cache_frames
                 )
                 if fast_vol is not None:
                     vol_np, static_mask_np, tr_min, tr_max, H, W = fast_vol
@@ -620,7 +1099,8 @@ class IntegratorGPU(Integrator):
                                         )
                                     )
                             c_img = make_image(image, mask)
-                            frame_cache[cache_key] = c_img
+                            if can_cache_frames:
+                                frame_cache[cache_key] = c_img
                             del image
                             del mask
                         read_time += time_fn() - st

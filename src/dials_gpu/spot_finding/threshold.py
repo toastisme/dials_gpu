@@ -39,8 +39,7 @@ def _get_triton_batch_scratch(
     key = (device.type, dev_idx, B, H, W)
     bufs = _TRITON_BATCH_SCRATCH_CACHE.get(key)
     if bufs is None:
-        if len(_TRITON_BATCH_SCRATCH_CACHE) >= 2:
-            _TRITON_BATCH_SCRATCH_CACHE.clear()
+        _TRITON_BATCH_SCRATCH_CACHE.clear()
         bufs = {
             "mh": torch.empty((B, H, W), dtype=torch.uint8, device=device),
             "xh": torch.empty((B, H, W), dtype=torch.float32, device=device),
@@ -840,7 +839,7 @@ def dispersion_threshold_batch_gpu(
     min_count = (2 * kx + 1) * (2 * ky + 1) if min_local <= 0 else min_local
     B, H, W = src.shape
     bufs = _get_triton_batch_scratch(src.device, B, H, W)
-    out = torch.empty((B, H, W), dtype=torch.bool, device=src.device)
+    out = bufs["dst"]
     grid = (B * H, triton.cdiv(W, 256))
     if gain is None:
         mode = 0
@@ -917,7 +916,7 @@ def dispersion_extended_threshold_batch_gpu(
 
     B, H, W = src.shape
     bufs = _get_triton_batch_scratch(src.device, B, H, W)
-    out = torch.empty((B, H, W), dtype=torch.bool, device=src.device)
+    out = bufs["dst"]
     grid = (B * H, triton.cdiv(W, 256))
     if gain is None:
         mode = 0

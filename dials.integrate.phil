@@ -1,13 +1,20 @@
 output {
-  experiments = "/tmp/pytest-of-davidm/pytest-52/test_end_to_end_scale_i19_mode0/integrated.expt"
-  reflections = "/tmp/pytest-of-davidm/pytest-52/test_end_to_end_scale_i19_mode0/integrated.refl"
+  experiments = "/home/davidm/.gemini/antigravity/brain/a604dbc3-5ed4-464f-9a64-9e046ba8393d/scratch/mxi_test/c2sum_dials_gpu_simple_sum_integrated.expt"
+  reflections = "/home/davidm/.gemini/antigravity/brain/a604dbc3-5ed4-464f-9a64-9e046ba8393d/scratch/mxi_test/c2sum_dials_gpu_simple_sum_integrated.refl"
+  log = "/home/davidm/.gemini/antigravity/brain/a604dbc3-5ed4-464f-9a64-9e046ba8393d/scratch/mxi_test/c2sum_dials_gpu_simple_sum_integrate.log"
 }
 integration {
   profile {
     fitting = False
   }
+  mp {
+    nproc = 1
+  }
+  background {
+    algorithm = Auto glm gmodel null *simple
+  }
 }
 input {
-  experiments = /tmp/pytest-of-davidm/pytest-52/test_end_to_end_scale_i19_mode0/indexed.expt
-  reflections = /tmp/pytest-of-davidm/pytest-52/test_end_to_end_scale_i19_mode0/indexed.refl
+  experiments = /home/davidm/.gemini/antigravity/brain/a604dbc3-5ed4-464f-9a64-9e046ba8393d/scratch/mxi_test/c2sum_dials_cpu_refined.expt
+  reflections = /home/davidm/.gemini/antigravity/brain/a604dbc3-5ed4-464f-9a64-9e046ba8393d/scratch/mxi_test/c2sum_dials_cpu_refined.refl
 }

@@ -26,16 +26,108 @@ from dials.util.exclude_images import (
 from dials.util.options import ArgumentParser, reflections_and_experiments_from_files
 from dials.util.version import dials_version
 
-from dials_gpu.integration.integrator import create_integrator_gpu
+from dials_gpu.integration import _shoebox_pack_ext
+from dials_gpu.integration.integrator import _compute_bbox_fast, create_integrator_gpu
 from dials_gpu.integration.profile import ProfileModelFactoryGPU
 
 logger = logging.getLogger("dials.command_line.integrate")
+
+
+def _mask_neighbouring_fast(profile_reference, exp):
+    try:
+        return _shoebox_pack_ext.parallel_mask_neighbouring(
+            profile_reference["shoebox"],
+            profile_reference["miller_index"],
+            exp.beam,
+            exp.detector,
+            exp.goniometer,
+            exp.scan,
+            exp.crystal,
+        )
+    except Exception:
+        return profile_reference["shoebox"].mask_neighbouring(
+            profile_reference["miller_index"],
+            exp.beam,
+            exp.detector,
+            exp.goniometer,
+            exp.scan,
+            exp.crystal,
+        )
+
+
+def _match_with_reference_fast(predicted, other):
+    try:
+        logger.info("Matching reference spots with predicted reflections")
+        logger.info(" %d observed reflections input", len(other))
+        logger.info(" %d reflections predicted", len(predicted))
+        sind, oind = _shoebox_pack_ext.match_with_reference_indices(
+            predicted["id"],
+            predicted["miller_index"],
+            predicted["entering"],
+            predicted["xyzcal.px"],
+            predicted["panel"],
+            other["id"],
+            other["miller_index"],
+            other["entering"],
+            other["xyzcal.px"],
+            other["panel"],
+        )
+        s2 = predicted.select(sind)
+        o2 = other.select(oind)
+        h1 = s2["miller_index"]
+        h2 = o2["miller_index"]
+        e1 = s2["entering"]
+        e2 = o2["entering"]
+        assert (h1 == h2).all_eq(True)
+        assert (e1 == e2).all_eq(True)
+        x1, y1, z1 = s2["xyzcal.px"].parts()
+        x2, y2, z2 = o2["xyzcal.px"].parts()
+        distance = flex.sqrt(
+            flex.pow2(x1 - x2) + flex.pow2(y1 - y2) + flex.pow2(z1 - z2)
+        )
+        mask = distance < 2
+        logger.info(" %d reflections matched", len(o2))
+        logger.info(" %d reflections accepted", mask.count(True))
+        sind_m = sind.select(mask)
+        predicted.set_flags(sind_m, predicted.flags.reference_spot)
+        predicted.set_flags(
+            sind.select(o2.get_flags(predicted.flags.strong)),
+            predicted.flags.strong,
+        )
+        predicted.set_flags(
+            sind.select(o2.get_flags(predicted.flags.indexed)),
+            predicted.flags.indexed,
+        )
+        predicted.set_flags(
+            sind.select(o2.get_flags(predicted.flags.used_in_refinement)),
+            predicted.flags.used_in_refinement,
+        )
+        other_matched_indices = oind.select(mask)
+        other_unmatched_mask = flex.bool(len(other), True)
+        other_unmatched_mask.set_selected(
+            other_matched_indices,
+            flex.bool(len(other_matched_indices), False),
+        )
+        other_matched = other.select(other_matched_indices)
+        other_unmatched = other.select(other_unmatched_mask)
+        for key, column in predicted.select(sind_m).cols():
+            other_matched[key] = column
+        mask2 = flex.bool(len(predicted), False)
+        mask2.set_selected(sind_m, True)
+        return mask2, other_matched, other_unmatched
+    except Exception:
+        return predicted.match_with_reference(other)
 
 
 def run_integration(params, experiments, reference=None):
     """
     GPU-accelerated integration entry point matching `dials.command_line.integrate.run_integration`.
     """
+    import torch
+
+    if torch.cuda.is_available() and torch.get_num_threads() > 1:
+        torch.set_num_threads(1)
+
     if params.integration.mp.nproc is libtbx.Auto:
         params.integration.mp.nproc = 1
 
@@ -91,7 +183,15 @@ def run_integration(params, experiments, reference=None):
         profile_reference, rubbish = process_reference(reference)
 
         if exp.goniometer is not None and exp.scan is not None:
-            profile_reference = filter_reference_pixels(profile_reference, experiments)
+            if len(experiments) == 1:
+                modified = _mask_neighbouring_fast(profile_reference, exp)
+                logger.info(
+                    " masked neighbouring pixels in %d shoeboxes", modified.count(True)
+                )
+            else:
+                profile_reference = filter_reference_pixels(
+                    profile_reference, experiments
+                )
 
         experiments, profile_reference = split_for_scan_range(
             experiments, profile_reference, params.scan_range
@@ -151,8 +251,8 @@ def run_integration(params, experiments, reference=None):
                     break
 
     if profile_reference:
-        matched, profile_reference, unmatched = predicted.match_with_reference(
-            profile_reference
+        matched, profile_reference, unmatched = _match_with_reference_fast(
+            predicted, profile_reference
         )
         assert len(matched) == len(predicted)
         assert matched.count(True) <= len(profile_reference)
@@ -223,7 +323,14 @@ def run_integration(params, experiments, reference=None):
     if not params.output.include_bad_reference:
         rubbish = None
 
-    predicted.compute_bbox(experiments)
+    _compute_bbox_fast(
+        predicted,
+        experiments,
+        sigma_b_multiplier=params.integration.profile.sigma_b_multiplier,
+    )
+    predicted._bbox_precomputed_sigma_b_mult = float(
+        params.integration.profile.sigma_b_multiplier
+    )
 
     integrator = create_integrator_gpu(params, experiments, predicted)
     reflections = integrator.integrate()

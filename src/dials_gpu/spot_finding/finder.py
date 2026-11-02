@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 import ctypes
@@ -73,12 +74,47 @@ ext_logger = logging.getLogger("dials.extensions.dispersion_spotfinder_threshold
 
 
 _BSHUF_LIB = None
+_CBF_READ_FN = None
 _BSHUF_POOL: ThreadPoolExecutor | None = None
 _HDF5_GPU_VOLUME_CACHE: OrderedDict[tuple, torch.Tensor] = OrderedDict()
 _HDF5_GPU_MASK_CACHE: OrderedDict[tuple, torch.Tensor] = OrderedDict()
 _HDF5_COMPRESSED_CACHE: OrderedDict[tuple, tuple[list[bytes], int, int, np.dtype]] = OrderedDict()
 _BASE_STATIC_MASK_GPU_CACHE: OrderedDict[tuple, list[torch.Tensor]] = OrderedDict()
 _PINNED_HOST_VOL_CACHE: dict[tuple, torch.Tensor] = {}
+_PIPELINE_PINNED_CACHE: dict[tuple, list[torch.Tensor]] = {}
+
+
+@atexit.register
+def _cleanup_spotfinding_caches():
+    _PIPELINE_PINNED_CACHE.clear()
+    _PINNED_HOST_VOL_CACHE.clear()
+    _HDF5_GPU_VOLUME_CACHE.clear()
+    _HDF5_GPU_MASK_CACHE.clear()
+    _BASE_STATIC_MASK_GPU_CACHE.clear()
+
+
+def _get_cbf_batch_reader():
+    global _CBF_READ_FN
+    if _CBF_READ_FN is not None:
+        return _CBF_READ_FN
+    try:
+        so_path = os.path.join(os.path.dirname(__file__), "_cbf_read_ext.so")
+        if not os.path.exists(so_path):
+            return None
+        lib = ctypes.CDLL(so_path)
+        fn = lib.read_cbf_batch_omp
+        fn.argtypes = [
+            ctypes.POINTER(ctypes.c_char_p),
+            ctypes.c_int,
+            ctypes.c_int64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        fn.restype = ctypes.c_int
+        _CBF_READ_FN = fn
+        return _CBF_READ_FN
+    except Exception:
+        return None
 
 
 def _get_bshuf_decompress():
@@ -111,12 +147,16 @@ def _get_bshuf_decompress():
 def _get_bshuf_pool() -> ThreadPoolExecutor:
     global _BSHUF_POOL
     if _BSHUF_POOL is None:
-        _BSHUF_POOL = ThreadPoolExecutor(max_workers=min(8, max(2, CPU_COUNT)))
+        _BSHUF_POOL = ThreadPoolExecutor(max_workers=min(20, max(2, CPU_COUNT)))
     return _BSHUF_POOL
 
 
 def _try_load_hdf5_raw_volume_gpu(
-    imageset, device: torch.device
+    imageset,
+    device: torch.device,
+    slice_start: int = 0,
+    slice_len: int | None = None,
+    pinned_out: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """
     Fast path for single-panel HDF5/NeXus ImageSequences:
@@ -136,7 +176,11 @@ def _try_load_hdf5_raw_volume_gpu(
     if not path or not path.endswith((".nxs", ".h5", ".hdf5")):
         return None
 
-    indices = tuple(imageset.indices())
+    all_indices = tuple(imageset.indices())
+    if slice_len is None:
+        indices = all_indices[slice_start:]
+    else:
+        indices = all_indices[slice_start : slice_start + slice_len]
     B = len(indices)
     if B == 0 or B > 64:
         return None
@@ -144,9 +188,10 @@ def _try_load_hdf5_raw_volume_gpu(
     if indices != tuple(range(z0, z0 + B)):
         return None
 
+    use_vram_cache = len(all_indices) <= 64
     dev_key = (device.type, device.index if device.index is not None else 0)
     gpu_key = (path, z0, B, dev_key)
-    if gpu_key in _HDF5_GPU_VOLUME_CACHE:
+    if use_vram_cache and gpu_key in _HDF5_GPU_VOLUME_CACHE:
         _HDF5_GPU_VOLUME_CACHE.move_to_end(gpu_key)
         return _HDF5_GPU_VOLUME_CACHE[gpu_key]
 
@@ -211,11 +256,14 @@ def _try_load_hdf5_raw_volume_gpu(
                         arr = arr.view(np.int32)
                     elif arr.dtype == np.uint16:
                         arr = arr.astype(np.int32)
+                    if pinned_out is not None:
+                        pinned_out[:B].copy_(torch.from_numpy(np.ascontiguousarray(arr)))
+                        return pinned_out[:B]
                     vol_t = torch.from_numpy(np.ascontiguousarray(arr)).to(
                         device=device, non_blocking=True
                     )
-                    if device.type == "cuda":
-                        if len(_HDF5_GPU_VOLUME_CACHE) >= 2:
+                    if use_vram_cache and device.type == "cuda":
+                        if len(_HDF5_GPU_VOLUME_CACHE) >= 8:
                             _HDF5_GPU_VOLUME_CACHE.popitem(last=False)
                         _HDF5_GPU_VOLUME_CACHE[gpu_key] = vol_t
                     return vol_t
@@ -226,18 +274,22 @@ def _try_load_hdf5_raw_volume_gpu(
     elem_size = int(np.dtype(dtype).itemsize)
     n_elems = H * W
     out_dtype = np.int32 if dtype == np.uint32 else dtype
-    pin_key = (B, H, W, out_dtype)
-    pinned_t = _PINNED_HOST_VOL_CACHE.get(pin_key) if device.type == "cuda" else None
-    if pinned_t is None and out_dtype == np.int32 and device.type == "cuda":
-        if len(_PINNED_HOST_VOL_CACHE) >= 2:
-            _PINNED_HOST_VOL_CACHE.clear()
-        pinned_t = torch.empty((B, H, W), dtype=torch.int32, pin_memory=True)
-        _PINNED_HOST_VOL_CACHE[pin_key] = pinned_t
-
-    if pinned_t is not None:
+    if pinned_out is not None and out_dtype == np.int32:
+        pinned_t = pinned_out[:B]
         out_np = pinned_t.numpy()
     else:
-        out_np = np.empty((B, H, W), dtype=out_dtype)
+        pin_key = (B, H, W, out_dtype)
+        pinned_t = _PINNED_HOST_VOL_CACHE.get(pin_key) if device.type == "cuda" else None
+        if pinned_t is None and out_dtype == np.int32 and device.type == "cuda":
+            if len(_PINNED_HOST_VOL_CACHE) >= 2:
+                _PINNED_HOST_VOL_CACHE.clear()
+            pinned_t = torch.empty((B, H, W), dtype=torch.int32, pin_memory=True)
+            _PINNED_HOST_VOL_CACHE[pin_key] = pinned_t
+
+        if pinned_t is not None:
+            out_np = pinned_t.numpy()
+        else:
+            out_np = np.empty((B, H, W), dtype=out_dtype)
 
     out_base = out_np.ctypes.data
     frame_nbytes = n_elems * elem_size
@@ -253,14 +305,19 @@ def _try_load_hdf5_raw_volume_gpu(
 
     list(_get_bshuf_pool().map(_decomp_one, range(B)))
 
+    if pinned_out is not None:
+        if out_dtype != np.int32:
+            pinned_out[:B].copy_(torch.from_numpy(out_np.astype(np.int32)))
+        return pinned_out[:B]
+
     if pinned_t is not None:
         vol_t = pinned_t.to(device=device, non_blocking=True)
     else:
         if out_np.dtype == np.uint16:
             out_np = out_np.astype(np.int32)
         vol_t = torch.from_numpy(out_np).to(device=device, non_blocking=True)
-    if device.type == "cuda":
-        if len(_HDF5_GPU_VOLUME_CACHE) >= 2:
+    if use_vram_cache and device.type == "cuda":
+        if len(_HDF5_GPU_VOLUME_CACHE) >= 8:
             _HDF5_GPU_VOLUME_CACHE.popitem(last=False)
         _HDF5_GPU_VOLUME_CACHE[gpu_key] = vol_t
     return vol_t
@@ -1047,10 +1104,19 @@ class ExtractSpotsGPU:
 
         logger.info("Extracting strong pixels from images on GPU")
         vol_t = None
+        is_hdf5 = False
+        try:
+            p0 = imageset.get_path(0)
+            if p0 and p0.endswith((".nxs", ".h5", ".hdf5")):
+                is_hdf5 = True
+        except Exception:
+            pass
+
         if (
             function._can_use_fast_gpu_raw
             and num_panels == 1
             and self.device.type == "cuda"
+            and len(indices) <= 64
         ):
             vol_t = _try_load_hdf5_raw_volume_gpu(imageset, self.device)
 
@@ -1071,36 +1137,41 @@ class ExtractSpotsGPU:
                 for plabeller, plist in zip(pixel_labeller, res):
                     plabeller.add(plist)
                 res.clear()
+        elif (
+            function._can_use_fast_gpu_raw
+            and num_panels == 1
+            and self.device.type == "cuda"
+            and hasattr(self.threshold_function, "compute_threshold_batch_tensor")
+            and len(indices) > 1
+        ):
+            self._run_pipelined_batch_volume_gpu(
+                imageset=imageset,
+                function=function,
+                indices=indices,
+                pixel_labeller=pixel_labeller,
+                is_hdf5=is_hdf5,
+            )
+        elif (
+            function._can_use_fast_gpu_raw
+            and not is_hdf5
+            and len(indices) > 1
+            and isinstance(mp_nproc, int)
+            and mp_nproc > 1
+        ):
+            self._run_parallel_raw_prefetch(
+                imageset=imageset,
+                function=function,
+                indices=indices,
+                pixel_labeller=pixel_labeller,
+                nproc=min(mp_nproc, len(indices) - 1, 16),
+            )
         else:
-            is_hdf5 = False
-            try:
-                p0 = imageset.get_path(0)
-                if p0 and p0.endswith((".nxs", ".h5", ".hdf5")):
-                    is_hdf5 = True
-            except Exception:
-                pass
-
-            if (
-                function._can_use_fast_gpu_raw
-                and not is_hdf5
-                and len(indices) > 1
-                and isinstance(mp_nproc, int)
-                and mp_nproc > 1
-            ):
-                self._run_parallel_raw_prefetch(
-                    imageset=imageset,
-                    function=function,
-                    indices=indices,
-                    pixel_labeller=pixel_labeller,
-                    nproc=min(mp_nproc, len(indices) - 1, 16),
-                )
-            else:
-                for task in indices:
-                    result = function(task)
-                    assert len(pixel_labeller) == len(result), "Inconsistent size"
-                    for plabeller, plist in zip(pixel_labeller, result):
-                        plabeller.add(plist)
-                    result.clear()
+            for task in indices:
+                result = function(task)
+                assert len(pixel_labeller) == len(result), "Inconsistent size"
+                for plabeller, plist in zip(pixel_labeller, result):
+                    plabeller.add(plist)
+                result.clear()
 
         return pixel_list_to_reflection_table_gpu(
             imageset,
@@ -1115,27 +1186,141 @@ class ExtractSpotsGPU:
             device=self.device,
         )
 
+    def _run_pipelined_batch_volume_gpu(
+        self,
+        imageset,
+        function: ExtractPixelsFromImageGPU,
+        indices: list[int],
+        pixel_labeller: list[PixelListLabellerGPU],
+        is_hdf5: bool = False,
+    ):
+        """
+        3-stage overlapped CPU decompression + PCIe H2D DMA + GPU batch thresholding pipeline
+        for single-panel sweeps (both multi-file .cbf.gz/.cbf and >64-frame HDF5 .nxs).
+        """
+        H, W = function._base_static_mask_tensors[0].shape
+        n_elems = H * W
+        if len(indices) > 64:
+            _HDF5_GPU_VOLUME_CACHE.clear()
+            _HDF5_GPU_MASK_CACHE.clear()
+
+        pin_key = (32, H, W)
+        pinned_bufs = _PIPELINE_PINNED_CACHE.get(pin_key)
+        if pinned_bufs is None:
+            _PIPELINE_PINNED_CACHE.clear()
+            pinned_bufs = [
+                torch.empty((32, H, W), dtype=torch.int32, pin_memory=True),
+                torch.empty((32, H, W), dtype=torch.int32, pin_memory=True),
+            ]
+            _PIPELINE_PINNED_CACHE[pin_key] = pinned_bufs
+
+        gpu_bufs = [
+            torch.empty((32, H, W), dtype=torch.int32, device=self.device),
+            torch.empty((32, H, W), dtype=torch.int32, device=self.device),
+        ]
+        copy_stream = torch.cuda.Stream(device=self.device)
+        h2d_events = [torch.cuda.Event(), torch.cuda.Event()]
+        compute_done_events = [torch.cuda.Event(), torch.cuda.Event()]
+
+        cbf_fn = _get_cbf_batch_reader() if not is_hdf5 else None
+        n_threads = min(20, max(2, CPU_COUNT))
+
+        def _load_and_stage(slot: int, s: int, B: int):
+            compute_done_events[slot].synchronize()
+            loaded = False
+            if is_hdf5:
+                res_t = _try_load_hdf5_raw_volume_gpu(
+                    imageset,
+                    self.device,
+                    slice_start=s,
+                    slice_len=B,
+                    pinned_out=pinned_bufs[slot][:B],
+                )
+                if res_t is not None:
+                    loaded = True
+            elif cbf_fn is not None:
+                try:
+                    paths_b = [
+                        imageset.get_path(i).encode("utf-8") for i in range(s, s + B)
+                    ]
+                    c_paths = (ctypes.c_char_p * B)(*paths_b)
+                    rc = cbf_fn(
+                        c_paths,
+                        B,
+                        n_elems,
+                        pinned_bufs[slot].numpy().ctypes.data,
+                        n_threads,
+                    )
+                    if rc == 0:
+                        loaded = True
+                except Exception:
+                    loaded = False
+
+            if not loaded:
+                frames_np = [
+                    flumpy.to_numpy(imageset.get_raw_data(i)[0])
+                    for i in range(s, s + B)
+                ]
+                chunk_np = np.stack(frames_np, axis=0)
+                if chunk_np.dtype == np.uint32:
+                    chunk_np = chunk_np.view(np.int32)
+                elif chunk_np.dtype != np.int32:
+                    chunk_np = chunk_np.astype(np.int32)
+                pinned_bufs[slot][:B].copy_(torch.from_numpy(chunk_np))
+
+            with torch.cuda.stream(copy_stream):
+                gpu_bufs[slot][:B].copy_(pinned_bufs[slot][:B], non_blocking=True)
+                h2d_events[slot].record(copy_stream)
+            return B
+
+        slabs = [(s, min(32, len(indices) - s)) for s in range(0, len(indices), 32)]
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(_load_and_stage, 0, slabs[0][0], slabs[0][1])
+            for idx, (s, B) in enumerate(slabs):
+                slot = idx % 2
+                fut.result()
+                if idx + 1 < len(slabs):
+                    ns, nB = slabs[idx + 1]
+                    fut = pool.submit(_load_and_stage, (idx + 1) % 2, ns, nB)
+                torch.cuda.current_stream(self.device).wait_event(h2d_events[slot])
+                self._run_batch_volume_gpu(
+                    imageset=imageset,
+                    function=function,
+                    vol_t=gpu_bufs[slot][:B],
+                    pixel_labeller=pixel_labeller,
+                    slab_start=s,
+                )
+                compute_done_events[slot].record(
+                    torch.cuda.current_stream(self.device)
+                )
+
     def _run_batch_volume_gpu(
         self,
         imageset,
         function: ExtractPixelsFromImageGPU,
         vol_t: torch.Tensor,
         pixel_labeller: list[PixelListLabellerGPU],
+        slab_start: int = 0,
     ):
         B, H, W = vol_t.shape
-        first_frame = imageset.get_array_range()[0]
+        first_frame = imageset.get_array_range()[0] + slab_start
         tr0, tr1 = function._trusted_ranges[0]
 
+        use_mask_cache = len(imageset.indices()) <= 64 and slab_start == 0
         dev_key = (self.device.type, self.device.index if self.device.index is not None else 0)
-        z0 = int(imageset.indices()[0])
+        z0 = int(imageset.indices()[slab_start])
         m_key = (function._path_key, z0, B, float(tr0), float(tr1), dev_key)
-        base_mask_vol = _HDF5_GPU_MASK_CACHE.get(m_key) if function._path_key else None
+        base_mask_vol = (
+            _HDF5_GPU_MASK_CACHE.get(m_key)
+            if (use_mask_cache and function._path_key)
+            else None
+        )
         if base_mask_vol is not None:
             _HDF5_GPU_MASK_CACHE.move_to_end(m_key)
         else:
             base_sm = function._base_static_mask_tensors[0]
             base_mask_vol = base_sm.unsqueeze(0) & (vol_t >= tr0) & (vol_t <= tr1)
-            if function._path_key and self.device.type == "cuda":
+            if use_mask_cache and function._path_key and self.device.type == "cuda":
                 if len(_HDF5_GPU_MASK_CACHE) >= 8:
                     _HDF5_GPU_MASK_CACHE.popitem(last=False)
                 _HDF5_GPU_MASK_CACHE[m_key] = base_mask_vol
@@ -1145,13 +1330,15 @@ class ExtractSpotsGPU:
         else:
             mask_vol = base_mask_vol
 
-        rejected_flags = [imageset.is_marked_for_rejection(i) for i in range(B)]
+        rejected_flags = [
+            imageset.is_marked_for_rejection(slab_start + i) for i in range(B)
+        ]
         if function._masker is not None:
             cloned_mask = False
             for i in range(B):
                 if not rejected_flags[i]:
                     angle = function._scan.get_angle_from_image_index(
-                        i + function._image_range_start, deg=True
+                        slab_start + i + function._image_range_start, deg=True
                     )
                     ext = function._masker.project_extrema(function._detector, angle)
                     if any(len(e) > 0 for e in ext):
@@ -1209,7 +1396,12 @@ class ExtractSpotsGPU:
                 if rej:
                     out_vol[i].zero_()
 
-        frame_counts = out_vol.reshape(B, -1).sum(dim=1).cpu().tolist()
+        zyx = torch.nonzero(out_vol, as_tuple=False)
+        if zyx.shape[0] > 0:
+            frame_counts = torch.bincount(zyx[:, 0], minlength=B).cpu().tolist()
+        else:
+            frame_counts = [0] * B
+
         max_strong = (
             int(math.ceil(self.max_strong_pixel_fraction * (H * W)))
             if self.max_strong_pixel_fraction < 1
@@ -1234,13 +1426,11 @@ class ExtractSpotsGPU:
                 )
                 logger.info(f"Average background on image {frame_log} is {avg_bg}")
 
-        zyx = torch.nonzero(out_vol, as_tuple=False)
         if zyx.shape[0] > 0:
             vals = work_vol[out_vol].to(torch.float64)
             if first_frame != 0:
-                zyx = zyx.clone()
                 zyx[:, 0] += first_frame
-            coords = zyx.to(torch.int64)
+            coords = zyx
         else:
             coords = torch.empty((0, 3), dtype=torch.int64, device=self.device)
             vals = torch.empty((0,), dtype=torch.float64, device=self.device)

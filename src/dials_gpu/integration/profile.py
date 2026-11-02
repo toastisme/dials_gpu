@@ -31,6 +31,8 @@ from dials.algorithms.profile_model.gaussian_rs.calculator import (
 from dials.array_family import flex
 from scitbx import simplex
 
+from dials_gpu.integration import _shoebox_pack_ext
+
 logger = logging.getLogger(__name__)
 
 
@@ -212,11 +214,55 @@ class ComputeEsdBeamDivergenceGPU:
     shoebox pixels around the reflection centroid.
     """
 
-    def __init__(self, detector, reflections, centroid_definition="s1", device=None):
+    def __init__(
+        self,
+        detector,
+        reflections,
+        centroid_definition="s1",
+        device=None,
+        sel_indices: np.ndarray | None = None,
+    ):
         assert centroid_definition in ["com", "s1"]
         self._device = _get_device(device)
         shoeboxes = reflections["shoebox"]
         s1_all = reflections["s1"]
+
+        if _shoebox_pack_ext is not None:
+            try:
+                is_com = centroid_definition == "com"
+                xyz_col = reflections["xyzobs.px.value"] if is_com else s1_all
+                if sel_indices is None:
+                    idx_np = np.arange(len(reflections), dtype=np.int64)
+                else:
+                    idx_np = np.ascontiguousarray(sel_indices, dtype=np.int64)
+                n_sel = len(idx_np)
+                if n_sel == 0:
+                    raise RuntimeError("No reflections remaining for profile modelling")
+                out_var = np.empty(n_sel, dtype=np.float64)
+                out_valid = np.empty(n_sel, dtype=np.uint8)
+                _shoebox_pack_ext.compute_beam_divergence_variances(
+                    detector,
+                    shoeboxes,
+                    s1_all,
+                    xyz_col,
+                    is_com,
+                    int(idx_np.ctypes.data),
+                    n_sel,
+                    int(out_var.ctypes.data),
+                    int(out_valid.ctypes.data),
+                )
+                variances = out_var[out_valid != 0]
+                if len(variances) == 0:
+                    raise RuntimeError("No reflections remaining for profile modelling")
+                self._variances = flex.double(
+                    np.ascontiguousarray(variances, dtype=np.float64)
+                )
+                self._sigma = math.sqrt(float(np.mean(variances)))
+                return
+            except RuntimeError:
+                raise
+            except Exception:
+                pass
 
         # Extract valid shoebox pixel coordinates and intensities, then evaluate
         # the angular variance in a single batched GPU tensor operation.
@@ -430,87 +476,169 @@ class _ExtendedEstimatorGPU:
     and `index_add_`.
     """
 
-    def __init__(self, crystal, beam, detector, goniometer, scan, reflections, device=None):
+    def __init__(
+        self,
+        crystal,
+        beam,
+        detector,
+        goniometer,
+        scan,
+        reflections,
+        device=None,
+        sel_indices: np.ndarray | None = None,
+        zeta_np: np.ndarray | None = None,
+    ):
         self._device = _get_device(device)
         s1 = reflections["s1"]
-        phi = reflections["xyzcal.mm"].parts()[2].as_numpy_array()
-        bbox = _bbox_to_numpy(reflections["bbox"])
+        phi = np.ascontiguousarray(
+            reflections["xyzcal.mm"].parts()[2].as_numpy_array(), dtype=np.float64
+        )
         shoeboxes = reflections["shoebox"]
 
-        zeta_np = compute_zeta_gpu(
-            type("Exp", (), {"beam": beam, "goniometer": goniometer})(),
-            s1,
-            device=self._device,
-        ).as_numpy_array()
+        if zeta_np is None:
+            zeta_np = np.ascontiguousarray(
+                compute_zeta_gpu(
+                    type("Exp", (), {"beam": beam, "goniometer": goniometer})(),
+                    s1,
+                    device=self._device,
+                ).as_numpy_array(),
+                dtype=np.float64,
+            )
+        else:
+            zeta_np = np.ascontiguousarray(zeta_np, dtype=np.float64)
 
         osc = scan.get_oscillation(deg=False)
         arr_range = scan.get_array_range()
-        osc0 = osc[0] - arr_range[0] * osc[1]
-        dosc = osc[1]
-
-        # Mask code Valid | Foreground = 1 | 4 = 5
-        mask_code = 5
-
-        e1_list = []
-        e2_list = []
-        n_list = []
-        refl_idx_list = []
-        k_list = []
-
-        valid_refl_id = 0
-        sqrt2 = math.sqrt(2.0)
-
-        for r in range(len(reflections)):
-            sb = shoeboxes[r]
-            mask_np = flumpy.to_numpy(sb.mask)
-            data_np = flumpy.to_numpy(sb.data)
-            fg_valid = mask_np == mask_code
-            # Sum foreground data per z-slice
-            frame_sums = np.sum(np.where(fg_valid, data_np, 0.0), axis=(1, 2))
-            pos_frames = np.where(frame_sums > 0)[0]
-            if len(pos_frames) == 0:
-                continue
-
-            z0 = bbox[r, 4]
-            phi_r = phi[r]
-            abs_zeta = abs(zeta_np[r])
-            factor = abs_zeta / sqrt2
-
-            f_indices = z0 + pos_frames
-            phi0_f = osc0 + f_indices * dosc
-            phi1_f = phi0_f + dosc
-            tau_f = (phi1_f + phi0_f) * 0.5 - phi_r
-            dphi_half = (phi1_f - phi0_f) * 0.5
-
-            e1_f = (tau_f + dphi_half) * factor
-            e2_f = (tau_f - dphi_half) * factor
-            n_f = frame_sums[pos_frames]
-
-            e1_list.append(e1_f)
-            e2_list.append(e2_f)
-            n_list.append(n_f)
-            refl_idx_list.append(np.full(len(pos_frames), valid_refl_id, dtype=np.int64))
-            k_list.append(float(np.sum(n_f)))
-            valid_refl_id += 1
-
-        if valid_refl_id == 0:
-            raise RuntimeError("0 reflections passes suitability criteria for profile modelling")
-
+        osc0 = float(osc[0] - arr_range[0] * osc[1])
+        dosc = float(osc[1])
         dev = self._device
-        self._e1_t = torch.as_tensor(
-            np.concatenate(e1_list), dtype=torch.float64, device=dev
-        )
-        self._e2_t = torch.as_tensor(
-            np.concatenate(e2_list), dtype=torch.float64, device=dev
-        )
-        self._n_t = torch.as_tensor(
-            np.concatenate(n_list), dtype=torch.float64, device=dev
-        )
-        self._refl_idx_t = torch.as_tensor(
-            np.concatenate(refl_idx_list), dtype=torch.long, device=dev
-        )
-        self._K_t = torch.as_tensor(k_list, dtype=torch.float64, device=dev)
-        self._num_valid_refls = valid_refl_id
+
+        used_cpp = False
+        if _shoebox_pack_ext is not None:
+            try:
+                if sel_indices is None:
+                    idx_np = np.arange(len(reflections), dtype=np.int64)
+                else:
+                    idx_np = np.ascontiguousarray(sel_indices, dtype=np.int64)
+                n_sel = len(idx_np)
+                if n_sel == 0:
+                    raise RuntimeError(
+                        "0 reflections passes suitability criteria for profile modelling"
+                    )
+                pos_counts = np.empty(n_sel, dtype=np.int64)
+                total_pos = _shoebox_pack_ext.count_extended_sigma_m_frames(
+                    shoeboxes,
+                    int(idx_np.ctypes.data),
+                    n_sel,
+                    int(pos_counts.ctypes.data),
+                )
+                if total_pos == 0:
+                    raise RuntimeError(
+                        "0 reflections passes suitability criteria for profile modelling"
+                    )
+                e1_np = np.empty(total_pos, dtype=np.float64)
+                e2_np = np.empty(total_pos, dtype=np.float64)
+                n_np = np.empty(total_pos, dtype=np.float64)
+                refl_idx_np = np.empty(total_pos, dtype=np.int64)
+                n_valid_refls = int(np.count_nonzero(pos_counts > 0))
+                k_np = np.empty(n_valid_refls, dtype=np.float64)
+                _shoebox_pack_ext.fill_extended_sigma_m_frames(
+                    shoeboxes,
+                    int(idx_np.ctypes.data),
+                    n_sel,
+                    int(pos_counts.ctypes.data),
+                    int(phi.ctypes.data),
+                    int(zeta_np.ctypes.data),
+                    osc0,
+                    dosc,
+                    int(e1_np.ctypes.data),
+                    int(e2_np.ctypes.data),
+                    int(n_np.ctypes.data),
+                    int(refl_idx_np.ctypes.data),
+                    int(k_np.ctypes.data),
+                )
+                self._e1_t = torch.as_tensor(e1_np, dtype=torch.float64, device=dev)
+                self._e2_t = torch.as_tensor(e2_np, dtype=torch.float64, device=dev)
+                self._n_t = torch.as_tensor(n_np, dtype=torch.float64, device=dev)
+                self._refl_idx_t = torch.as_tensor(
+                    refl_idx_np, dtype=torch.long, device=dev
+                )
+                self._K_t = torch.as_tensor(k_np, dtype=torch.float64, device=dev)
+                self._num_valid_refls = n_valid_refls
+                used_cpp = True
+            except RuntimeError:
+                raise
+            except Exception:
+                used_cpp = False
+
+        if not used_cpp:
+            bbox = _bbox_to_numpy(reflections["bbox"])
+            mask_code = 5
+            e1_list = []
+            e2_list = []
+            n_list = []
+            refl_idx_list = []
+            k_list = []
+            valid_refl_id = 0
+            sqrt2 = math.sqrt(2.0)
+
+            iter_indices = (
+                range(len(reflections)) if sel_indices is None else sel_indices
+            )
+            for r in iter_indices:
+                r = int(r)
+                sb = shoeboxes[r]
+                mask_np = flumpy.to_numpy(sb.mask)
+                data_np = flumpy.to_numpy(sb.data)
+                fg_valid = mask_np == mask_code
+                frame_sums = np.sum(np.where(fg_valid, data_np, 0.0), axis=(1, 2))
+                pos_frames = np.where(frame_sums > 0)[0]
+                if len(pos_frames) == 0:
+                    continue
+
+                z0 = bbox[r, 4]
+                phi_r = phi[r]
+                abs_zeta = abs(zeta_np[r])
+                factor = abs_zeta / sqrt2
+
+                f_indices = z0 + pos_frames
+                phi0_f = osc0 + f_indices * dosc
+                phi1_f = phi0_f + dosc
+                tau_f = (phi1_f + phi0_f) * 0.5 - phi_r
+                dphi_half = (phi1_f - phi0_f) * 0.5
+
+                e1_f = (tau_f + dphi_half) * factor
+                e2_f = (tau_f - dphi_half) * factor
+                n_f = frame_sums[pos_frames]
+
+                e1_list.append(e1_f)
+                e2_list.append(e2_f)
+                n_list.append(n_f)
+                refl_idx_list.append(
+                    np.full(len(pos_frames), valid_refl_id, dtype=np.int64)
+                )
+                k_list.append(float(np.sum(n_f)))
+                valid_refl_id += 1
+
+            if valid_refl_id == 0:
+                raise RuntimeError(
+                    "0 reflections passes suitability criteria for profile modelling"
+                )
+
+            self._e1_t = torch.as_tensor(
+                np.concatenate(e1_list), dtype=torch.float64, device=dev
+            )
+            self._e2_t = torch.as_tensor(
+                np.concatenate(e2_list), dtype=torch.float64, device=dev
+            )
+            self._n_t = torch.as_tensor(
+                np.concatenate(n_list), dtype=torch.float64, device=dev
+            )
+            self._refl_idx_t = torch.as_tensor(
+                np.concatenate(refl_idx_list), dtype=torch.long, device=dev
+            )
+            self._K_t = torch.as_tensor(k_list, dtype=torch.float64, device=dev)
+            self._num_valid_refls = valid_refl_id
 
         start = math.log(0.1 * math.pi / 180.0)
         stop = math.log(1.0 * math.pi / 180.0)
@@ -616,6 +744,26 @@ class _BasicEstimatorGPU:
         return -float(torch.sum(torch.log(p)).item())
 
 
+def _select_indices_for_sigma_calc(reflections, min_number_of_refl: int = 10000) -> np.ndarray:
+    """Return int64 indices of reflections selected by `_select_reflections_for_sigma_calc` without copying shoeboxes."""
+    n_ref = len(reflections)
+    if n_ref < min_number_of_refl:
+        return np.arange(n_ref, dtype=np.int64)
+    flags_np = reflections["flags"].as_numpy_array()
+    used_mask = (flags_np & int(reflections.flags.used_in_refinement)) != 0
+    used_idx = np.nonzero(used_mask)[0].astype(np.int64)
+    n_used = len(used_idx)
+    if n_used >= min_number_of_refl:
+        return used_idx
+    other_idx = np.nonzero(~used_mask)[0].astype(np.int64)
+    n_other = len(other_idx)
+    step_size = int(math.floor(n_other / (min_number_of_refl - n_used)))
+    top_up = other_idx[::step_size]
+    if n_used > 0:
+        return np.concatenate([used_idx, top_up])
+    return top_up
+
+
 class ComputeEsdReflectingRangeGPU:
     """
     GPU-accelerated calculation of the E.S.D of the reflecting range (`sigma_m`).
@@ -632,18 +780,36 @@ class ComputeEsdReflectingRangeGPU:
         reflections,
         algorithm="extended",
         device=None,
+        sel_indices: np.ndarray | None = None,
+        zeta_np: np.ndarray | None = None,
     ):
         if algorithm == "basic":
+            if sel_indices is not None:
+                reflections = reflections.select(
+                    flex.size_t(np.ascontiguousarray(sel_indices, dtype=np.uintp))
+                )
             estimator = _BasicEstimatorGPU(
                 crystal, beam, detector, goniometer, scan, reflections, device=device
             )
         elif algorithm == "crude":
+            if sel_indices is not None:
+                reflections = reflections.select(
+                    flex.size_t(np.ascontiguousarray(sel_indices, dtype=np.uintp))
+                )
             estimator = ComputeEsdReflectingRange.CrudeEstimator(
                 crystal, beam, detector, goniometer, scan, reflections
             )
         elif algorithm == "extended":
             estimator = _ExtendedEstimatorGPU(
-                crystal, beam, detector, goniometer, scan, reflections, device=device
+                crystal,
+                beam,
+                detector,
+                goniometer,
+                scan,
+                reflections,
+                device=device,
+                sel_indices=sel_indices,
+                zeta_np=zeta_np,
             )
         else:
             raise RuntimeError(f'Unknown algorithm: "{algorithm}"')
@@ -684,15 +850,19 @@ class ProfileModelCalculatorGPU(ProfileModelCalculator):
             self._sigma_b = calc_b.sigma()
             self._sigma_m = 0.0
         else:
-            sub = _select_reflections_for_sigma_calc(reflections)
-            zeta = compute_zeta_gpu(
+            sel_idx = _select_indices_for_sigma_calc(reflections)
+            zeta_all = compute_zeta_gpu(
                 type("Exp", (), {"beam": beam, "goniometer": goniometer})(),
-                sub["s1"],
+                reflections["s1"],
                 device=dev,
-            )
-            sub = sub.select(flex.abs(zeta) >= min_zeta)
+            ).as_numpy_array()
+            sel_idx = sel_idx[np.abs(zeta_all[sel_idx]) >= min_zeta]
             calc_b = ComputeEsdBeamDivergenceGPU(
-                detector, sub, centroid_definition, device=dev
+                detector,
+                reflections,
+                centroid_definition,
+                device=dev,
+                sel_indices=sel_idx,
             )
             self._sigma_b = calc_b.sigma()
             calc_m = ComputeEsdReflectingRangeGPU(
@@ -701,9 +871,11 @@ class ProfileModelCalculatorGPU(ProfileModelCalculator):
                 detector,
                 goniometer,
                 scan,
-                sub,
+                reflections,
                 algorithm=algorithm,
                 device=dev,
+                sel_indices=sel_idx,
+                zeta_np=zeta_all,
             )
             self._sigma_m = calc_m.sigma()
 

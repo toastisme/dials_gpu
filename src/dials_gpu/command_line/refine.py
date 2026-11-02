@@ -19,6 +19,7 @@ import logging
 import sys
 from collections import namedtuple
 
+import torch  # noqa: F401 -- import before omptbx_ext to avoid OpenMP runtime conflict
 from dxtbx.model.experiment_list import ExperimentList
 from libtbx import Auto
 

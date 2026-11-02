@@ -267,9 +267,9 @@ class _GPUScanGradientsMixin(_FastModifyParametersMixin):
         """Return cached reflection-constant GPU tensors and integer index selections."""
         n_refl = len(reflections)
         n_expts = len(self._experiments)
-        h_np = flumpy.to_numpy(reflections["miller_index"])
-        exp_id_np = flumpy.to_numpy(reflections["id"])
-        panel_id_np = flumpy.to_numpy(reflections["panel"])
+        h_np = reflections["miller_index"].as_vec3_double().as_numpy_array()
+        exp_id_np = np.array(flumpy.to_numpy(reflections["id"]), copy=True)
+        panel_id_np = np.array(flumpy.to_numpy(reflections["panel"]), copy=True)
 
         cache = getattr(self, "_gpu_refl_cache", None)
         if (
@@ -283,7 +283,7 @@ class _GPUScanGradientsMixin(_FastModifyParametersMixin):
             return cache
 
         h_gpu = torch.as_tensor(
-            h_np.astype(np.float64), dtype=torch.float64, device=device
+            h_np, dtype=torch.float64, device=device
         )
         exp_id_i64 = exp_id_np.astype(np.int64)
         panel_id_i64 = panel_id_np.astype(np.int64)
@@ -1176,7 +1176,7 @@ class _GPUStillsGradientsMixin(_FastModifyParametersMixin):
         )
 
         h_gpu = torch.as_tensor(
-            flumpy.to_numpy(reflections["miller_index"]).astype(np.float64),
+            reflections["miller_index"].as_vec3_double().as_numpy_array(),
             dtype=torch.float64,
             device=device,
         )
