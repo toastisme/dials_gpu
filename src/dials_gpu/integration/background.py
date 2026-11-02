@@ -406,6 +406,38 @@ class GLMBackgroundGPU:
         bg_mean_np = np.zeros(n_refl, dtype=np.float64)
         success_np = np.zeros(n_refl, dtype=bool)
 
+        if self._model_alg == "constant3d" and hasattr(_shoebox_pack_ext, "compute_glm_constant3d_fast"):
+            if "flags" not in reflections:
+                reflections["flags"] = flex.size_t(n_refl, 0)
+            bg_mean_flex, success_flex = _shoebox_pack_ext.compute_glm_constant3d_fast(
+                shoeboxes,
+                reflections["flags"],
+                int(self._min_pixels),
+                float(self._tuning_constant),
+                int(self._max_iter),
+                MASK_BG_VALID,
+                MASK_OVERLAPPED,
+                MASK_BACKGROUND_USED,
+            )
+            reflections["background.mean"] = bg_mean_flex
+            return success_flex
+
+        if self._model_alg == "constant2d" and hasattr(_shoebox_pack_ext, "compute_glm_constant2d_fast"):
+            if "flags" not in reflections:
+                reflections["flags"] = flex.size_t(n_refl, 0)
+            bg_mean_flex, success_flex = _shoebox_pack_ext.compute_glm_constant2d_fast(
+                shoeboxes,
+                reflections["flags"],
+                int(self._min_pixels),
+                float(self._tuning_constant),
+                int(self._max_iter),
+                MASK_BG_VALID,
+                MASK_OVERLAPPED,
+                MASK_BACKGROUND_USED,
+            )
+            reflections["background.mean"] = bg_mean_flex
+            return success_flex
+
         if self._model_alg == "constant3d":
             counts_np = np.empty(n_refl, dtype=np.int64)
             medians_np = np.empty(n_refl, dtype=np.float64)

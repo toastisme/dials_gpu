@@ -119,6 +119,98 @@ def _match_with_reference_fast(predicted, other):
         return predicted.match_with_reference(other)
 
 
+def _predict_reflections_fast(
+    experiments,
+    dmin=None,
+    dmax=None,
+    margin=1,
+    force_static=False,
+    padding=0,
+):
+    if (
+        len(experiments) == 1
+        and dmax is None
+        and hasattr(_shoebox_pack_ext, "parallel_predict_scan_varying")
+    ):
+        exp = experiments[0]
+        if (
+            exp.beam is not None
+            and exp.detector is not None
+            and exp.goniometer is not None
+            and exp.scan is not None
+            and exp.crystal is not None
+            and not force_static
+            and exp.scan.get_num_images() > 50
+            and exp.crystal.num_scan_points == exp.scan.get_num_images() + 1
+            and exp.beam.num_scan_points == 0
+            and exp.goniometer.num_scan_points == 0
+            and exp.scan.get_oscillation()[1] != 0.0
+            and not exp.detector.has_projection_2d()
+            and all(getattr(p, "num_scan_points", 0) == 0 for p in exp.detector)
+        ):
+            try:
+                dmin_val = (
+                    float(dmin)
+                    if dmin is not None
+                    else float(exp.detector.get_max_resolution(exp.beam.get_s0()))
+                )
+                wl = exp.beam.get_wavelength()
+                if dmin_val >= 0.5 * wl:
+                    A_list = flex.mat3_double(
+                        [
+                            exp.crystal.get_A_at_scan_point(i)
+                            for i in range(exp.crystal.num_scan_points)
+                        ]
+                    )
+                    patterson_sg_type = (
+                        exp.crystal.get_space_group()
+                        .build_derived_patterson_group()
+                        .type()
+                    )
+                    (
+                        hkl_col,
+                        panel_col,
+                        enter_col,
+                        s1_col,
+                        xyz_px_col,
+                        xyz_mm_col,
+                        flags_col,
+                        id_col,
+                    ) = _shoebox_pack_ext.parallel_predict_scan_varying(
+                        exp.beam,
+                        exp.detector,
+                        exp.goniometer,
+                        exp.scan,
+                        patterson_sg_type,
+                        dmin_val,
+                        int(margin),
+                        float(padding),
+                        A_list,
+                    )
+                    predicted = flex.reflection_table()
+                    predicted["miller_index"] = hkl_col
+                    predicted["panel"] = panel_col
+                    predicted["entering"] = enter_col
+                    predicted["s1"] = s1_col
+                    predicted["xyzcal.px"] = xyz_px_col
+                    predicted["xyzcal.mm"] = xyz_mm_col
+                    predicted["flags"] = flags_col
+                    predicted["id"] = id_col
+                    if exp.identifier:
+                        predicted.experiment_identifiers()[0] = exp.identifier
+                    return predicted
+            except Exception:
+                pass
+    return flex.reflection_table.from_predictions_multi(
+        experiments,
+        dmin=dmin,
+        dmax=dmax,
+        margin=margin,
+        force_static=force_static,
+        padding=padding,
+    )
+
+
 def run_integration(params, experiments, reference=None):
     """
     GPU-accelerated integration entry point matching `dials.command_line.integrate.run_integration`.
@@ -230,7 +322,7 @@ def run_integration(params, experiments, reference=None):
 
     logger.info("\n".join(("", "=" * 80, "")))
     logger.info("Predicting reflections")
-    predicted = flex.reflection_table.from_predictions_multi(
+    predicted = _predict_reflections_fast(
         experiments,
         dmin=params.prediction.d_min,
         dmax=params.prediction.d_max,

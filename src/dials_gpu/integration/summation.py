@@ -32,8 +32,25 @@ def compute_summed_intensity_gpu(
     if n_refl == 0:
         return
 
-    dev = _get_device(device)
     shoeboxes = reflections["shoebox"]
+    if hasattr(_shoebox_pack_ext, "compute_summation_fast"):
+        if "flags" not in reflections:
+            reflections["flags"] = flex.size_t(n_refl, 0)
+        i_val, i_var, b_val, b_var = _shoebox_pack_ext.compute_summation_fast(
+            shoeboxes,
+            reflections["flags"],
+            MASK_FOREGROUND,
+            MASK_FG_VALID,
+            MASK_OVERLAPPED,
+            MASK_BG_USED_VALID,
+        )
+        reflections["intensity.sum.value"] = i_val
+        reflections["intensity.sum.variance"] = i_var
+        reflections["background.sum.value"] = b_val
+        reflections["background.sum.variance"] = b_var
+        return
+
+    dev = _get_device(device)
 
     sum_p_np = np.empty(n_refl, dtype=np.float64)
     sum_b_np = np.empty(n_refl, dtype=np.float64)

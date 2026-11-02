@@ -129,6 +129,9 @@ def _get_centroid_cls_gpu(alg: str):
     return Centroid.load(alg)
 
 
+_DEFERRED_SINGLE_PASS_FITTERS = {}
+
+
 def _parallel_fit_reflections(fitter, reflections):
     """
     OpenMP parallel GaussianRS profile fitting on single-experiment reflection tables,
@@ -136,6 +139,55 @@ def _parallel_fit_reflections(fitter, reflections):
     """
     if len(reflections) == 0:
         return flex.bool()
+    ctx = _DEFERRED_SINGLE_PASS_FITTERS.get(id(fitter))
+    if ctx is not None and ctx.get("circular_prof_range") is not None:
+        prof_begin, prof_end = ctx["circular_prof_range"]
+        n_r = len(reflections)
+        val = flex.double(n_r, 0.0)
+        var = flex.double(n_r, -1.0)
+        cor = flex.double(n_r, 0.0)
+        flags = reflections["flags"]
+        success = _shoebox_pack_ext.parallel_model_and_fit_circular_slab(
+            fitter,
+            prof_begin,
+            prof_end,
+            reflections["shoebox"],
+            reflections["partiality"],
+            reflections["s1"],
+            reflections["xyzcal.px"],
+            reflections["xyzcal.mm"],
+            flags,
+            val,
+            var,
+            cor,
+        )
+        reflections["intensity.prf.value"] = val
+        reflections["intensity.prf.variance"] = var
+        reflections["profile.correlation"] = cor
+        reflections["flags"] = flags
+        reflections.set_flags(
+            ~success, reflections.flags.failed_during_profile_fitting
+        )
+        return success
+    if (
+        ctx is not None
+        and ctx.get("cache_id") is not None
+        and ctx.get("active_slab_ind") is not None
+    ):
+        flags = reflections["flags"]
+        _shoebox_pack_ext.parallel_transform_and_model_slab(
+            fitter,
+            ctx["cache_id"],
+            ctx["active_slab_ind"],
+            reflections["shoebox"],
+            reflections["partiality"],
+            reflections["s1"],
+            reflections["xyzcal.px"],
+            reflections["xyzcal.mm"],
+            flags,
+        )
+        reflections["flags"] = flags
+        return None
     try:
         if len(fitter) == 1:
             n_r = len(reflections)
@@ -603,22 +655,10 @@ def _try_get_hdf5_volume_and_mask_cpu(imageset, lookup_mask, cache_host_vol: boo
     if vol_np is not None:
         _HOST_VOL_CACHE.move_to_end(vol_key)
     elif is_hdf5:
-        # Check if already resident in GPU volume cache from dials_gpu.find_spots
-        dev = get_default_device()
-        dev_key = (dev.type, dev.index if dev.index is not None else 0)
-        gpu_key = (path, z0, B, dev_key)
-        if gpu_key in _HDF5_GPU_VOLUME_CACHE:
-            vol_t = _HDF5_GPU_VOLUME_CACHE[gpu_key]
-            vol_np = np.ascontiguousarray(vol_t.cpu().numpy())
-        else:
-            vol_t = _try_load_hdf5_raw_volume_gpu(imageset, torch.device("cpu"))
-            if vol_t is None or vol_t.dtype != torch.int32:
-                return None
-            vol_np = np.ascontiguousarray(vol_t.numpy())
-        if cache_host_vol:
-            if len(_HOST_VOL_CACHE) >= 8:
-                _HOST_VOL_CACHE.popitem(last=False)
-            _HOST_VOL_CACHE[vol_key] = vol_np
+        vol_t = _try_load_hdf5_raw_volume_gpu(imageset, torch.device("cpu"))
+        if vol_t is None or vol_t.dtype != torch.int32:
+            return None
+        vol_np = vol_t.numpy()
     else:
         try:
             cbf_ext = _get_cbf_batch_reader()
@@ -648,7 +688,9 @@ def _try_get_hdf5_volume_and_mask_cpu(imageset, lookup_mask, cache_host_vol: boo
     return vol_np, static_mask, tr_min, tr_max, H, W
 
 
-def _try_run_slabbed_volume_integration(task_self, imageset, frame0, frame1, time_fn):
+def _try_run_slabbed_volume_integration(
+    task_self, imageset, frame0, frame1, time_fn, slab_chunk_cache=None
+):
     """
     Fast multi-threaded slabbed volume extraction + GPU integration for large sweeps
     (> 64 frames) on single-panel static-mask HDF5/NeXus or CBF/CBF.GZ detectors.
@@ -702,12 +744,32 @@ def _try_run_slabbed_volume_integration(task_self, imageset, frame0, frame1, tim
     if n_total == 0:
         return 0.0, 0.0, 0.0
 
-    _, _, _, _, z0_flex, z1_flex = refls["bbox"].parts()
+    x0_flex, x1_flex, y0_flex, y1_flex, z0_flex, z1_flex = refls["bbox"].parts()
     z0_arr = z0_flex.as_numpy_array()
     z1_arr = z1_flex.as_numpy_array()
     dz_arr = z1_arr - z0_arr
 
     in_bounds = (z0_arr >= frame0) & (z1_arr <= frame1) & (dz_arr > 0)
+    is_single_fold_modeller = (
+        isinstance(task_self.executor, ProfileModellerExecutorGPU)
+        and len(getattr(task_self.executor.profile_fitter, "modellers", [None])) == 1
+        and "partiality" in refls
+    )
+    if is_single_fold_modeller:
+        x0_arr = x0_flex.as_numpy_array()
+        x1_arr = x1_flex.as_numpy_array()
+        y0_arr = y0_flex.as_numpy_array()
+        y1_arr = y1_flex.as_numpy_array()
+        part_arr = refls["partiality"].as_numpy_array()
+        in_bounds = (
+            in_bounds
+            & (part_arr > 0.99)
+            & (x0_arr >= 0)
+            & (y0_arr >= 0)
+            & (x1_arr <= W)
+            & (y1_arr <= H)
+        )
+
     slab_step = 64
     norm_mask = in_bounds & (dz_arr <= slab_step)
     wide_mask = in_bounds & (dz_arr > slab_step)
@@ -727,10 +789,40 @@ def _try_run_slabbed_volume_integration(task_self, imageset, frame0, frame1, tim
         )
         wide_valid_flags = np.zeros(len(wide_refl), dtype=np.uint8)
 
-    max_norm_dz = int(dz_arr[norm_mask].max()) if np.any(norm_mask) else 1
-    overlap = max(0, max_norm_dz - 1)
-    max_buf_frames = min(n_frames, slab_step + overlap)
-    slab_buf = np.empty((max_buf_frames, H, W), dtype=np.int32)
+    single_pass_ctx = _DEFERRED_SINGLE_PASS_FITTERS.get(
+        id(getattr(task_self.executor, "profile_fitter", None))
+    )
+
+    try:
+        import psutil
+
+        max_cache_bytes = min(
+            int(24 * 1024**3), int(psutil.virtual_memory().available * 0.55)
+        )
+    except Exception:
+        max_cache_bytes = int(3.5 * 1024**3)
+    can_cache_full_sweep = (
+        single_pass_ctx is None
+        and slab_chunk_cache is not None
+        and (n_frames * H * W * 4) <= max_cache_bytes
+    )
+    full_vol = None
+    loaded_state = None
+    if can_cache_full_sweep:
+        cache_entry = slab_chunk_cache.get((path0, frame0, frame1))
+        if cache_entry is not None:
+            full_vol, loaded_state = cache_entry
+        else:
+            full_vol = np.empty((n_frames, H, W), dtype=np.int32)
+            loaded_state = [0]
+            slab_chunk_cache[(path0, frame0, frame1)] = (full_vol, loaded_state)
+        slab_buf = None
+        max_buf_frames = n_frames
+    else:
+        max_norm_dz = int(dz_arr[norm_mask].max()) if np.any(norm_mask) else 1
+        overlap = max(0, max_norm_dz - 1)
+        max_buf_frames = min(n_frames, slab_step + overlap)
+        slab_buf = np.empty((max_buf_frames, H, W), dtype=np.int32)
 
     def _read_chunk_into(f_start, f_end, dst_slice):
         count = f_end - f_start
@@ -764,150 +856,331 @@ def _try_run_slabbed_volume_integration(task_self, imageset, frame0, frame1, tim
     prev_f0 = frame0
     prev_f1 = frame0
 
-    for z0_start in range(frame0, frame1, slab_step):
-        z0_end = min(z0_start + slab_step, frame1)
-        slab_sel = norm_mask & (z0_arr >= z0_start) & (z0_arr < z0_end)
-        has_norm = bool(np.any(slab_sel))
-        if has_norm:
-            req_f1 = int(z1_arr[slab_sel].max())
-        else:
-            req_f1 = z0_end
-        if z0_end == frame1:
-            req_f1 = frame1
-        slab_f1 = max(req_f1, prev_f1)
+    use_circular_slabs = False
+    slab_specs = []
+    if (
+        single_pass_ctx is not None
+        and not has_wide
+        and single_pass_ctx.get("is_circular_grid", False)
+    ):
+        num_z = single_pass_ctx["num_z"]
+        scan_f0, scan_f1 = single_pass_ctx["scan_range"]
+        step_size_z = float(scan_f1 - scan_f0) / float(num_z)
+        xyzpx_np = flumpy.to_numpy(refls["xyzcal.px"]).reshape(-1, 3)
+        k_arr = np.floor((xyzpx_np[:, 2] - scan_f0) / step_size_z).astype(np.int32)
+        np.clip(k_arr, 0, num_z - 1, out=k_arr)
+        k_step = max(1, int(round(slab_step / step_size_z)))
+        sim_prev_f0 = frame0
+        sim_prev_f1 = frame0
+        valid_circular = True
+        max_req_buf = 1
+        temp_specs = []
+        for k0 in range(0, num_z, k_step):
+            k1 = min(k0 + k_step, num_z)
+            s_sel = norm_mask & (k_arr >= k0) & (k_arr < k1)
+            if not np.any(s_sel):
+                continue
+            s_f0 = int(z0_arr[s_sel].min())
+            s_f1 = max(int(z1_arr[s_sel].max()), sim_prev_f1)
+            if s_f0 < sim_prev_f0:
+                valid_circular = False
+                break
+            max_req_buf = max(max_req_buf, s_f1 - s_f0)
+            temp_specs.append((s_f0, s_f1, s_sel, (k0 * 9, k1 * 9)))
+            sim_prev_f0 = s_f0
+            sim_prev_f1 = s_f1
+        if valid_circular:
+            use_circular_slabs = True
+            slab_specs = temp_specs
+            if full_vol is None and max_req_buf > max_buf_frames:
+                max_buf_frames = max_req_buf
+                slab_buf = np.empty((max_buf_frames, H, W), dtype=np.int32)
 
-        if not has_norm and slab_f1 == prev_f1:
-            continue
+    if not use_circular_slabs:
+        for z0_start in range(frame0, frame1, slab_step):
+            z0_end = min(z0_start + slab_step, frame1)
+            slab_sel = norm_mask & (z0_arr >= z0_start) & (z0_arr < z0_end)
+            has_norm = bool(np.any(slab_sel))
+            if has_norm:
+                req_f1 = int(z1_arr[slab_sel].max())
+            else:
+                req_f1 = z0_end
+            if z0_end == frame1:
+                req_f1 = frame1
+            slab_specs.append((z0_start, req_f1, slab_sel, None))
 
-        st_r = time_fn()
-        n_ov = max(0, prev_f1 - z0_start)
-        if n_ov > 0:
-            ov_offset = z0_start - prev_f0
-            slab_buf[:n_ov] = slab_buf[ov_offset : ov_offset + n_ov]
-        new_f0 = max(z0_start, prev_f1)
-        n_new = slab_f1 - new_f0
-        if n_new > 0:
-            ok = _read_chunk_into(new_f0, slab_f1, slab_buf[n_ov : n_ov + n_new])
-            if not ok:
-                return None
-        read_time += time_fn() - st_r
+    if single_pass_ctx is not None and not use_circular_slabs:
+        single_pass_ctx["cache_id"] = _shoebox_pack_ext.create_transform_cache(
+            single_pass_ctx["fitter"], n_total
+        )
 
-        if has_wide and n_new > 0:
-            st_e = time_fn()
-            new_view = slab_buf[n_ov : n_ov + n_new]
-            rej_new = np.ascontiguousarray(
-                rejected_arr[new_f0 - frame0 : slab_f1 - frame0]
-            )
-            _shoebox_pack_ext.extract_wide_shoeboxes_slice_from_volume(
-                wide_refl["shoebox"],
-                int(new_view.ctypes.data),
-                int(static_mask_np.ctypes.data),
-                int(rej_new.ctypes.data),
-                tr_min,
-                tr_max,
-                new_f0,
-                slab_f1,
-                H,
-                W,
-                int(wide_valid_flags.ctypes.data),
-            )
-            extract_time += time_fn() - st_e
+    use_slim_sub_refl = (
+        type(task_self.executor) is IntegratorExecutorGPU
+        and not is_single_fold_modeller
+    )
+    slim_input_cols = (
+        "id",
+        "panel",
+        "bbox",
+        "s1",
+        "xyzcal.px",
+        "xyzcal.mm",
+        "partiality",
+        "flags",
+    )
+    slim_readonly_cols = {
+        "id",
+        "panel",
+        "bbox",
+        "s1",
+        "xyzcal.px",
+        "xyzcal.mm",
+        "partiality",
+    }
 
-        prev_f0 = z0_start
-        prev_f1 = slab_f1
+    try:
+        for z0_start, req_f1, slab_sel, circ_range in slab_specs:
+            has_norm = bool(np.any(slab_sel))
+            slab_f1 = max(req_f1, prev_f1)
 
-        if has_norm:
-            slab_ind_np = np.nonzero(slab_sel)[0]
-            slab_ind = flex.size_t(np.ascontiguousarray(slab_ind_np, dtype=np.uintp))
-            sub_refl = refls.select(slab_ind)
-            sub_refl["shoebox"] = flex.shoebox(
-                sub_refl["panel"],
-                sub_refl["bbox"],
-                allocate=False,
-                flatten=task_self.params.shoebox.flatten,
-            )
+            if not has_norm and slab_f1 == prev_f1:
+                continue
 
-            st_e = time_fn()
-            n_sub = len(sub_refl)
-            valid_flags = np.empty(n_sub, dtype=np.uint8)
-            slab_len = slab_f1 - z0_start
-            slab_view = slab_buf[:slab_len]
-            rej_view = np.ascontiguousarray(
-                rejected_arr[z0_start - frame0 : slab_f1 - frame0]
-            )
-            n_valid = _shoebox_pack_ext.extract_shoeboxes_from_volume(
-                sub_refl["shoebox"],
-                int(slab_view.ctypes.data),
-                int(static_mask_np.ctypes.data),
-                int(rej_view.ctypes.data),
-                tr_min,
-                tr_max,
-                z0_start,
-                slab_f1,
-                H,
-                W,
-                int(valid_flags.ctypes.data),
-            )
-            extract_time += time_fn() - st_e
-
-            st_p = time_fn()
-            if n_valid == n_sub and n_sub > 0:
-                task_self.executor.process(slab_f1 - 1, sub_refl)
-            elif n_valid > 0:
-                v_ind = flex.size_t(
-                    np.ascontiguousarray(np.nonzero(valid_flags)[0], dtype=np.uintp)
-                )
-                v_refl = sub_refl.select(v_ind)
-                task_self.executor.process(slab_f1 - 1, v_refl)
-                sub_refl.set_selected(v_ind, v_refl)
-            del sub_refl["shoebox"]
-            refls.set_selected(slab_ind, sub_refl)
-            process_time += time_fn() - st_p
-
-    if has_wide:
-        if prev_f1 < frame1:
             st_r = time_fn()
-            n_rem = frame1 - prev_f1
-            rem_buf = slab_buf[:n_rem] if n_rem <= max_buf_frames else np.empty((n_rem, H, W), dtype=np.int32)
-            ok = _read_chunk_into(prev_f1, frame1, rem_buf)
-            if not ok:
-                return None
+            if full_vol is not None:
+                cur_loaded_f = frame0 + loaded_state[0]
+                if slab_f1 > cur_loaded_f:
+                    ok = _read_chunk_into(
+                        cur_loaded_f,
+                        slab_f1,
+                        full_vol[cur_loaded_f - frame0 : slab_f1 - frame0],
+                    )
+                    if not ok:
+                        slab_chunk_cache.pop((path0, frame0, frame1), None)
+                        return None
+                    loaded_state[0] = slab_f1 - frame0
+                new_f0 = max(z0_start, prev_f1)
+                n_new = slab_f1 - new_f0
+            else:
+                n_ov = max(0, prev_f1 - z0_start)
+                if n_ov > 0:
+                    ov_offset = z0_start - prev_f0
+                    slab_buf[:n_ov] = slab_buf[ov_offset : ov_offset + n_ov]
+                new_f0 = max(z0_start, prev_f1)
+                n_new = slab_f1 - new_f0
+                if n_new > 0:
+                    ok = _read_chunk_into(new_f0, slab_f1, slab_buf[n_ov : n_ov + n_new])
+                    if not ok:
+                        return None
             read_time += time_fn() - st_r
 
-            st_e = time_fn()
-            rej_rem = np.ascontiguousarray(
-                rejected_arr[prev_f1 - frame0 : frame1 - frame0]
-            )
-            _shoebox_pack_ext.extract_wide_shoeboxes_slice_from_volume(
-                wide_refl["shoebox"],
-                int(rem_buf.ctypes.data),
-                int(static_mask_np.ctypes.data),
-                int(rej_rem.ctypes.data),
-                tr_min,
-                tr_max,
-                prev_f1,
-                frame1,
-                H,
-                W,
-                int(wide_valid_flags.ctypes.data),
-            )
-            extract_time += time_fn() - st_e
+            if has_wide and n_new > 0:
+                st_e = time_fn()
+                if full_vol is not None:
+                    new_view = full_vol[new_f0 - frame0 : slab_f1 - frame0]
+                else:
+                    new_view = slab_buf[n_ov : n_ov + n_new]
+                rej_new = np.ascontiguousarray(
+                    rejected_arr[new_f0 - frame0 : slab_f1 - frame0]
+                )
+                _shoebox_pack_ext.extract_wide_shoeboxes_slice_from_volume(
+                    wide_refl["shoebox"],
+                    int(new_view.ctypes.data),
+                    int(static_mask_np.ctypes.data),
+                    int(rej_new.ctypes.data),
+                    tr_min,
+                    tr_max,
+                    new_f0,
+                    slab_f1,
+                    H,
+                    W,
+                    int(wide_valid_flags.ctypes.data),
+                )
+                extract_time += time_fn() - st_e
 
-        st_p = time_fn()
-        n_wide = len(wide_refl)
-        n_w_valid = int(np.count_nonzero(wide_valid_flags))
-        if n_w_valid == n_wide and n_wide > 0:
-            task_self.executor.process(frame1 - 1, wide_refl)
-        elif n_w_valid > 0:
-            wv_ind = flex.size_t(
-                np.ascontiguousarray(np.nonzero(wide_valid_flags)[0], dtype=np.uintp)
+            prev_f0 = z0_start
+            prev_f1 = slab_f1
+
+            if has_norm:
+                slab_ind_np = np.nonzero(slab_sel)[0]
+                slab_ind = flex.size_t(np.ascontiguousarray(slab_ind_np, dtype=np.uintp))
+                if use_slim_sub_refl:
+                    sub_refl = flex.reflection_table()
+                    for col in slim_input_cols:
+                        if col in refls:
+                            sub_refl[col] = refls[col].select(slab_ind)
+                else:
+                    sub_refl = refls.select(slab_ind)
+                sub_refl["shoebox"] = flex.shoebox(
+                    sub_refl["panel"],
+                    sub_refl["bbox"],
+                    allocate=False,
+                    flatten=task_self.params.shoebox.flatten,
+                )
+
+                st_e = time_fn()
+                n_sub = len(sub_refl)
+                valid_flags = np.empty(n_sub, dtype=np.uint8)
+                slab_len = slab_f1 - z0_start
+                if full_vol is not None:
+                    slab_view = full_vol[z0_start - frame0 : slab_f1 - frame0]
+                else:
+                    slab_view = slab_buf[:slab_len]
+                rej_view = np.ascontiguousarray(
+                    rejected_arr[z0_start - frame0 : slab_f1 - frame0]
+                )
+                n_valid = _shoebox_pack_ext.extract_shoeboxes_from_volume(
+                    sub_refl["shoebox"],
+                    int(slab_view.ctypes.data),
+                    int(static_mask_np.ctypes.data),
+                    int(rej_view.ctypes.data),
+                    tr_min,
+                    tr_max,
+                    z0_start,
+                    slab_f1,
+                    H,
+                    W,
+                    int(valid_flags.ctypes.data),
+                )
+                extract_time += time_fn() - st_e
+
+                st_p = time_fn()
+                if single_pass_ctx is not None:
+                    single_pass_ctx["circular_prof_range"] = circ_range
+                if n_valid == n_sub and n_sub > 0:
+                    if single_pass_ctx is not None:
+                        single_pass_ctx["active_slab_ind"] = slab_ind
+                    task_self.executor.process(slab_f1 - 1, sub_refl)
+                elif n_valid > 0:
+                    v_ind = flex.size_t(
+                        np.ascontiguousarray(np.nonzero(valid_flags)[0], dtype=np.uintp)
+                    )
+                    if single_pass_ctx is not None:
+                        single_pass_ctx["active_slab_ind"] = slab_ind.select(v_ind)
+                    v_refl = sub_refl.select(v_ind)
+                    task_self.executor.process(slab_f1 - 1, v_refl)
+                    if not is_single_fold_modeller:
+                        sub_refl.set_selected(v_ind, v_refl)
+                _shoebox_pack_ext.parallel_deallocate_shoeboxes(sub_refl["shoebox"])
+                del sub_refl["shoebox"]
+                if not is_single_fold_modeller:
+                    if use_slim_sub_refl:
+                        for col in sub_refl.keys():
+                            if col not in slim_readonly_cols:
+                                if col not in refls:
+                                    refls[col] = type(sub_refl[col])(n_total)
+                                refls[col].set_selected(slab_ind, sub_refl[col])
+                    else:
+                        refls.set_selected(slab_ind, sub_refl)
+                process_time += time_fn() - st_p
+
+        if has_wide:
+            if prev_f1 < frame1:
+                st_r = time_fn()
+                n_rem = frame1 - prev_f1
+                if full_vol is not None:
+                    cur_loaded_f = frame0 + loaded_state[0]
+                    if frame1 > cur_loaded_f:
+                        ok = _read_chunk_into(
+                            cur_loaded_f,
+                            frame1,
+                            full_vol[cur_loaded_f - frame0 : frame1 - frame0],
+                        )
+                        if not ok:
+                            slab_chunk_cache.pop((path0, frame0, frame1), None)
+                            return None
+                        loaded_state[0] = frame1 - frame0
+                    rem_buf = full_vol[prev_f1 - frame0 : frame1 - frame0]
+                else:
+                    rem_buf = slab_buf[:n_rem] if n_rem <= max_buf_frames else np.empty((n_rem, H, W), dtype=np.int32)
+                    ok = _read_chunk_into(prev_f1, frame1, rem_buf)
+                    if not ok:
+                        return None
+                read_time += time_fn() - st_r
+
+                st_e = time_fn()
+                rej_rem = np.ascontiguousarray(
+                    rejected_arr[prev_f1 - frame0 : frame1 - frame0]
+                )
+                _shoebox_pack_ext.extract_wide_shoeboxes_slice_from_volume(
+                    wide_refl["shoebox"],
+                    int(rem_buf.ctypes.data),
+                    int(static_mask_np.ctypes.data),
+                    int(rej_rem.ctypes.data),
+                    tr_min,
+                    tr_max,
+                    prev_f1,
+                    frame1,
+                    H,
+                    W,
+                    int(wide_valid_flags.ctypes.data),
+                )
+                extract_time += time_fn() - st_e
+
+            st_p = time_fn()
+            n_wide = len(wide_refl)
+            n_w_valid = int(np.count_nonzero(wide_valid_flags))
+            if n_w_valid == n_wide and n_wide > 0:
+                if single_pass_ctx is not None:
+                    single_pass_ctx["active_slab_ind"] = wide_ind
+                task_self.executor.process(frame1 - 1, wide_refl)
+            elif n_w_valid > 0:
+                wv_ind = flex.size_t(
+                    np.ascontiguousarray(np.nonzero(wide_valid_flags)[0], dtype=np.uintp)
+                )
+                if single_pass_ctx is not None:
+                    single_pass_ctx["active_slab_ind"] = wide_ind.select(wv_ind)
+                wv_refl = wide_refl.select(wv_ind)
+                task_self.executor.process(frame1 - 1, wv_refl)
+                if not is_single_fold_modeller:
+                    wide_refl.set_selected(wv_ind, wv_refl)
+            _shoebox_pack_ext.parallel_deallocate_shoeboxes(wide_refl["shoebox"])
+            del wide_refl["shoebox"]
+            if not is_single_fold_modeller:
+                refls.set_selected(wide_ind, wide_refl)
+            process_time += time_fn() - st_p
+
+        if single_pass_ctx is not None:
+            st_p = time_fn()
+            fitter_single = single_pass_ctx["fitter"]
+            if use_circular_slabs:
+                _shoebox_pack_ext.mark_modeller_finalized(fitter_single)
+                finalized_fitter = fitter_single
+            else:
+                fitter_single.finalize()
+                finalized_fitter = fitter_single
+                val = flex.double(n_total, 0.0)
+                var = flex.double(n_total, 0.0)
+                cor = flex.double(n_total, 0.0)
+                flags = refls["flags"]
+                _shoebox_pack_ext.parallel_fit_from_cache(
+                    finalized_fitter,
+                    single_pass_ctx["cache_id"],
+                    refls["panel"],
+                    refls["xyzcal.px"],
+                    flags,
+                    val,
+                    var,
+                    cor,
+                )
+                refls["intensity.prf.value"] = val
+                refls["intensity.prf.variance"] = var
+                refls["profile.correlation"] = cor
+                refls["flags"] = flags
+            integrator_obj = single_pass_ctx["integrator"]
+            integrator_obj.profile_model_report = _dials_integrator.ProfileModelReport(
+                integrator_obj.experiments,
+                finalized_fitter,
+                refls,
             )
-            wv_refl = wide_refl.select(wv_ind)
-            task_self.executor.process(frame1 - 1, wv_refl)
-            wide_refl.set_selected(wv_ind, wv_refl)
-        del wide_refl["shoebox"]
-        refls.set_selected(wide_ind, wide_refl)
-        process_time += time_fn() - st_p
+            task_self.executor.profile_fitter = finalized_fitter
+            process_time += time_fn() - st_p
+    finally:
+        if single_pass_ctx is not None:
+            _DEFERRED_SINGLE_PASS_FITTERS.pop(id(single_pass_ctx["fitter"]), None)
+            if single_pass_ctx.get("cache_id") is not None:
+                _shoebox_pack_ext.free_transform_cache(single_pass_ctx["cache_id"])
+                single_pass_ctx["cache_id"] = None
 
     return read_time, extract_time, process_time
 
@@ -923,13 +1196,106 @@ class IntegratorGPU(Integrator):
 
     ExecutorClass = IntegratorExecutorGPU
 
+    def fit_profiles(self):
+        try:
+            if (
+                self.ProcessorClass is Processor3D
+                and not self.params.frame_slice_shoeboxes
+                and len(self.experiments) == 1
+                and self.params.integration.mp.nproc == 1
+                and self.params.integration.mp.njobs == 1
+                and not self.params.modelling.debug.output
+                and not self.params.integration.debug.output
+                and not self.params.debug_reference_output
+                and self.params.integration.block.size
+                in (libtbx.Auto, "auto", "Auto", None)
+                and not self.params.integration.block.force
+                and self.params.profile.fitting
+                and self.experiments[0].profile is not None
+                and self.experiments[0].profile.fitting_class() is not None
+            ):
+                exp = self.experiments[0]
+                imageset = exp.imageset
+                detector = imageset.get_detector()
+                if (
+                    imageset is not None
+                    and len(detector) == 1
+                    and not imageset.has_dynamic_mask()
+                    and imageset.external_lookup.pedestal.data.empty()
+                    and imageset.external_lookup.gain.data.empty()
+                ):
+                    path0 = imageset.get_path(0)
+                    n_frames = len(imageset)
+                    if (
+                        path0
+                        and n_frames > 64
+                        and path0.endswith((".nxs", ".h5", ".hdf5", ".cbf", ".cbf.gz"))
+                    ):
+                        selection = self.reflections.get_flags(
+                            self.reflections.flags.reference_spot
+                        )
+                        n_ref = selection.count(True)
+                        if n_ref > 0:
+                            num_folds = 1
+                            if self.params.profile.validation.number_of_partitions > 1:
+                                k_max = int(
+                                    math.floor(
+                                        n_ref
+                                        / self.params.profile.validation.min_partition_size
+                                    )
+                                )
+                                num_folds = max(
+                                    1,
+                                    min(
+                                        k_max,
+                                        self.params.profile.validation.number_of_partitions,
+                                    ),
+                                )
+                            if num_folds == 1:
+                                fitter_single = (
+                                    _dials_integrator.MultiExpProfileModeller()
+                                )
+                                mod0 = exp.profile.fitting_class()(exp)
+                                fitter_single.add(mod0)
+                                init_args = (
+                                    mod0.__getinitargs__()
+                                    if hasattr(mod0, "__getinitargs__")
+                                    else ()
+                                )
+                                is_circ = (
+                                    len(init_args) == 12
+                                    and int(init_args[10]) == 3
+                                    and int(init_args[11]) == 1
+                                    and len(exp.detector) == 1
+                                    and exp.scan is not None
+                                    and not exp.scan.is_still()
+                                )
+                                _DEFERRED_SINGLE_PASS_FITTERS[id(fitter_single)] = {
+                                    "integrator": self,
+                                    "fitter": fitter_single,
+                                    "selection": selection,
+                                    "cache_id": None,
+                                    "active_slab_ind": None,
+                                    "circular_prof_range": None,
+                                    "is_circular_grid": is_circ,
+                                    "num_z": int(init_args[8]) if is_circ else 0,
+                                    "scan_range": exp.scan.get_array_range() if is_circ else (0, 0),
+                                }
+                                return fitter_single
+        except Exception:
+            pass
+        return super().fit_profiles()
+
     def integrate(self):
         if torch.cuda.is_available() and torch.get_num_threads() > 1:
             torch.set_num_threads(1)
         orig_modeller_exec = _dials_integrator.ProfileModellerExecutor
         orig_validator_exec = _dials_integrator.ProfileValidatorExecutor
+        orig_pprint_p3d = _dials_integrator.pprint.profile3d
         _dials_integrator.ProfileModellerExecutor = ProfileModellerExecutorGPU
         _dials_integrator.ProfileValidatorExecutor = ProfileValidatorExecutorGPU
+        if not _dials_integrator.logger.isEnabledFor(logging.DEBUG):
+            _dials_integrator.pprint.profile3d = lambda *a, **k: ""
 
         # Enable fast task execution when nproc == 1; only cache full decoded frames in RAM
         # for short sweeps (<= 100 frames). For longer HDF5 sweeps, _HDF5_COMPRESSED_CACHE
@@ -942,6 +1308,7 @@ class IntegratorGPU(Integrator):
             sum(len(e.imageset) for e in self.experiments if e.imageset is not None) <= 100
         )
         frame_cache = {}
+        slab_chunk_cache = {}
         orig_task_call = _dials_processor.Task.__call__
 
         if use_frame_cache:
@@ -989,7 +1356,12 @@ class IntegratorGPU(Integrator):
                 task_self.executor.initialize(frame0, frame1, task_self.reflections)
 
                 slab_res = _try_run_slabbed_volume_integration(
-                    task_self, imageset, frame0, frame1, time_fn
+                    task_self,
+                    imageset,
+                    frame0,
+                    frame1,
+                    time_fn,
+                    slab_chunk_cache=slab_chunk_cache,
                 )
                 if slab_res is not None:
                     read_time, extract_time, process_time = slab_res
@@ -1027,36 +1399,91 @@ class IntegratorGPU(Integrator):
                     read_time = time_fn() - st_read
 
                     st_ext = time_fn()
-                    n_refl = len(task_self.reflections)
-                    valid_flags = np.empty(n_refl, dtype=np.uint8)
-                    n_valid = _shoebox_pack_ext.extract_shoeboxes_from_volume(
-                        task_self.reflections["shoebox"],
-                        int(vol_np.ctypes.data),
-                        int(static_mask_np.ctypes.data),
-                        int(rejected_arr.ctypes.data),
-                        tr_min,
-                        tr_max,
-                        frame0,
-                        frame1,
-                        H,
-                        W,
-                        int(valid_flags.ctypes.data),
-                    )
-                    extract_time = time_fn() - st_ext
-
-                    st_proc = time_fn()
-                    if n_valid == n_refl and n_refl > 0:
-                        task_self.executor.process(frame1 - 1, task_self.reflections)
-                    elif n_valid > 0:
-                        ind = flex.size_t(
-                            np.ascontiguousarray(
-                                np.nonzero(valid_flags)[0], dtype=np.uintp
+                    is_single_fold_modeller = (
+                        isinstance(task_self.executor, ProfileModellerExecutorGPU)
+                        and len(
+                            getattr(
+                                task_self.executor.profile_fitter, "modellers", [None]
                             )
                         )
-                        sub_refl = task_self.reflections.select(ind)
-                        task_self.executor.process(frame1 - 1, sub_refl)
-                        task_self.reflections.set_selected(ind, sub_refl)
-                    process_time = time_fn() - st_proc
+                        == 1
+                        and "partiality" in task_self.reflections
+                        and not task_self.params.debug.output
+                    )
+                    if is_single_fold_modeller:
+                        x0_f, x1_f, y0_f, y1_f, z0_f, z1_f = (
+                            task_self.reflections["bbox"].parts()
+                        )
+                        part_np = task_self.reflections["partiality"].as_numpy_array()
+                        mod_ok = (
+                            (part_np > 0.99)
+                            & (x0_f.as_numpy_array() >= 0)
+                            & (y0_f.as_numpy_array() >= 0)
+                            & (x1_f.as_numpy_array() <= W)
+                            & (y1_f.as_numpy_array() <= H)
+                            & (z0_f.as_numpy_array() >= frame0)
+                            & (z1_f.as_numpy_array() <= frame1)
+                        )
+                        ok_ind = flex.size_t(
+                            np.ascontiguousarray(np.nonzero(mod_ok)[0], dtype=np.uintp)
+                        )
+                        if len(ok_ind) > 0:
+                            sub_refl = task_self.reflections.select(ok_ind)
+                            valid_flags = np.empty(len(sub_refl), dtype=np.uint8)
+                            n_valid = _shoebox_pack_ext.extract_shoeboxes_from_volume(
+                                sub_refl["shoebox"],
+                                int(vol_np.ctypes.data),
+                                int(static_mask_np.ctypes.data),
+                                int(rejected_arr.ctypes.data),
+                                tr_min,
+                                tr_max,
+                                frame0,
+                                frame1,
+                                H,
+                                W,
+                                int(valid_flags.ctypes.data),
+                            )
+                            extract_time = time_fn() - st_ext
+                            st_proc = time_fn()
+                            if n_valid > 0:
+                                task_self.executor.process(frame1 - 1, sub_refl)
+                            _shoebox_pack_ext.parallel_deallocate_shoeboxes(sub_refl["shoebox"])
+                            del sub_refl["shoebox"]
+                            process_time = time_fn() - st_proc
+                        else:
+                            extract_time = time_fn() - st_ext
+                            process_time = 0.0
+                    else:
+                        n_refl = len(task_self.reflections)
+                        valid_flags = np.empty(n_refl, dtype=np.uint8)
+                        n_valid = _shoebox_pack_ext.extract_shoeboxes_from_volume(
+                            task_self.reflections["shoebox"],
+                            int(vol_np.ctypes.data),
+                            int(static_mask_np.ctypes.data),
+                            int(rejected_arr.ctypes.data),
+                            tr_min,
+                            tr_max,
+                            frame0,
+                            frame1,
+                            H,
+                            W,
+                            int(valid_flags.ctypes.data),
+                        )
+                        extract_time = time_fn() - st_ext
+
+                        st_proc = time_fn()
+                        if n_valid == n_refl and n_refl > 0:
+                            task_self.executor.process(frame1 - 1, task_self.reflections)
+                        elif n_valid > 0:
+                            ind = flex.size_t(
+                                np.ascontiguousarray(
+                                    np.nonzero(valid_flags)[0], dtype=np.uintp
+                                )
+                            )
+                            sub_refl = task_self.reflections.select(ind)
+                            task_self.executor.process(frame1 - 1, sub_refl)
+                            task_self.reflections.set_selected(ind, sub_refl)
+                        process_time = time_fn() - st_proc
                 else:
                     processor = ShoeboxProcessor(
                         task_self.reflections,
@@ -1152,8 +1579,10 @@ class IntegratorGPU(Integrator):
             if use_frame_cache:
                 _dials_processor.Task.__call__ = orig_task_call
                 frame_cache.clear()
+                slab_chunk_cache.clear()
             _dials_integrator.ProfileModellerExecutor = orig_modeller_exec
             _dials_integrator.ProfileValidatorExecutor = orig_validator_exec
+            _dials_integrator.pprint.profile3d = orig_pprint_p3d
 
 
 class Integrator3DGPU(IntegratorGPU):

@@ -81,6 +81,7 @@ _HDF5_GPU_MASK_CACHE: OrderedDict[tuple, torch.Tensor] = OrderedDict()
 _HDF5_COMPRESSED_CACHE: OrderedDict[tuple, tuple[list[bytes], int, int, np.dtype]] = OrderedDict()
 _BASE_STATIC_MASK_GPU_CACHE: OrderedDict[tuple, list[torch.Tensor]] = OrderedDict()
 _PINNED_HOST_VOL_CACHE: dict[tuple, torch.Tensor] = {}
+_PINNED_HOST_VOL_TAG: dict[tuple, tuple] = {}
 _PIPELINE_PINNED_CACHE: dict[tuple, list[torch.Tensor]] = {}
 
 
@@ -88,6 +89,7 @@ _PIPELINE_PINNED_CACHE: dict[tuple, list[torch.Tensor]] = {}
 def _cleanup_spotfinding_caches():
     _PIPELINE_PINNED_CACHE.clear()
     _PINNED_HOST_VOL_CACHE.clear()
+    _PINNED_HOST_VOL_TAG.clear()
     _HDF5_GPU_VOLUME_CACHE.clear()
     _HDF5_GPU_MASK_CACHE.clear()
     _BASE_STATIC_MASK_GPU_CACHE.clear()
@@ -274,16 +276,28 @@ def _try_load_hdf5_raw_volume_gpu(
     elem_size = int(np.dtype(dtype).itemsize)
     n_elems = H * W
     out_dtype = np.int32 if dtype == np.uint32 else dtype
+    pin_key = (B, H, W, out_dtype)
     if pinned_out is not None and out_dtype == np.int32:
         pinned_t = pinned_out[:B]
         out_np = pinned_t.numpy()
     else:
-        pin_key = (B, H, W, out_dtype)
-        pinned_t = _PINNED_HOST_VOL_CACHE.get(pin_key) if device.type == "cuda" else None
-        if pinned_t is None and out_dtype == np.int32 and device.type == "cuda":
+        pinned_t = _PINNED_HOST_VOL_CACHE.get(pin_key)
+        if pinned_t is not None and _PINNED_HOST_VOL_TAG.get(pin_key) == comp_key:
+            if device.type == "cpu":
+                return pinned_t
+            vol_t = pinned_t.to(device=device, non_blocking=True)
+            if use_vram_cache and device.type == "cuda":
+                if len(_HDF5_GPU_VOLUME_CACHE) >= 8:
+                    _HDF5_GPU_VOLUME_CACHE.popitem(last=False)
+                _HDF5_GPU_VOLUME_CACHE[gpu_key] = vol_t
+            return vol_t
+        if pinned_t is None and out_dtype == np.int32:
             if len(_PINNED_HOST_VOL_CACHE) >= 2:
                 _PINNED_HOST_VOL_CACHE.clear()
-            pinned_t = torch.empty((B, H, W), dtype=torch.int32, pin_memory=True)
+                _PINNED_HOST_VOL_TAG.clear()
+            pinned_t = torch.empty(
+                (B, H, W), dtype=torch.int32, pin_memory=torch.cuda.is_available()
+            )
             _PINNED_HOST_VOL_CACHE[pin_key] = pinned_t
 
         if pinned_t is not None:
@@ -311,6 +325,9 @@ def _try_load_hdf5_raw_volume_gpu(
         return pinned_out[:B]
 
     if pinned_t is not None:
+        _PINNED_HOST_VOL_TAG[pin_key] = comp_key
+        if device.type == "cpu":
+            return pinned_t
         vol_t = pinned_t.to(device=device, non_blocking=True)
     else:
         if out_np.dtype == np.uint16:

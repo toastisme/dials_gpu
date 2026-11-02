@@ -2,12 +2,14 @@
 #include <dials/algorithms/profile_model/gaussian_rs/bbox_calculator.h>
 #include <dials/algorithms/profile_model/gaussian_rs/partiality_calculator.h>
 #include <dials/algorithms/spot_prediction/pixel_to_miller_index.h>
+#include <dials/algorithms/spot_prediction/reflection_predictor.h>
 #include <cctbx/miller.h>
 #include <dials/model/data/shoebox.h>
 #include <dials/array_family/scitbx_shared_and_versa.h>
 #include <dials/algorithms/profile_model/gaussian_rs/mask_calculator.h>
 #include <dials/algorithms/profile_model/gaussian_rs/modeller.h>
 #include <dials/algorithms/profile_model/modeller/multi_experiment_modeller.h>
+#include <scitbx/glmtbx/robust_glm.h>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
@@ -15,7 +17,10 @@
 #include <algorithm>
 #include <thread>
 #include <atomic>
+#include <mutex>
+#include <unordered_map>
 #include <type_traits>
+#include <typeinfo>
 
 namespace dials_gpu {
 
@@ -47,17 +52,26 @@ inline void parallel_for(std::int64_t n, Func&& fn, std::int64_t min_per_thread 
     std::int64_t chunk = std::max<std::int64_t>(1, n / (n_threads * 8));
     if (chunk > 64) chunk = 64;
     std::atomic<std::int64_t> next_idx{0};
+    std::mutex exc_mtx;
+    std::exception_ptr first_exc = nullptr;
     auto worker = [&](int tid) {
-        while (true) {
-            std::int64_t start = next_idx.fetch_add(chunk, std::memory_order_relaxed);
-            if (start >= n) break;
-            std::int64_t end = std::min(n, start + chunk);
-            for (std::int64_t i = start; i < end; ++i) {
-                if constexpr (std::is_invocable_v<Func, std::int64_t, int>) {
-                    fn(i, tid);
-                } else {
-                    fn(i);
+        try {
+            while (true) {
+                std::int64_t start = next_idx.fetch_add(chunk, std::memory_order_relaxed);
+                if (start >= n) break;
+                std::int64_t end = std::min(n, start + chunk);
+                for (std::int64_t i = start; i < end; ++i) {
+                    if constexpr (std::is_invocable_v<Func, std::int64_t, int>) {
+                        fn(i, tid);
+                    } else {
+                        fn(i);
+                    }
                 }
+            }
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(exc_mtx);
+            if (!first_exc) {
+                first_exc = std::current_exception();
             }
         }
     };
@@ -69,6 +83,9 @@ inline void parallel_for(std::int64_t n, Func&& fn, std::int64_t min_per_thread 
     worker(0);
     for (auto& th : threads) {
         th.join();
+    }
+    if (first_exc) {
+        std::rethrow_exception(first_exc);
     }
 }
 
@@ -364,6 +381,344 @@ void unpack_constant3d_bg_and_mask(
             }
         }
     });
+}
+
+inline bool solve_robust_poisson_hist(
+    const int32_t* h_r,
+    int max_bin,
+    const std::vector<double>& tail,
+    int64_t cnt,
+    double mean0,
+    double c,
+    double tolerance,
+    std::size_t max_iter,
+    double& mean_out)
+{
+    typedef scitbx::glmtbx::poisson family;
+    if (cnt <= 0 || !(mean0 > 0.0) || !(c > 0.0) || !(tolerance > 0.0) || max_iter == 0) {
+        return false;
+    }
+    double beta = std::log(mean0);
+    std::size_t niter = 0;
+    for (niter = 0; niter < max_iter; ++niter) {
+        double eta = beta;
+        double mu = family::linkinv(eta);
+        double var = family::variance(mu);
+        double dmu = family::dmu_deta(eta);
+        double phi = family::dispersion();
+        if (!(phi > 0.0) || !(var > 0.0) || !std::isfinite(mu)) {
+            return false;
+        }
+        double svar = std::sqrt(phi * var);
+        scitbx::glmtbx::expectation<family> epsi(mu, svar, c);
+        double b = epsi.epsi2 * dmu * dmu / svar;
+        double scale_q = dmu / svar;
+        double U = 0.0;
+        for (int k = 0; k <= max_bin; ++k) {
+            int32_t hk = h_r[k];
+            if (hk > 0) {
+                double res = (static_cast<double>(k) - mu) / svar;
+                double psi = scitbx::glmtbx::huber(res, c);
+                double q = (psi - epsi.epsi1) * scale_q;
+                U += static_cast<double>(hk) * q;
+            }
+        }
+        for (double y : tail) {
+            double res = (y - mu) / svar;
+            double psi = scitbx::glmtbx::huber(res, c);
+            double q = (psi - epsi.epsi1) * scale_q;
+            U += q;
+        }
+        double H = static_cast<double>(cnt) * b;
+        if (H == 0.0 || !std::isfinite(H)) {
+            return false;
+        }
+        U = U / H;
+        double sum_delta_sq = U * U;
+        double sum_beta_sq = beta * beta;
+        beta += U;
+        double error = std::sqrt(sum_delta_sq / std::max(1e-10, sum_beta_sq));
+        if (error < tolerance) {
+            break;
+        }
+    }
+    if (niter >= max_iter || !(beta > -300.0 && beta < 300.0)) {
+        return false;
+    }
+    mean_out = std::exp(beta);
+    return true;
+}
+
+boost::python::tuple compute_glm_constant3d_fast(
+    dials::af::ref<Shoebox<ProfileFloatType>> self,
+    dials::af::ref<std::size_t> flags,
+    int min_pixels,
+    double tuning_constant,
+    std::size_t max_iter,
+    int mask_bg_valid,
+    int mask_overlapped,
+    int mask_bg_used)
+{
+    uint8_t m_bg_val = static_cast<uint8_t>(mask_bg_valid);
+    uint8_t m_ovlp = static_cast<uint8_t>(mask_overlapped);
+    uint8_t m_used = static_cast<uint8_t>(mask_bg_used);
+    std::int64_t n = static_cast<std::int64_t>(self.size());
+
+    dials::af::shared<double> bg_mean(self.size(), 0.0);
+    dials::af::shared<bool> success(self.size(), false);
+    double* mean_ptr = bg_mean.begin();
+    bool* succ_ptr = success.begin();
+    std::size_t* fl_ptr = flags.begin();
+
+    parallel_for(n, [&](std::int64_t r, int) {
+        auto& sb = self[r];
+        std::size_t sz = sb.data.size();
+        if (sz == 0) {
+            fl_ptr[r] |= dials::af::DontIntegrate;
+            return;
+        }
+        const float* d_ptr = sb.data.begin();
+        uint8_t* m_ptr = sb.mask.begin();
+        float* bg_ptr = sb.background.begin();
+
+        int32_t h_r[128];
+        std::memset(h_r, 0, sizeof(h_r));
+        int max_bin = -1;
+        int64_t cnt = 0;
+        int64_t tail_cnt = 0;
+        bool neg = false;
+
+        for (std::size_t i = 0; i < sz; ++i) {
+            uint8_t m = m_ptr[i];
+            if (((m & m_bg_val) == m_bg_val) && ((m & m_ovlp) == 0)) {
+                cnt++;
+                float v = d_ptr[i];
+                if (v < 0.0f) {
+                    neg = true;
+                } else {
+                    int iv = static_cast<int>(v);
+                    if (static_cast<float>(iv) == v && iv >= 0 && iv < 128) {
+                        h_r[iv]++;
+                        if (iv > max_bin) max_bin = iv;
+                    } else {
+                        tail_cnt++;
+                    }
+                }
+            }
+        }
+
+        if (cnt < min_pixels || neg) {
+            if (sb.background.size() == sz) {
+                std::fill(bg_ptr, bg_ptr + sz, 0.0f);
+            }
+            fl_ptr[r] |= dials::af::DontIntegrate;
+            return;
+        }
+
+        std::vector<double> tail;
+        double med = 0.0;
+        if (tail_cnt == 0) {
+            int64_t target = cnt / 2;
+            int64_t acc = 0;
+            for (int k = 0; k <= max_bin; ++k) {
+                acc += h_r[k];
+                if (acc > target) {
+                    med = static_cast<double>(k);
+                    break;
+                }
+            }
+        } else {
+            tail.reserve(static_cast<std::size_t>(tail_cnt));
+            std::vector<double> tmp;
+            tmp.reserve(static_cast<std::size_t>(cnt));
+            for (std::size_t i = 0; i < sz; ++i) {
+                uint8_t m = m_ptr[i];
+                if (((m & m_bg_val) == m_bg_val) && ((m & m_ovlp) == 0)) {
+                    float v = d_ptr[i];
+                    double dv = static_cast<double>(v);
+                    tmp.push_back(dv);
+                    int iv = static_cast<int>(v);
+                    if (!(static_cast<float>(iv) == v && iv >= 0 && iv < 128)) {
+                        tail.push_back(dv);
+                    }
+                }
+            }
+            std::nth_element(tmp.begin(), tmp.begin() + cnt / 2, tmp.end());
+            med = tmp[cnt / 2];
+        }
+        if (med <= 0.0) med = 1.0;
+
+        double m_val_d = 0.0;
+        bool ok = solve_robust_poisson_hist(
+            h_r, max_bin, tail, cnt, med, tuning_constant, 1e-3, max_iter, m_val_d
+        );
+        if (ok) {
+            float m_val_f = static_cast<float>(m_val_d);
+            std::fill(bg_ptr, bg_ptr + sz, m_val_f);
+            for (std::size_t i = 0; i < sz; ++i) {
+                uint8_t m = m_ptr[i];
+                if (((m & m_bg_val) == m_bg_val) && ((m & m_ovlp) == 0)) {
+                    m_ptr[i] = m | m_used;
+                }
+            }
+            mean_ptr[r] = static_cast<double>(m_val_f);
+            succ_ptr[r] = true;
+        } else {
+            if (sb.background.size() == sz) {
+                std::fill(bg_ptr, bg_ptr + sz, 0.0f);
+            }
+            fl_ptr[r] |= dials::af::DontIntegrate;
+        }
+    });
+
+    return boost::python::make_tuple(bg_mean, success);
+}
+
+boost::python::tuple compute_glm_constant2d_fast(
+    dials::af::ref<Shoebox<ProfileFloatType>> self,
+    dials::af::ref<std::size_t> flags,
+    int min_pixels,
+    double tuning_constant,
+    std::size_t max_iter,
+    int mask_bg_valid,
+    int mask_overlapped,
+    int mask_bg_used)
+{
+    uint8_t m_bg_val = static_cast<uint8_t>(mask_bg_valid);
+    uint8_t m_ovlp = static_cast<uint8_t>(mask_overlapped);
+    uint8_t m_used = static_cast<uint8_t>(mask_bg_used);
+    uint8_t m_not_used = static_cast<uint8_t>(255 ^ m_used);
+    std::int64_t n = static_cast<std::int64_t>(self.size());
+
+    dials::af::shared<double> bg_mean(self.size(), 0.0);
+    dials::af::shared<bool> success(self.size(), false);
+    double* mean_ptr = bg_mean.begin();
+    bool* succ_ptr = success.begin();
+    std::size_t* fl_ptr = flags.begin();
+
+    parallel_for(n, [&](std::int64_t r, int) {
+        auto& sb = self[r];
+        std::size_t sz = sb.data.size();
+        if (sz == 0) {
+            fl_ptr[r] |= dials::af::DontIntegrate;
+            return;
+        }
+        auto acc = sb.data.accessor();
+        std::size_t nz = acc[0];
+        std::size_t slice_sz = acc[1] * acc[2];
+        const float* d_ptr = sb.data.begin();
+        uint8_t* m_ptr = sb.mask.begin();
+        float* bg_ptr = sb.background.begin();
+
+        bool all_ok = true;
+        double sum_bg = 0.0;
+        int64_t total_used = 0;
+
+        for (std::size_t k = 0; k < nz; ++k) {
+            std::size_t z_off = k * slice_sz;
+            const float* dz = d_ptr + z_off;
+            uint8_t* mz = m_ptr + z_off;
+            float* bgz = bg_ptr + z_off;
+
+            int32_t h_r[128];
+            std::memset(h_r, 0, sizeof(h_r));
+            int max_bin = -1;
+            int64_t cnt = 0;
+            int64_t tail_cnt = 0;
+            bool neg = false;
+
+            for (std::size_t i = 0; i < slice_sz; ++i) {
+                uint8_t m = mz[i];
+                if (((m & m_bg_val) == m_bg_val) && ((m & m_ovlp) == 0)) {
+                    cnt++;
+                    float v = dz[i];
+                    if (v < 0.0f) {
+                        neg = true;
+                    } else {
+                        int iv = static_cast<int>(v);
+                        if (static_cast<float>(iv) == v && iv >= 0 && iv < 128) {
+                            h_r[iv]++;
+                            if (iv > max_bin) max_bin = iv;
+                        } else {
+                            tail_cnt++;
+                        }
+                    }
+                }
+            }
+
+            if (cnt < min_pixels || neg) {
+                all_ok = false;
+                break;
+            }
+
+            std::vector<double> tail;
+            double med = 0.0;
+            if (tail_cnt == 0) {
+                int64_t target = cnt / 2;
+                int64_t acc_c = 0;
+                for (int b = 0; b <= max_bin; ++b) {
+                    acc_c += h_r[b];
+                    if (acc_c > target) {
+                        med = static_cast<double>(b);
+                        break;
+                    }
+                }
+            } else {
+                tail.reserve(static_cast<std::size_t>(tail_cnt));
+                std::vector<double> tmp;
+                tmp.reserve(static_cast<std::size_t>(cnt));
+                for (std::size_t i = 0; i < slice_sz; ++i) {
+                    uint8_t m = mz[i];
+                    if (((m & m_bg_val) == m_bg_val) && ((m & m_ovlp) == 0)) {
+                        float v = dz[i];
+                        double dv = static_cast<double>(v);
+                        tmp.push_back(dv);
+                        int iv = static_cast<int>(v);
+                        if (!(static_cast<float>(iv) == v && iv >= 0 && iv < 128)) {
+                            tail.push_back(dv);
+                        }
+                    }
+                }
+                std::nth_element(tmp.begin(), tmp.begin() + cnt / 2, tmp.end());
+                med = tmp[cnt / 2];
+            }
+            if (med <= 0.0) med = 1.0;
+
+            double m_val_d = 0.0;
+            bool ok = solve_robust_poisson_hist(
+                h_r, max_bin, tail, cnt, med, tuning_constant, 1e-3, max_iter, m_val_d
+            );
+            if (!ok) {
+                all_ok = false;
+                break;
+            }
+            float m_val_f = static_cast<float>(m_val_d);
+            std::fill(bgz, bgz + slice_sz, m_val_f);
+            for (std::size_t i = 0; i < slice_sz; ++i) {
+                uint8_t m = mz[i];
+                if (((m & m_bg_val) == m_bg_val) && ((m & m_ovlp) == 0)) {
+                    mz[i] = m | m_used;
+                }
+            }
+            sum_bg += static_cast<double>(m_val_f) * static_cast<double>(cnt);
+            total_used += cnt;
+        }
+
+        if (all_ok && total_used > 0) {
+            mean_ptr[r] = sum_bg / static_cast<double>(total_used);
+            succ_ptr[r] = true;
+        } else {
+            if (sb.background.size() == sz) {
+                std::fill(bg_ptr, bg_ptr + sz, 0.0f);
+            }
+            for (std::size_t i = 0; i < sz; ++i) {
+                m_ptr[i] &= m_not_used;
+            }
+            fl_ptr[r] |= dials::af::DontIntegrate;
+        }
+    });
+
+    return boost::python::make_tuple(bg_mean, success);
 }
 
 // 1c. Fast OpenMP outlier rejection + moment extraction for SimpleBackground (constant3d)
@@ -930,6 +1285,178 @@ void extract_centroid_moments(
     });
 }
 
+// 3c. Complete parallel C++ centroid calculation returning flex.vec3_double directly
+boost::python::tuple compute_centroid_fast(
+    dials::af::const_ref<Shoebox<ProfileFloatType>> self,
+    int mask_fg_valid,
+    int mask_overlapped,
+    bool has_single_panel_px2mm,
+    int px2mm_mode, // 0 = SimplePxMmStrategy, 1 = ParallaxCorrectedPxMmStrategy
+    double px_size_x,
+    double px_size_y,
+    double mu,
+    double t0,
+    scitbx::vec3<double> fast_axis,
+    scitbx::vec3<double> slow_axis,
+    scitbx::vec3<double> origin,
+    double osc0,
+    double osc_w,
+    double arr0)
+{
+    uint8_t m_fg_val = static_cast<uint8_t>(mask_fg_valid);
+    uint8_t m_ovlp = static_cast<uint8_t>(mask_overlapped);
+    std::int64_t n = static_cast<std::int64_t>(self.size());
+
+    dials::af::shared<scitbx::vec3<double>> px_pos(
+        self.size(), dials::af::init_functor_null<scitbx::vec3<double>>()
+    );
+    dials::af::shared<scitbx::vec3<double>> px_var(
+        self.size(), dials::af::init_functor_null<scitbx::vec3<double>>()
+    );
+    scitbx::vec3<double>* p_pos = px_pos.begin();
+    scitbx::vec3<double>* p_var = px_var.begin();
+
+    dials::af::shared<scitbx::vec3<double>> mm_pos;
+    dials::af::shared<scitbx::vec3<double>> mm_var;
+    scitbx::vec3<double>* m_pos = nullptr;
+    scitbx::vec3<double>* m_var = nullptr;
+    if (has_single_panel_px2mm) {
+        mm_pos = dials::af::shared<scitbx::vec3<double>>(
+            self.size(), dials::af::init_functor_null<scitbx::vec3<double>>()
+        );
+        mm_var = dials::af::shared<scitbx::vec3<double>>(
+            self.size(), dials::af::init_functor_null<scitbx::vec3<double>>()
+        );
+        m_pos = mm_pos.begin();
+        m_var = mm_var.begin();
+    }
+
+    constexpr double half_sq = 1.0 / 12.0;
+    double px_size_x2 = px_size_x * px_size_x;
+    double px_size_y2 = px_size_y * px_size_y;
+    double osc_w2 = osc_w * osc_w;
+    scitbx::vec3<double> n_vec = fast_axis.cross(slow_axis);
+    if (origin * n_vec < 0.0) {
+        n_vec = -n_vec;
+    }
+
+    parallel_for(n, [&](std::int64_t r) {
+        const auto& sb = self[r];
+        auto b = sb.bbox;
+        int x0 = b[0], x1 = b[1], y0 = b[2], y1 = b[3], z0 = b[4], z1 = b[5];
+        double bx = static_cast<double>(x0);
+        double by = static_cast<double>(y0);
+        double bz = static_cast<double>(sb.flat ? ((z1 + z0) / 2) : z0);
+        std::size_t sz = sb.data.size();
+
+        double cx = static_cast<double>(x1 + x0) * 0.5;
+        double cy = static_cast<double>(y1 + y0) * 0.5;
+        double cz = static_cast<double>(z1 + z0) * 0.5;
+        double vx = 0.0, vy = 0.0, vz = 0.0;
+
+        if (sz > 0) {
+            auto acc = sb.data.accessor();
+            std::size_t nz = acc[0], ny = acc[1], nx = acc[2];
+            const float* d_ptr = sb.data.begin();
+            const float* b_ptr = sb.background.begin();
+            const uint8_t* m_ptr = sb.mask.begin();
+
+            int64_t cnt = 0;
+            double sum_w = 0.0, sum_wsq = 0.0, sum_wx = 0.0, sum_wy = 0.0, sum_wz = 0.0;
+            for (std::size_t k = 0; k < nz; ++k) {
+                double zc = static_cast<double>(k) + 0.5;
+                for (std::size_t j = 0; j < ny; ++j) {
+                    double yc = static_cast<double>(j) + 0.5;
+                    std::size_t row_off = (k * ny + j) * nx;
+                    for (std::size_t i = 0; i < nx; ++i) {
+                        uint8_t m = m_ptr[row_off + i];
+                        if (((m & m_fg_val) == m_fg_val) && ((m & m_ovlp) == 0)) {
+                            double val = static_cast<double>(d_ptr[row_off + i]) - static_cast<double>(b_ptr[row_off + i]);
+                            if (val > 0.0) {
+                                double xc = static_cast<double>(i) + 0.5;
+                                cnt++;
+                                sum_w += val;
+                                sum_wsq += val * val;
+                                sum_wx += val * xc;
+                                sum_wy += val * yc;
+                                sum_wz += val * zc;
+                            }
+                        }
+                    }
+                }
+            }
+            if (cnt > 0 && sum_w > 0.0) {
+                double inv_w = 1.0 / sum_w;
+                double mean_x = sum_wx * inv_w;
+                double mean_y = sum_wy * inv_w;
+                double mean_z = sum_wz * inv_w;
+                cx = mean_x + bx;
+                cy = mean_y + by;
+                cz = mean_z + bz;
+                double denom = (sum_w * sum_w) - sum_wsq;
+                if (cnt > 1 && denom > 0.0) {
+                    double sum_wdx2 = 0.0, sum_wdy2 = 0.0, sum_wdz2 = 0.0;
+                    for (std::size_t k = 0; k < nz; ++k) {
+                        double dz = (static_cast<double>(k) + 0.5) - mean_z;
+                        double dz2 = dz * dz;
+                        for (std::size_t j = 0; j < ny; ++j) {
+                            double dy = (static_cast<double>(j) + 0.5) - mean_y;
+                            double dy2 = dy * dy;
+                            std::size_t row_off = (k * ny + j) * nx;
+                            for (std::size_t i = 0; i < nx; ++i) {
+                                uint8_t m = m_ptr[row_off + i];
+                                if (((m & m_fg_val) == m_fg_val) && ((m & m_ovlp) == 0)) {
+                                    double val = static_cast<double>(d_ptr[row_off + i]) - static_cast<double>(b_ptr[row_off + i]);
+                                    if (val > 0.0) {
+                                        double dx = (static_cast<double>(i) + 0.5) - mean_x;
+                                        sum_wdx2 += val * (dx * dx);
+                                        sum_wdy2 += val * dy2;
+                                        sum_wdz2 += val * dz2;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    double scale = 1.0 / denom;
+                    vx = sum_wdx2 * scale + half_sq;
+                    vy = sum_wdy2 * scale + half_sq;
+                    vz = sum_wdz2 * scale + half_sq;
+                }
+            }
+        }
+        p_pos[r] = scitbx::vec3<double>(cx, cy, cz);
+        p_var[r] = scitbx::vec3<double>(vx, vy, vz);
+
+        if (has_single_panel_px2mm) {
+            double mx = cx * px_size_x;
+            double my = cy * px_size_y;
+            if (px2mm_mode == 1) {
+                scitbx::vec3<double> s1 = origin + mx * fast_axis + my * slow_axis;
+                double slen = s1.length();
+                if (slen > 0.0) {
+                    scitbx::vec3<double> s1_n = s1 * (1.0 / slen);
+                    double cos_t = s1_n * n_vec;
+                    if (mu > 0.0 && cos_t != 0.0) {
+                        double inv_mu = 1.0 / mu;
+                        double t0_over_cos_t = t0 / cos_t;
+                        double atten_o = inv_mu - (t0_over_cos_t + inv_mu) * std::exp(-mu * t0_over_cos_t);
+                        mx -= (s1_n * fast_axis) * atten_o;
+                        my -= (s1_n * slow_axis) * atten_o;
+                    }
+                }
+            }
+            double mz = (osc_w == 0.0 && osc0 == 0.0) ? 0.0 : (osc0 + (cz - arr0) * osc_w);
+            m_pos[r] = scitbx::vec3<double>(mx, my, mz);
+            m_var[r] = scitbx::vec3<double>(vx * px_size_x2, vy * px_size_y2, vz * osc_w2);
+        }
+    });
+
+    if (has_single_panel_px2mm) {
+        return boost::python::make_tuple(px_pos, px_var, mm_pos, mm_var);
+    }
+    return boost::python::make_tuple(px_pos, px_var);
+}
+
 // 4b. Extract summation totals per shoebox in a single parallel pass
 void extract_summation_totals(
     dials::af::const_ref<Shoebox<ProfileFloatType>> self,
@@ -996,6 +1523,85 @@ void extract_summation_totals(
     });
 }
 
+// 4c. Complete parallel C++ summation integration returning flex.double directly and updating flags
+boost::python::tuple compute_summation_fast(
+    dials::af::const_ref<Shoebox<ProfileFloatType>> self,
+    dials::af::ref<std::size_t> flags,
+    int mask_fg,
+    int mask_fg_valid,
+    int mask_overlapped,
+    int mask_bg_used_valid)
+{
+    uint8_t m_fg = static_cast<uint8_t>(mask_fg);
+    uint8_t m_fg_val = static_cast<uint8_t>(mask_fg_valid);
+    uint8_t m_ovlp = static_cast<uint8_t>(mask_overlapped);
+    uint8_t m_bg_used = static_cast<uint8_t>(mask_bg_used_valid);
+    std::int64_t n = static_cast<std::int64_t>(self.size());
+    DIALS_ASSERT(flags.size() == self.size());
+
+    dials::af::shared<double> intensity_val(self.size(), dials::af::init_functor_null<double>());
+    dials::af::shared<double> intensity_var(self.size(), dials::af::init_functor_null<double>());
+    dials::af::shared<double> background_val(self.size(), dials::af::init_functor_null<double>());
+    dials::af::shared<double> background_var(self.size(), dials::af::init_functor_null<double>());
+    double* i_val = intensity_val.begin();
+    double* i_var = intensity_var.begin();
+    double* b_val = background_val.begin();
+    double* b_var = background_var.begin();
+    std::size_t* fl_ptr = flags.begin();
+
+    constexpr std::size_t clear_mask = ~(dials::af::IntegratedSum | dials::af::FailedDuringSummation);
+
+    parallel_for(n, [&](std::int64_t r) {
+        const auto& sb = self[r];
+        std::size_t sz = sb.data.size();
+        if (sz == 0) {
+            i_val[r] = 0.0;
+            i_var[r] = 0.0;
+            b_val[r] = 0.0;
+            b_var[r] = 0.0;
+            fl_ptr[r] |= dials::af::FailedDuringSummation;
+            return;
+        }
+        const float* d_ptr = sb.data.begin();
+        const float* b_ptr = sb.background.begin();
+        const uint8_t* m_ptr = sb.mask.begin();
+        double sum_p = 0.0;
+        double sum_b = 0.0;
+        int64_t fg_cnt = 0;
+        int64_t bg_cnt = 0;
+        int32_t bad_cnt = 0;
+        for (std::size_t i = 0; i < sz; ++i) {
+            uint8_t m = m_ptr[i];
+            bool is_fg = (m & m_fg) == m_fg;
+            if (is_fg) {
+                if (((m & m_fg_val) == m_fg_val) && ((m & m_ovlp) == 0)) {
+                    sum_p += static_cast<double>(d_ptr[i]);
+                    sum_b += static_cast<double>(b_ptr[i]);
+                    fg_cnt++;
+                } else {
+                    bad_cnt++;
+                }
+            } else if ((m & m_bg_used) == m_bg_used) {
+                bg_cnt++;
+            }
+        }
+        double m_ratio = (bg_cnt > 0) ? (static_cast<double>(fg_cnt) / static_cast<double>(bg_cnt)) : 0.0;
+        double ival = sum_p - sum_b;
+        double bg_v = std::abs(sum_b) * (1.0 + m_ratio);
+        i_val[r] = ival;
+        i_var[r] = std::abs(ival) + bg_v;
+        b_val[r] = sum_b;
+        b_var[r] = bg_v;
+        if (bad_cnt == 0) {
+            fl_ptr[r] |= dials::af::IntegratedSum;
+        } else {
+            fl_ptr[r] |= dials::af::FailedDuringSummation;
+        }
+    });
+
+    return boost::python::make_tuple(intensity_val, intensity_var, background_val, background_var);
+}
+
 // 5. Fast parallel shoebox extraction directly from a 3D (B, H, W) int32 raw volume
 std::size_t extract_shoeboxes_from_volume(
     dials::af::ref<Shoebox<ProfileFloatType>> self,
@@ -1021,7 +1627,6 @@ std::size_t extract_shoeboxes_from_volume(
 
     parallel_for(n, [&](std::int64_t r) {
         auto& sbox = self[r];
-        sbox.allocate_data();
         auto b = sbox.bbox;
         int x0 = b[0];
         int x1 = b[1];
@@ -1037,11 +1642,27 @@ std::size_t extract_shoeboxes_from_volume(
         int xe = x1 <= xi ? xs : xs - (x1 - xi);
         int ye = y1 <= yi ? ys : ys - (y1 - yi);
         if (yb >= ye || xb >= xe || z0 < frame0 || z1 > frame1) {
+            sbox.allocate_data();
             valid_flags[r] = 0;
             return;
         }
         valid_flags[r] = 1;
-        sbox.allocate_background();
+        bool full_interior = (!sbox.flat && xb == 0 && xe == xs && yb == 0 && ye == ys);
+        if (full_interior) {
+            dials::af::c_grid<3> grid(zs, ys, xs);
+            sbox.data = dials::af::versa<ProfileFloatType, dials::af::c_grid<3>>(
+                grid, dials::af::init_functor_null<ProfileFloatType>()
+            );
+            sbox.mask = dials::af::versa<uint8_t, dials::af::c_grid<3>>(
+                grid, dials::af::init_functor_null<uint8_t>()
+            );
+            sbox.background = dials::af::versa<ProfileFloatType, dials::af::c_grid<3>>(
+                grid, 0.0f
+            );
+        } else {
+            sbox.allocate_data();
+            sbox.allocate_background();
+        }
         float* sdata = sbox.data.begin();
         uint8_t* smask = sbox.mask.begin();
         std::size_t s_stride_z = static_cast<std::size_t>(ys) * static_cast<std::size_t>(xs);
@@ -1279,10 +1900,38 @@ void parallel_compute_mask_3d_fast(
     double delta_b_r = 1.0 / delta_b;
     double delta_b_r2 = delta_b_r * delta_b_r;
 
+    struct PanelFastInfo {
+        vec3<double> origin;
+        vec3<double> fast;
+        vec3<double> slow;
+        double px_x;
+        double px_y;
+        bool is_pure_simple;
+        bool is_pure_parallax;
+    };
+    std::size_t n_panels = detector.size();
+    std::vector<PanelFastInfo> panel_infos(n_panels);
+    for (std::size_t p = 0; p < n_panels; ++p) {
+        const auto& pan = detector[p];
+        panel_infos[p].origin = pan.get_origin();
+        panel_infos[p].fast = pan.get_fast_axis();
+        panel_infos[p].slow = pan.get_slow_axis();
+        panel_infos[p].px_x = pan.get_pixel_size()[0];
+        panel_infos[p].px_y = pan.get_pixel_size()[1];
+        auto strat = pan.get_px_mm_strategy();
+        bool is_parallax = (dynamic_cast<const dxtbx::model::ParallaxCorrectedPxMmStrategy*>(strat.get()) != nullptr);
+        bool is_offset = (dynamic_cast<const dxtbx::model::OffsetPxMmStrategy*>(strat.get()) != nullptr);
+        bool is_simple = (dynamic_cast<const dxtbx::model::SimplePxMmStrategy*>(strat.get()) != nullptr);
+        panel_infos[p].is_pure_simple = (is_simple && !is_parallax && !is_offset);
+        panel_infos[p].is_pure_parallax = (is_parallax && !is_offset);
+    }
+
     std::int64_t n = static_cast<std::int64_t>(shoeboxes.size());
     std::vector<std::vector<double>> thread_dxy_bufs(20);
+    std::vector<std::vector<uint8_t>> thread_mv_bufs(20);
     parallel_for(n, [&](std::int64_t idx, int tid) {
         auto& dxy_buf = thread_dxy_bufs[tid];
+        auto& mv_buf = thread_mv_bufs[tid];
         auto& shoebox = shoeboxes[idx];
         auto mask = shoebox.mask.ref();
         scitbx::af::int6 bbox = shoebox.bbox;
@@ -1295,8 +1944,14 @@ void parallel_compute_mask_3d_fast(
         int ysize = y1 - y0;
         int zsize = z1 - z0;
 
-        const dxtbx::model::Panel& panel = detector[panel_arr[idx]];
-        CoordinateSystem cs(m2, s0, s1[idx], phi);
+        std::size_t p_idx = panel_arr[idx];
+        const dxtbx::model::Panel& panel = detector[p_idx];
+        const PanelFastInfo& pinfo = panel_infos[p_idx];
+        vec3<double> s1_r = s1[idx];
+        CoordinateSystem cs(m2, s0, s1_r, phi);
+        double s1_len = cs.s1().length();
+        vec3<double> scaled_e1 = cs.e1_axis() * (1.0 / s1_len);
+        vec3<double> scaled_e2 = cs.e2_axis() * (1.0 / s1_len);
 
         std::size_t stride_x = static_cast<std::size_t>(xsize + 1);
         std::size_t dxy_sz = static_cast<std::size_t>(ysize + 1) * stride_x;
@@ -1305,12 +1960,30 @@ void parallel_compute_mask_3d_fast(
         }
 
         if (shoebox.flat) {
-            for (int j = 0; j <= ysize; ++j) {
-                for (int i = 0; i <= xsize; ++i) {
-                    vec2<double> gxy = cs.from_beam_vector(
-                        panel.get_pixel_lab_coord(vec2<double>(x0 + i, y0 + j)).normalize() * s0_length);
-                    dxy_buf[static_cast<std::size_t>(j) * stride_x + i] =
-                        (gxy[0] * gxy[0] + gxy[1] * gxy[1]) * delta_b_r2;
+            if (pinfo.is_pure_simple) {
+                for (int j = 0; j <= ysize; ++j) {
+                    double my = static_cast<double>(y0 + j) * pinfo.px_y;
+                    vec3<double> row_base = pinfo.origin + pinfo.slow * my;
+                    for (int i = 0; i <= xsize; ++i) {
+                        double mx = static_cast<double>(x0 + i) * pinfo.px_x;
+                        vec3<double> lab = row_base + pinfo.fast * mx;
+                        vec3<double> ds1 = lab.normalize() * s0_length - s1_r;
+                        double gx = scaled_e1 * ds1;
+                        double gy = scaled_e2 * ds1;
+                        dxy_buf[static_cast<std::size_t>(j) * stride_x + i] =
+                            (gx * gx + gy * gy) * delta_b_r2;
+                    }
+                }
+            } else {
+                for (int j = 0; j <= ysize; ++j) {
+                    for (int i = 0; i <= xsize; ++i) {
+                        vec3<double> ds1 =
+                            panel.get_pixel_lab_coord(vec2<double>(x0 + i, y0 + j)).normalize() * s0_length - s1_r;
+                        double gx = scaled_e1 * ds1;
+                        double gy = scaled_e2 * ds1;
+                        dxy_buf[static_cast<std::size_t>(j) * stride_x + i] =
+                            (gx * gx + gy * gy) * delta_b_r2;
+                    }
                 }
             }
             uint8_t* m_ptr = mask.begin();
@@ -1324,14 +1997,52 @@ void parallel_compute_mask_3d_fast(
                 }
             }
         } else {
-            vec2<double> shoebox_centroid_px = panel.get_ray_intersection_px(s1[idx]);
-            double attenuation_length = panel.attenuation_length(shoebox_centroid_px);
-            for (int j = 0; j <= ysize; ++j) {
-                for (int i = 0; i <= xsize; ++i) {
-                    vec2<double> gxy = cs.from_beam_vector(
-                        panel.get_pixel_lab_coord(vec2<double>(x0 + i, y0 + j), attenuation_length).normalize() * s0_length);
-                    dxy_buf[static_cast<std::size_t>(j) * stride_x + i] =
-                        (gxy[0] * gxy[0] + gxy[1] * gxy[1]) * delta_b_r2;
+            if (pinfo.is_pure_simple) {
+                for (int j = 0; j <= ysize; ++j) {
+                    double my = static_cast<double>(y0 + j) * pinfo.px_y;
+                    vec3<double> row_base = pinfo.origin + pinfo.slow * my;
+                    for (int i = 0; i <= xsize; ++i) {
+                        double mx = static_cast<double>(x0 + i) * pinfo.px_x;
+                        vec3<double> lab = row_base + pinfo.fast * mx;
+                        vec3<double> ds1 = lab.normalize() * s0_length - s1_r;
+                        double gx = scaled_e1 * ds1;
+                        double gy = scaled_e2 * ds1;
+                        dxy_buf[static_cast<std::size_t>(j) * stride_x + i] =
+                            (gx * gx + gy * gy) * delta_b_r2;
+                    }
+                }
+            } else if (pinfo.is_pure_parallax) {
+                vec2<double> shoebox_centroid_px = panel.get_ray_intersection_px(s1_r);
+                double attenuation_length = panel.attenuation_length(shoebox_centroid_px);
+                for (int j = 0; j <= ysize; ++j) {
+                    double my = static_cast<double>(y0 + j) * pinfo.px_y;
+                    vec3<double> row_base = pinfo.origin + my * pinfo.slow;
+                    for (int i = 0; i <= xsize; ++i) {
+                        double mx = static_cast<double>(x0 + i) * pinfo.px_x;
+                        vec3<double> s1_raw = row_base + mx * pinfo.fast;
+                        vec3<double> s1_n = s1_raw.normalize();
+                        double cx = mx - (s1_n * pinfo.fast) * attenuation_length;
+                        double cy = my - (s1_n * pinfo.slow) * attenuation_length;
+                        vec3<double> lab = pinfo.origin + cx * pinfo.fast + cy * pinfo.slow;
+                        vec3<double> ds1 = lab.normalize() * s0_length - s1_r;
+                        double gx = scaled_e1 * ds1;
+                        double gy = scaled_e2 * ds1;
+                        dxy_buf[static_cast<std::size_t>(j) * stride_x + i] =
+                            (gx * gx + gy * gy) * delta_b_r2;
+                    }
+                }
+            } else {
+                vec2<double> shoebox_centroid_px = panel.get_ray_intersection_px(s1_r);
+                double attenuation_length = panel.attenuation_length(shoebox_centroid_px);
+                for (int j = 0; j <= ysize; ++j) {
+                    for (int i = 0; i <= xsize; ++i) {
+                        vec3<double> ds1 =
+                            panel.get_pixel_lab_coord(vec2<double>(x0 + i, y0 + j), attenuation_length).normalize() * s0_length - s1_r;
+                        double gx = scaled_e1 * ds1;
+                        double gy = scaled_e2 * ds1;
+                        dxy_buf[static_cast<std::size_t>(j) * stride_x + i] =
+                            (gx * gx + gy * gy) * delta_b_r2;
+                    }
                 }
             }
             int k_start = std::max(0, index0 - z0);
@@ -1339,18 +2050,25 @@ void parallel_compute_mask_3d_fast(
             if (k_start < k_end) {
                 uint8_t* m_ptr = mask.begin();
                 std::size_t slice_stride = static_cast<std::size_t>(ysize) * static_cast<std::size_t>(xsize);
-                uint8_t* m_first = m_ptr + static_cast<std::size_t>(k_start) * slice_stride;
-                int n_k = k_end - k_start;
+                if (mv_buf.size() < slice_stride) {
+                    mv_buf.resize(slice_stride);
+                }
                 for (int j = 0; j < ysize; ++j) {
                     const double* r0 = &dxy_buf[static_cast<std::size_t>(j) * stride_x];
                     const double* r1 = r0 + stride_x;
-                    uint8_t* m_row0 = m_first + static_cast<std::size_t>(j) * xsize;
+                    uint8_t* mv_row = mv_buf.data() + static_cast<std::size_t>(j) * xsize;
                     for (int i = 0; i < xsize; ++i) {
                         double dxy = std::min(std::min(r0[i], r1[i]), std::min(r0[i + 1], r1[i + 1]));
-                        uint8_t mv = (dxy <= 1.0) ? Foreground : Background;
-                        for (int k = 0; k < n_k; ++k) {
-                            m_row0[static_cast<std::size_t>(k) * slice_stride + i] |= mv;
-                        }
+                        mv_row[i] = (dxy <= 1.0) ? Foreground : Background;
+                    }
+                }
+                uint8_t* m_first = m_ptr + static_cast<std::size_t>(k_start) * slice_stride;
+                int n_k = k_end - k_start;
+                const uint8_t* mv_data = mv_buf.data();
+                for (int k = 0; k < n_k; ++k) {
+                    uint8_t* m_slice = m_first + static_cast<std::size_t>(k) * slice_stride;
+                    for (std::size_t p = 0; p < slice_stride; ++p) {
+                        m_slice[p] |= mv_data[p];
                     }
                 }
             }
@@ -1440,6 +2158,15 @@ void parallel_post_mask_counts(
     });
 }
 
+void parallel_deallocate_shoeboxes(
+    dials::af::ref<Shoebox<ProfileFloatType>> shoeboxes)
+{
+    std::int64_t n = static_cast<std::int64_t>(shoeboxes.size());
+    parallel_for(n, [&](std::int64_t r) {
+        shoeboxes[r].deallocate();
+    });
+}
+
 void parallel_check_overloads_single_panel(
     dials::af::ref<Shoebox<ProfileFloatType>> shoeboxes,
     dials::af::ref<std::size_t> flags,
@@ -1467,138 +2194,477 @@ void parallel_check_overloads_single_panel(
     });
 }
 
-// 7. Parallel GaussianRS profile fitting and modelling (zero per-reflection data/mask/Match heap allocations)
-struct ThreadSafeTransformForward {
-    dials::af::versa<bool, dials::af::c_grid<3>> mask_;
-    dials::af::versa<double, dials::af::c_grid<3>> profile_;
-    dials::af::versa<double, dials::af::c_grid<3>> background_;
+// 7. Parallel GaussianRS profile fitting and modelling (zero per-reflection heap allocations, zero inner-loop erf)
+struct PanelTransformInfo {
+    scitbx::vec3<double> origin;
+    scitbx::vec3<double> fast;
+    scitbx::vec3<double> slow;
+    double px_x;
+    double px_y;
+    int img_w;
+    int img_h;
+    bool is_pure_simple;
+    bool is_pure_parallax;
+};
 
-    ThreadSafeTransformForward(
-        const dxtbx::model::Panel& panel,
-        int scan_index0,
-        double phi0,
-        double dphi,
-        double sigma_b,
-        double sigma_m,
-        double n_sigma,
-        std::size_t half_grid_size,
-        const dials::algorithms::profile_model::gaussian_rs::CoordinateSystem& cs,
-        const Shoebox<ProfileFloatType>& sbox,
-        bool use_bkgrd)
-    {
-        using namespace dials::algorithms::profile_model::gaussian_rs::transform;
-        using dials::algorithms::polygon::clip::vert4;
-        using dials::algorithms::polygon::spatial_interpolation::quad_grid_range;
-        using dials::algorithms::polygon::spatial_interpolation::reverse_quad_inplace_if_backward;
-        using dials::algorithms::polygon::spatial_interpolation::quad_grid_intersection_area;
-        using dials::model::Foreground;
-        using dials::model::Valid;
-        using scitbx::vec2;
-        using scitbx::vec3;
-        using scitbx::af::int3;
-        using scitbx::af::int4;
-        using scitbx::af::double3;
+inline std::vector<PanelTransformInfo> extract_panel_transform_infos(const dxtbx::model::Detector& detector) {
+    std::size_t n_panels = detector.size();
+    std::vector<PanelTransformInfo> infos(n_panels);
+    for (std::size_t p = 0; p < n_panels; ++p) {
+        const auto& pan = detector[p];
+        infos[p].origin = pan.get_origin();
+        infos[p].fast = pan.get_fast_axis();
+        infos[p].slow = pan.get_slow_axis();
+        infos[p].px_x = pan.get_pixel_size()[0];
+        infos[p].px_y = pan.get_pixel_size()[1];
+        infos[p].img_w = static_cast<int>(pan.get_image_size()[0]);
+        infos[p].img_h = static_cast<int>(pan.get_image_size()[1]);
+        auto strat = pan.get_px_mm_strategy();
+        bool is_parallax = (dynamic_cast<const dxtbx::model::ParallaxCorrectedPxMmStrategy*>(strat.get()) != nullptr);
+        bool is_offset = (dynamic_cast<const dxtbx::model::OffsetPxMmStrategy*>(strat.get()) != nullptr);
+        bool is_simple = (dynamic_cast<const dxtbx::model::SimplePxMmStrategy*>(strat.get()) != nullptr);
+        infos[p].is_pure_simple = (is_simple && !is_parallax && !is_offset);
+        infos[p].is_pure_parallax = (is_parallax && !is_offset);
+    }
+    return infos;
+}
 
-        scitbx::af::int6 bbox = sbox.bbox;
-        int x0 = bbox[0];
-        int y0 = bbox[2];
-        int nz = bbox[5] - bbox[4];
-        int ny = bbox[3] - bbox[2];
-        int nx = bbox[1] - bbox[0];
-        int3 shoebox_size(nz, ny, nx);
-        DIALS_ASSERT(shoebox_size.all_gt(0));
-        int g_dim = static_cast<int>(2 * half_grid_size + 1);
-        int3 grid_size(g_dim, g_dim, g_dim);
-        double step_m = sigma_m * n_sigma / (static_cast<double>(half_grid_size) + 0.5);
-        double step_b = sigma_b * n_sigma / (static_cast<double>(half_grid_size) + 0.5);
-        double3 step_size(step_m, step_b, step_b);
-        double g_cent = static_cast<double>(half_grid_size) + 0.5;
-        double3 grid_cent(g_cent, g_cent, g_cent);
+struct ThreadTransformScratch {
+    std::vector<double> profile;
+    std::vector<double> background;
+    std::vector<double> net_profile;
+    std::vector<double> av3;
+    std::vector<double> bv3;
+    std::vector<double> erf_av3;
+    std::vector<double> erf_bv3;
+    std::vector<double> aj;
+    std::vector<double> bj;
+    std::vector<double> erf_aj;
+    std::vector<double> erf_bj;
+    std::vector<double> zfraction;
+    std::vector<scitbx::vec2<double>> gc_sub;
+    std::vector<double> col_prof;
+    std::vector<double> col_bg;
+    std::vector<double> col_net;
+    int valid_kk_list[64];
+    int n_valid_kk = 0;
+    uint32_t valid_kk_mask = 0;
+    bool has_fg_pixels = false;
 
-        vec3<double> s1 = cs.s1();
-        double s1_len = s1.length();
-        DIALS_ASSERT(s1_len > 0);
-        vec3<double> e1 = cs.e1_axis() / s1_len;
-        vec3<double> e2 = cs.e2_axis() / s1_len;
+    std::vector<double> c_act;
+    std::vector<double> b_act;
+    std::vector<double> p_act;
+    std::vector<double> cb_p;
+    std::vector<double> p2;
+};
 
-        vec2<int> zrange(bbox[4], bbox[5]);
-        MapFramesForward<double> map_frames_forward(
-            scan_index0, phi0, dphi, sigma_m, n_sigma, grid_size[2] / 2
-        );
-        dials::af::versa<double, dials::af::c_grid<2>> zfraction_arr =
-            map_frames_forward(zrange, cs.phi(), cs.zeta());
+inline double quad_unit_square_intersection_area(
+    const dials::algorithms::polygon::clip::vert4& a,
+    int ii,
+    int jj,
+    double q_xmin,
+    double q_xmax,
+    double q_ymin,
+    double q_ymax,
+    double target_area)
+{
+    using scitbx::vec2;
+    using dials::algorithms::polygon::intersection;
+    double x0 = static_cast<double>(ii);
+    double x1 = static_cast<double>(ii + 1);
+    double y0 = static_cast<double>(jj);
+    double y1 = static_cast<double>(jj + 1);
 
-        MapFramesReverse<double> map_frames_backward(
-            scan_index0, phi0, dphi, sigma_m, n_sigma, grid_size[2] / 2
-        );
-        dials::af::versa<double, dials::af::c_grid<2>> efraction_arr =
-            map_frames_backward(zrange, cs.phi(), cs.zeta());
+    if (q_xmin > x0 && q_xmax < x1 && q_ymin > y0 && q_ymax < y1) {
+        return target_area;
+    }
 
-        dials::af::const_ref<double, dials::af::c_grid<2>> zfraction = zfraction_arr.const_ref();
-        dials::af::const_ref<double, dials::af::c_grid<2>> efraction = efraction_arr.const_ref();
+    vec2<double> buf0[8];
+    vec2<double> buf1[8];
+    const vec2<double>* in_pts = &a[0];
+    vec2<double>* out_pts = buf0;
+    int in_sz = 4;
 
-        dials::af::c_grid<3> accessor(grid_size);
-        profile_ = dials::af::versa<double, dials::af::c_grid<3>>(accessor, 0.0);
-        if (use_bkgrd) {
-            background_ = dials::af::versa<double, dials::af::c_grid<3>>(accessor, 0.0);
+    if (!(q_xmin > x0)) {
+        if (q_xmax <= x0) return 0.0;
+        vec2<double> e1(x0, y1), e2(x0, y0);
+        int out_sz = 0;
+        vec2<double> p1 = in_pts[in_sz - 1];
+        bool in1 = (p1[0] > x0);
+        for (int k = 0; k < in_sz; ++k) {
+            vec2<double> p2 = in_pts[k];
+            bool in2 = (p2[0] > x0);
+            if (in2) {
+                if (!in1) out_pts[out_sz++] = intersection(p1, p2, e1, e2);
+                out_pts[out_sz++] = p2;
+            } else if (in1) {
+                out_pts[out_sz++] = intersection(p1, p2, e1, e2);
+            }
+            p1 = p2;
+            in1 = in2;
         }
-        mask_ = dials::af::versa<bool, dials::af::c_grid<3>>(accessor, false);
+        if (out_sz < 3) return 0.0;
+        in_pts = out_pts;
+        out_pts = (out_pts == buf0) ? buf1 : buf0;
+        in_sz = out_sz;
+    }
 
-        for (std::size_t kk = 0; kk < static_cast<std::size_t>(grid_size[0]); ++kk) {
+    if (!(q_ymin > y0)) {
+        if (q_ymax <= y0) return 0.0;
+        vec2<double> e1(x0, y0), e2(x1, y0);
+        int out_sz = 0;
+        vec2<double> p1 = in_pts[in_sz - 1];
+        bool in1 = (p1[1] > y0);
+        for (int k = 0; k < in_sz; ++k) {
+            vec2<double> p2 = in_pts[k];
+            bool in2 = (p2[1] > y0);
+            if (in2) {
+                if (!in1) out_pts[out_sz++] = intersection(p1, p2, e1, e2);
+                out_pts[out_sz++] = p2;
+            } else if (in1) {
+                out_pts[out_sz++] = intersection(p1, p2, e1, e2);
+            }
+            p1 = p2;
+            in1 = in2;
+        }
+        if (out_sz < 3) return 0.0;
+        in_pts = out_pts;
+        out_pts = (out_pts == buf0) ? buf1 : buf0;
+        in_sz = out_sz;
+    }
+
+    if (!(q_xmax < x1)) {
+        if (q_xmin >= x1) return 0.0;
+        vec2<double> e1(x1, y0), e2(x1, y1);
+        int out_sz = 0;
+        vec2<double> p1 = in_pts[in_sz - 1];
+        bool in1 = (p1[0] < x1);
+        for (int k = 0; k < in_sz; ++k) {
+            vec2<double> p2 = in_pts[k];
+            bool in2 = (p2[0] < x1);
+            if (in2) {
+                if (!in1) out_pts[out_sz++] = intersection(p1, p2, e1, e2);
+                out_pts[out_sz++] = p2;
+            } else if (in1) {
+                out_pts[out_sz++] = intersection(p1, p2, e1, e2);
+            }
+            p1 = p2;
+            in1 = in2;
+        }
+        if (out_sz < 3) return 0.0;
+        in_pts = out_pts;
+        out_pts = (out_pts == buf0) ? buf1 : buf0;
+        in_sz = out_sz;
+    }
+
+    if (!(q_ymax < y1)) {
+        if (q_ymin >= y1) return 0.0;
+        vec2<double> e1(x1, y1), e2(x0, y1);
+        int out_sz = 0;
+        vec2<double> p1 = in_pts[in_sz - 1];
+        bool in1 = (p1[1] < y1);
+        for (int k = 0; k < in_sz; ++k) {
+            vec2<double> p2 = in_pts[k];
+            bool in2 = (p2[1] < y1);
+            if (in2) {
+                if (!in1) out_pts[out_sz++] = intersection(p1, p2, e1, e2);
+                out_pts[out_sz++] = p2;
+            } else if (in1) {
+                out_pts[out_sz++] = intersection(p1, p2, e1, e2);
+            }
+            p1 = p2;
+            in1 = in2;
+        }
+        if (out_sz < 3) return 0.0;
+        in_pts = out_pts;
+        in_sz = out_sz;
+    }
+
+    double area = 0.0;
+    vec2<double> v0 = in_pts[in_sz - 1];
+    for (int k = 0; k < in_sz; ++k) {
+        vec2<double> v1 = in_pts[k];
+        area += v0[0] * v1[1] - v1[0] * v0[1];
+        v0 = v1;
+    }
+    return area * 0.5;
+}
+
+inline void run_transform_forward_fast(
+    const dxtbx::model::Panel& panel,
+    const PanelTransformInfo& pinfo,
+    int scan_index0,
+    double phi0,
+    double dphi,
+    double sigma_b,
+    double sigma_m,
+    double n_sigma,
+    std::size_t half_grid_size,
+    const dials::algorithms::profile_model::gaussian_rs::CoordinateSystem& cs,
+    const Shoebox<ProfileFloatType>& sbox,
+    bool use_bkgrd,
+    bool compute_net,
+    ThreadTransformScratch& scratch)
+{
+    using boost::math::erf;
+    using dials::algorithms::polygon::clip::vert4;
+    using dials::algorithms::polygon::spatial_interpolation::quad_grid_range;
+    using dials::algorithms::polygon::spatial_interpolation::reverse_quad_inplace_if_backward;
+    using dials::algorithms::polygon::spatial_interpolation::quad_grid_intersection_area;
+    using dials::model::Foreground;
+    using dials::model::Valid;
+    using scitbx::vec2;
+    using scitbx::vec3;
+    using scitbx::af::int4;
+
+    scratch.n_valid_kk = 0;
+    scratch.valid_kk_mask = 0;
+    scratch.has_fg_pixels = false;
+
+    scitbx::af::int6 bbox = sbox.bbox;
+    int x0 = bbox[0];
+    int y0 = bbox[2];
+    int j0 = bbox[4];
+    int j1 = bbox[5];
+    int nz = j1 - j0;
+    int ny = bbox[3] - bbox[2];
+    int nx = bbox[1] - bbox[0];
+    if (nz <= 0 || ny <= 0 || nx <= 0) return;
+
+    int g_dim = static_cast<int>(2 * half_grid_size + 1);
+    std::size_t g_stride_k = static_cast<std::size_t>(g_dim) * static_cast<std::size_t>(g_dim);
+    std::size_t g_stride_j = static_cast<std::size_t>(g_dim);
+    std::size_t g_vol = static_cast<std::size_t>(g_dim) * g_stride_k;
+
+    double phi = cs.phi();
+    double zeta = cs.zeta();
+    if (zeta == 0.0 || sigma_m <= 0.0) return;
+
+    double delta_mosaicity = sigma_m * n_sigma;
+    double step_size_e3 = 2.0 * delta_mosaicity / static_cast<double>(g_dim);
+    double sigr2 = std::abs(zeta) / (std::sqrt(2.0) * sigma_m);
+    int offset = static_cast<int>(half_grid_size);
+
+    if (scratch.av3.size() < static_cast<std::size_t>(g_dim)) {
+        scratch.av3.resize(static_cast<std::size_t>(g_dim));
+        scratch.bv3.resize(static_cast<std::size_t>(g_dim));
+        scratch.erf_av3.resize(static_cast<std::size_t>(g_dim));
+        scratch.erf_bv3.resize(static_cast<std::size_t>(g_dim));
+        scratch.col_prof.resize(static_cast<std::size_t>(g_dim));
+        scratch.col_bg.resize(static_cast<std::size_t>(g_dim));
+        scratch.col_net.resize(static_cast<std::size_t>(g_dim));
+    }
+    if (scratch.aj.size() < static_cast<std::size_t>(nz)) {
+        scratch.aj.resize(static_cast<std::size_t>(nz));
+        scratch.bj.resize(static_cast<std::size_t>(nz));
+        scratch.erf_aj.resize(static_cast<std::size_t>(nz));
+        scratch.erf_bj.resize(static_cast<std::size_t>(nz));
+    }
+
+    for (int kk = 0; kk < g_dim; ++kk) {
+        double b_v = ((kk - offset - 0.5) * step_size_e3) / zeta + phi;
+        double a_v = ((kk - offset + 0.5) * step_size_e3) / zeta + phi;
+        if (a_v > b_v) std::swap(a_v, b_v);
+        scratch.av3[kk] = a_v;
+        scratch.bv3[kk] = b_v;
+        scratch.erf_av3[kk] = erf((a_v - phi) * sigr2);
+        scratch.erf_bv3[kk] = erf((b_v - phi) * sigr2);
+    }
+
+    for (int k = 0; k < nz; ++k) {
+        double a_j = phi0 + ((j0 + k) - scan_index0) * dphi;
+        double b_j = a_j + dphi;
+        scratch.aj[k] = a_j;
+        scratch.bj[k] = b_j;
+        scratch.erf_aj[k] = erf((a_j - phi) * sigr2);
+        scratch.erf_bj[k] = erf((b_j - phi) * sigr2);
+    }
+
+    if (use_bkgrd) {
+        for (int kk = 0; kk < g_dim; ++kk) {
+            double int_v3 = scratch.erf_bv3[kk] - scratch.erf_av3[kk];
+            if (int_v3 == 0.0) continue;
+            double int_v3_r = 1.0 / int_v3;
+            double a_v = scratch.av3[kk];
+            double b_v = scratch.bv3[kk];
+            double e_av = scratch.erf_av3[kk];
+            double e_bv = scratch.erf_bv3[kk];
             double sumk = 0.0;
-            for (std::size_t k = 0; k < static_cast<std::size_t>(nz); ++k) {
-                sumk += efraction(kk, k);
+            for (int k = 0; k < nz; ++k) {
+                double a_j = scratch.aj[k];
+                double b_j = scratch.bj[k];
+                double av3j = std::max(a_v, a_j);
+                double bv3j = std::min(b_v, b_j);
+                if (av3j < bv3j) {
+                    double e_hi = (b_v < b_j) ? e_bv : scratch.erf_bj[k];
+                    double e_lo = (a_v > a_j) ? e_av : scratch.erf_aj[k];
+                    sumk += (e_hi - e_lo) * int_v3_r;
+                }
             }
             if (sumk > 0.99) {
-                for (std::size_t j = 0; j < static_cast<std::size_t>(grid_size[1]); ++j) {
-                    for (std::size_t i = 0; i < static_cast<std::size_t>(grid_size[2]); ++i) {
-                        mask_(kk, j, i) = true;
-                    }
-                }
+                scratch.valid_kk_list[scratch.n_valid_kk++] = kk;
+                scratch.valid_kk_mask |= (1u << kk);
             }
         }
-
-        const float* sdata = sbox.data.begin();
-        const float* sbkgrd = sbox.background.begin();
-        const uint8_t* smask = sbox.mask.begin();
-        constexpr uint8_t fg_valid = Valid | Foreground;
-        std::size_t stride_z = static_cast<std::size_t>(ny) * static_cast<std::size_t>(nx);
-        std::size_t stride_y = static_cast<std::size_t>(nx);
-
-        int img_w = static_cast<int>(panel.get_image_size()[0]);
-        int img_h = static_cast<int>(panel.get_image_size()[1]);
-
-        // Find 2D bounding box of valid foreground pixels in (j, i) so we only evaluate
-        // get_pixel_lab_coord and polygon clipping where foreground pixels actually exist
-        int j_min = ny, j_max = -1, i_min = nx, i_max = -1;
-        for (int j = 0; j < ny; ++j) {
-            if (y0 + j < 0 || y0 + j >= img_h) continue;
-            for (int i = 0; i < nx; ++i) {
-                if (x0 + i < 0 || x0 + i >= img_w) continue;
-                std::size_t col_off = static_cast<std::size_t>(j) * stride_y + static_cast<std::size_t>(i);
-                for (int k = 0; k < nz; ++k) {
-                    if ((smask[static_cast<std::size_t>(k) * stride_z + col_off] & fg_valid) == fg_valid) {
-                        if (j < j_min) j_min = j;
-                        if (j > j_max) j_max = j;
-                        if (i < i_min) i_min = i;
-                        if (i > i_max) i_max = i;
-                        break;
-                    }
-                }
-            }
-        }
-        if (j_min > j_max || i_min > i_max) {
+        if (scratch.n_valid_kk == 0 && !compute_net) {
             return;
         }
+    }
 
+    const float* sdata = sbox.data.begin();
+    const float* sbkgrd = sbox.background.begin();
+    const uint8_t* smask = sbox.mask.begin();
+    constexpr uint8_t fg_valid = Valid | Foreground;
+    std::size_t stride_z = static_cast<std::size_t>(ny) * static_cast<std::size_t>(nx);
+    std::size_t stride_y = static_cast<std::size_t>(nx);
+
+    int img_w = pinfo.img_w;
+    int img_h = pinfo.img_h;
+
+    int j_min = ny, j_max = -1, i_min = nx, i_max = -1;
+    for (int j = 0; j < ny; ++j) {
+        if (y0 + j < 0 || y0 + j >= img_h) continue;
+        for (int i = 0; i < nx; ++i) {
+            if (x0 + i < 0 || x0 + i >= img_w) continue;
+            std::size_t col_off = static_cast<std::size_t>(j) * stride_y + static_cast<std::size_t>(i);
+            for (int k = 0; k < nz; ++k) {
+                if ((smask[static_cast<std::size_t>(k) * stride_z + col_off] & fg_valid) == fg_valid) {
+                    if (j < j_min) j_min = j;
+                    if (j > j_max) j_max = j;
+                    if (i < i_min) i_min = i;
+                    if (i > i_max) i_max = i;
+                    break;
+                }
+            }
+        }
+    }
+    if (j_min > j_max || i_min > i_max) {
+        return;
+    }
+    scratch.has_fg_pixels = true;
+
+    if (scratch.profile.size() < g_vol) {
+        scratch.profile.resize(g_vol);
+    }
+    if (use_bkgrd && scratch.background.size() < g_vol) {
+        scratch.background.resize(g_vol);
+    }
+    if (compute_net && scratch.net_profile.size() < g_vol) {
+        scratch.net_profile.resize(g_vol);
+    }
+
+    double* prof_ptr = scratch.profile.data();
+    double* bg_ptr = use_bkgrd ? scratch.background.data() : nullptr;
+    double* net_ptr = compute_net ? scratch.net_profile.data() : nullptr;
+
+    if (use_bkgrd && !compute_net) {
+        for (int idx_kk = 0; idx_kk < scratch.n_valid_kk; ++idx_kk) {
+            std::size_t kk_off = static_cast<std::size_t>(scratch.valid_kk_list[idx_kk]) * g_stride_k;
+            std::memset(prof_ptr + kk_off, 0, g_stride_k * sizeof(double));
+            std::memset(bg_ptr + kk_off, 0, g_stride_k * sizeof(double));
+        }
+    } else {
+        std::memset(prof_ptr, 0, g_vol * sizeof(double));
+        if (use_bkgrd) {
+            std::memset(bg_ptr, 0, g_vol * sizeof(double));
+        }
+        if (compute_net) {
+            std::memset(net_ptr, 0, g_vol * sizeof(double));
+        }
+    }
+
+    std::size_t zf_sz = static_cast<std::size_t>(nz) * static_cast<std::size_t>(g_dim);
+    if (scratch.zfraction.size() < zf_sz) {
+        scratch.zfraction.resize(zf_sz);
+    }
+    double* zf_ptr = scratch.zfraction.data();
+    for (int k = 0; k < nz; ++k) {
+        double int_j = scratch.erf_bj[k] - scratch.erf_aj[k];
+        double* zf_row = zf_ptr + static_cast<std::size_t>(k) * static_cast<std::size_t>(g_dim);
+        if (int_j == 0.0) {
+            for (int kk = 0; kk < g_dim; ++kk) {
+                zf_row[kk] = 0.0;
+            }
+        } else {
+            double int_j_r = 1.0 / int_j;
+            double a_j = scratch.aj[k];
+            double b_j = scratch.bj[k];
+            double e_aj = scratch.erf_aj[k];
+            double e_bj = scratch.erf_bj[k];
+            for (int kk = 0; kk < g_dim; ++kk) {
+                double a_v = scratch.av3[kk];
+                double b_v = scratch.bv3[kk];
+                double av3j = std::max(a_v, a_j);
+                double bv3j = std::min(b_v, b_j);
+                if (av3j >= bv3j) {
+                    zf_row[kk] = 0.0;
+                } else {
+                    double e_hi = (b_v < b_j) ? scratch.erf_bv3[kk] : e_bj;
+                    double e_lo = (a_v > a_j) ? scratch.erf_av3[kk] : e_aj;
+                    zf_row[kk] = (e_hi - e_lo) * int_j_r;
+                }
+            }
+        }
+    }
+
+    double g_cent = static_cast<double>(half_grid_size) + 0.5;
+    double step_b = sigma_b * n_sigma / g_cent;
+    double inv_step_b = 1.0 / step_b;
+
+    vec3<double> s1 = cs.s1();
+    double s1_len = s1.length();
+    vec3<double> e1_scaled = (cs.e1_axis() / s1_len) * inv_step_b;
+    vec3<double> e2_scaled = (cs.e2_axis() / s1_len) * inv_step_b;
+
+    int sub_ny = (j_max - j_min) + 2;
+    int sub_nx = (i_max - i_min) + 2;
+    std::size_t gc_sz = static_cast<std::size_t>(sub_ny * sub_nx);
+    if (scratch.gc_sub.size() < gc_sz) {
+        scratch.gc_sub.resize(gc_sz);
+    }
+    vec2<double>* gc_sub = scratch.gc_sub.data();
+
+    if (pinfo.is_pure_simple) {
+        for (int jj = 0; jj < sub_ny; ++jj) {
+            int j = j_min + jj;
+            double my = static_cast<double>(y0 + j) * pinfo.px_y;
+            vec3<double> row_base = pinfo.origin + my * pinfo.slow;
+            for (int ii = 0; ii < sub_nx; ++ii) {
+                int i = i_min + ii;
+                double mx = static_cast<double>(x0 + i) * pinfo.px_x;
+                vec3<double> sp = row_base + mx * pinfo.fast;
+                vec3<double> ds = sp.normalize() * s1_len - s1;
+                gc_sub[static_cast<std::size_t>(jj * sub_nx + ii)] = vec2<double>(
+                    g_cent + (e1_scaled * ds),
+                    g_cent + (e2_scaled * ds)
+                );
+            }
+        }
+    } else if (pinfo.is_pure_parallax) {
         vec2<double> shoebox_centroid_px = panel.get_ray_intersection_px(s1);
         double attenuation_length = panel.attenuation_length(shoebox_centroid_px);
-
-        int sub_ny = (j_max - j_min) + 2;
-        int sub_nx = (i_max - i_min) + 2;
-        std::vector<vec2<double>> gc_sub(static_cast<std::size_t>(sub_ny * sub_nx));
-        double inv_step2 = 1.0 / step_size[2];
-        double inv_step1 = 1.0 / step_size[1];
+        for (int jj = 0; jj < sub_ny; ++jj) {
+            int j = j_min + jj;
+            double my = static_cast<double>(y0 + j) * pinfo.px_y;
+            vec3<double> row_base = pinfo.origin + my * pinfo.slow;
+            for (int ii = 0; ii < sub_nx; ++ii) {
+                int i = i_min + ii;
+                double mx = static_cast<double>(x0 + i) * pinfo.px_x;
+                vec3<double> s1_raw = row_base + mx * pinfo.fast;
+                vec3<double> s1_n = s1_raw.normalize();
+                double cx = mx - (s1_n * pinfo.fast) * attenuation_length;
+                double cy = my - (s1_n * pinfo.slow) * attenuation_length;
+                vec3<double> sp = pinfo.origin + cx * pinfo.fast + cy * pinfo.slow;
+                vec3<double> ds = sp.normalize() * s1_len - s1;
+                gc_sub[static_cast<std::size_t>(jj * sub_nx + ii)] = vec2<double>(
+                    g_cent + (e1_scaled * ds),
+                    g_cent + (e2_scaled * ds)
+                );
+            }
+        }
+    } else {
+        vec2<double> shoebox_centroid_px = panel.get_ray_intersection_px(s1);
+        double attenuation_length = panel.attenuation_length(shoebox_centroid_px);
         for (int jj = 0; jj < sub_ny; ++jj) {
             int j = j_min + jj;
             for (int ii = 0; ii < sub_nx; ++ii) {
@@ -1608,106 +2674,207 @@ struct ThreadSafeTransformForward {
                 );
                 vec3<double> ds = sp.normalize() * s1_len - s1;
                 gc_sub[static_cast<std::size_t>(jj * sub_nx + ii)] = vec2<double>(
-                    grid_cent[2] + (e1 * ds) * inv_step2,
-                    grid_cent[1] + (e2 * ds) * inv_step1
+                    g_cent + (e1_scaled * ds),
+                    g_cent + (e2_scaled * ds)
                 );
             }
         }
+    }
 
-        dials::af::c_grid<2> grid_size2(grid_size[1], grid_size[2]);
+    dials::af::c_grid<2> grid_size2(g_dim, g_dim);
+    double* col_prof = scratch.col_prof.data();
+    double* col_bg = scratch.col_bg.data();
+    double* col_net = scratch.col_net.data();
+    const int* vkk = scratch.valid_kk_list;
+    int n_vkk = scratch.n_valid_kk;
 
-        if (use_bkgrd) {
-            for (int j = j_min; j <= j_max; ++j) {
-                if (y0 + j < 0 || y0 + j >= img_h) continue;
-                int jj_sub = j - j_min;
-                for (int i = i_min; i <= i_max; ++i) {
-                    if (x0 + i < 0 || x0 + i >= img_w) continue;
-                    std::size_t col_off = static_cast<std::size_t>(j) * stride_y + static_cast<std::size_t>(i);
-                    bool any_k = false;
-                    for (int k = 0; k < nz; ++k) {
-                        if ((smask[static_cast<std::size_t>(k) * stride_z + col_off] & fg_valid) == fg_valid) {
-                            any_k = true;
-                            break;
+    if (use_bkgrd && !compute_net) {
+        for (int j = j_min; j <= j_max; ++j) {
+            if (y0 + j < 0 || y0 + j >= img_h) continue;
+            int jj_sub = j - j_min;
+            for (int i = i_min; i <= i_max; ++i) {
+                if (x0 + i < 0 || x0 + i >= img_w) continue;
+                std::size_t col_off = static_cast<std::size_t>(j) * stride_y + static_cast<std::size_t>(i);
+                bool any_k = false;
+                for (int idx_kk = 0; idx_kk < n_vkk; ++idx_kk) {
+                    col_prof[idx_kk] = 0.0;
+                    col_bg[idx_kk] = 0.0;
+                }
+                for (int k = 0; k < nz; ++k) {
+                    std::size_t off = static_cast<std::size_t>(k) * stride_z + col_off;
+                    if ((smask[off] & fg_valid) == fg_valid) {
+                        any_k = true;
+                        double d_val = static_cast<double>(sdata[off]);
+                        double b_val = static_cast<double>(sbkgrd[off]);
+                        const double* zf_row = zf_ptr + static_cast<std::size_t>(k) * static_cast<std::size_t>(g_dim);
+                        for (int idx_kk = 0; idx_kk < n_vkk; ++idx_kk) {
+                            double zf = zf_row[vkk[idx_kk]];
+                            col_prof[idx_kk] += d_val * zf;
+                            col_bg[idx_kk] += b_val * zf;
                         }
                     }
-                    if (!any_k) continue;
+                }
+                if (!any_k) continue;
 
-                    int ii_sub = i - i_min;
-                    vert4 input(
-                        gc_sub[static_cast<std::size_t>(jj_sub * sub_nx + ii_sub)],
-                        gc_sub[static_cast<std::size_t>(jj_sub * sub_nx + ii_sub + 1)],
-                        gc_sub[static_cast<std::size_t>((jj_sub + 1) * sub_nx + ii_sub + 1)],
-                        gc_sub[static_cast<std::size_t>((jj_sub + 1) * sub_nx + ii_sub)]
-                    );
-                    int4 range = quad_grid_range(input, grid_size2);
-                    if (range[0] >= range[1] || range[2] >= range[3]) continue;
-                    double target_area = reverse_quad_inplace_if_backward(input);
-                    double inv_target_area = 1.0 / target_area;
+                int ii_sub = i - i_min;
+                vert4 input(
+                    gc_sub[static_cast<std::size_t>(jj_sub * sub_nx + ii_sub)],
+                    gc_sub[static_cast<std::size_t>(jj_sub * sub_nx + ii_sub + 1)],
+                    gc_sub[static_cast<std::size_t>((jj_sub + 1) * sub_nx + ii_sub + 1)],
+                    gc_sub[static_cast<std::size_t>((jj_sub + 1) * sub_nx + ii_sub)]
+                );
+                double q_xmin = std::min(std::min(input[0][0], input[1][0]), std::min(input[2][0], input[3][0]));
+                double q_xmax = std::max(std::max(input[0][0], input[1][0]), std::max(input[2][0], input[3][0]));
+                double q_ymin = std::min(std::min(input[0][1], input[1][1]), std::min(input[2][1], input[3][1]));
+                double q_ymax = std::max(std::max(input[0][1], input[1][1]), std::max(input[2][1], input[3][1]));
+                int ox0 = std::max(0, static_cast<int>(std::floor(q_xmin)));
+                int oy0 = std::max(0, static_cast<int>(std::floor(q_ymin)));
+                int ox1 = std::min(g_dim, static_cast<int>(std::ceil(q_xmax)));
+                int oy1 = std::min(g_dim, static_cast<int>(std::ceil(q_ymax)));
+                if (ox0 >= ox1 || oy0 >= oy1) continue;
+                double target_area = reverse_quad_inplace_if_backward(input);
+                double inv_target_area = 1.0 / target_area;
 
-                    for (int jj = range[2]; jj < range[3]; ++jj) {
-                        for (int ii = range[0]; ii < range[1]; ++ii) {
-                            double result_area = quad_grid_intersection_area(input, ii, jj);
-                            if (result_area > 0.0) {
-                                double fraction = result_area * inv_target_area;
-                                for (int k = 0; k < nz; ++k) {
-                                    std::size_t off = static_cast<std::size_t>(k) * stride_z + col_off;
-                                    if ((smask[off] & fg_valid) == fg_valid) {
-                                        double ivalue = static_cast<double>(sdata[off]) * fraction;
-                                        double bvalue = static_cast<double>(sbkgrd[off]) * fraction;
-                                        for (int kk = 0; kk < grid_size[0]; ++kk) {
-                                            double zf = zfraction(k, kk);
-                                            profile_(kk, jj, ii) += ivalue * zf;
-                                            background_(kk, jj, ii) += bvalue * zf;
-                                        }
-                                    }
-                                }
+                for (int jj = oy0; jj < oy1; ++jj) {
+                    for (int ii = ox0; ii < ox1; ++ii) {
+                        double result_area = quad_unit_square_intersection_area(
+                            input, ii, jj, q_xmin, q_xmax, q_ymin, q_ymax, target_area
+                        );
+                        if (result_area > 0.0) {
+                            double fraction = result_area * inv_target_area;
+                            std::size_t cell_off = static_cast<std::size_t>(jj) * g_stride_j + static_cast<std::size_t>(ii);
+                            for (int idx_kk = 0; idx_kk < n_vkk; ++idx_kk) {
+                                std::size_t idx3 = static_cast<std::size_t>(vkk[idx_kk]) * g_stride_k + cell_off;
+                                prof_ptr[idx3] += col_prof[idx_kk] * fraction;
+                                bg_ptr[idx3] += col_bg[idx_kk] * fraction;
                             }
                         }
                     }
                 }
             }
-        } else {
-            for (int j = j_min; j <= j_max; ++j) {
-                if (y0 + j < 0 || y0 + j >= img_h) continue;
-                int jj_sub = j - j_min;
-                for (int i = i_min; i <= i_max; ++i) {
-                    if (x0 + i < 0 || x0 + i >= img_w) continue;
-                    std::size_t col_off = static_cast<std::size_t>(j) * stride_y + static_cast<std::size_t>(i);
-                    bool any_k = false;
-                    for (int k = 0; k < nz; ++k) {
-                        if ((smask[static_cast<std::size_t>(k) * stride_z + col_off] & fg_valid) == fg_valid) {
-                            any_k = true;
-                            break;
+        }
+    } else if (use_bkgrd && compute_net) {
+        for (int j = j_min; j <= j_max; ++j) {
+            if (y0 + j < 0 || y0 + j >= img_h) continue;
+            int jj_sub = j - j_min;
+            for (int i = i_min; i <= i_max; ++i) {
+                if (x0 + i < 0 || x0 + i >= img_w) continue;
+                std::size_t col_off = static_cast<std::size_t>(j) * stride_y + static_cast<std::size_t>(i);
+                bool any_k = false;
+                for (int kk = 0; kk < g_dim; ++kk) {
+                    col_prof[kk] = 0.0;
+                    col_bg[kk] = 0.0;
+                    col_net[kk] = 0.0;
+                }
+                for (int k = 0; k < nz; ++k) {
+                    std::size_t off = static_cast<std::size_t>(k) * stride_z + col_off;
+                    if ((smask[off] & fg_valid) == fg_valid) {
+                        any_k = true;
+                        double d_val = static_cast<double>(sdata[off]);
+                        double b_val = static_cast<double>(sbkgrd[off]);
+                        double n_val = d_val - b_val;
+                        const double* zf_row = zf_ptr + static_cast<std::size_t>(k) * static_cast<std::size_t>(g_dim);
+                        for (int kk = 0; kk < g_dim; ++kk) {
+                            double zf = zf_row[kk];
+                            col_prof[kk] += d_val * zf;
+                            col_bg[kk] += b_val * zf;
+                            col_net[kk] += n_val * zf;
                         }
                     }
-                    if (!any_k) continue;
+                }
+                if (!any_k) continue;
 
-                    int ii_sub = i - i_min;
-                    vert4 input(
-                        gc_sub[static_cast<std::size_t>(jj_sub * sub_nx + ii_sub)],
-                        gc_sub[static_cast<std::size_t>(jj_sub * sub_nx + ii_sub + 1)],
-                        gc_sub[static_cast<std::size_t>((jj_sub + 1) * sub_nx + ii_sub + 1)],
-                        gc_sub[static_cast<std::size_t>((jj_sub + 1) * sub_nx + ii_sub)]
-                    );
-                    int4 range = quad_grid_range(input, grid_size2);
-                    if (range[0] >= range[1] || range[2] >= range[3]) continue;
-                    double target_area = reverse_quad_inplace_if_backward(input);
-                    double inv_target_area = 1.0 / target_area;
+                int ii_sub = i - i_min;
+                vert4 input(
+                    gc_sub[static_cast<std::size_t>(jj_sub * sub_nx + ii_sub)],
+                    gc_sub[static_cast<std::size_t>(jj_sub * sub_nx + ii_sub + 1)],
+                    gc_sub[static_cast<std::size_t>((jj_sub + 1) * sub_nx + ii_sub + 1)],
+                    gc_sub[static_cast<std::size_t>((jj_sub + 1) * sub_nx + ii_sub)]
+                );
+                double q_xmin = std::min(std::min(input[0][0], input[1][0]), std::min(input[2][0], input[3][0]));
+                double q_xmax = std::max(std::max(input[0][0], input[1][0]), std::max(input[2][0], input[3][0]));
+                double q_ymin = std::min(std::min(input[0][1], input[1][1]), std::min(input[2][1], input[3][1]));
+                double q_ymax = std::max(std::max(input[0][1], input[1][1]), std::max(input[2][1], input[3][1]));
+                int ox0 = std::max(0, static_cast<int>(std::floor(q_xmin)));
+                int oy0 = std::max(0, static_cast<int>(std::floor(q_ymin)));
+                int ox1 = std::min(g_dim, static_cast<int>(std::ceil(q_xmax)));
+                int oy1 = std::min(g_dim, static_cast<int>(std::ceil(q_ymax)));
+                if (ox0 >= ox1 || oy0 >= oy1) continue;
+                double target_area = reverse_quad_inplace_if_backward(input);
+                double inv_target_area = 1.0 / target_area;
 
-                    for (int jj = range[2]; jj < range[3]; ++jj) {
-                        for (int ii = range[0]; ii < range[1]; ++ii) {
-                            double result_area = quad_grid_intersection_area(input, ii, jj);
-                            if (result_area > 0.0) {
-                                double fraction = result_area * inv_target_area;
-                                for (int k = 0; k < nz; ++k) {
-                                    std::size_t off = static_cast<std::size_t>(k) * stride_z + col_off;
-                                    if ((smask[off] & fg_valid) == fg_valid) {
-                                        double value = (static_cast<double>(sdata[off]) - static_cast<double>(sbkgrd[off])) * fraction;
-                                        for (int kk = 0; kk < grid_size[0]; ++kk) {
-                                            profile_(kk, jj, ii) += value * zfraction(k, kk);
-                                        }
-                                    }
-                                }
+                for (int jj = oy0; jj < oy1; ++jj) {
+                    for (int ii = ox0; ii < ox1; ++ii) {
+                        double result_area = quad_unit_square_intersection_area(
+                            input, ii, jj, q_xmin, q_xmax, q_ymin, q_ymax, target_area
+                        );
+                        if (result_area > 0.0) {
+                            double fraction = result_area * inv_target_area;
+                            std::size_t cell_off = static_cast<std::size_t>(jj) * g_stride_j + static_cast<std::size_t>(ii);
+                            for (int kk = 0; kk < g_dim; ++kk) {
+                                std::size_t idx3 = static_cast<std::size_t>(kk) * g_stride_k + cell_off;
+                                prof_ptr[idx3] += col_prof[kk] * fraction;
+                                bg_ptr[idx3] += col_bg[kk] * fraction;
+                                net_ptr[idx3] += col_net[kk] * fraction;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        for (int j = j_min; j <= j_max; ++j) {
+            if (y0 + j < 0 || y0 + j >= img_h) continue;
+            int jj_sub = j - j_min;
+            for (int i = i_min; i <= i_max; ++i) {
+                if (x0 + i < 0 || x0 + i >= img_w) continue;
+                std::size_t col_off = static_cast<std::size_t>(j) * stride_y + static_cast<std::size_t>(i);
+                bool any_k = false;
+                for (int kk = 0; kk < g_dim; ++kk) {
+                    col_prof[kk] = 0.0;
+                }
+                for (int k = 0; k < nz; ++k) {
+                    std::size_t off = static_cast<std::size_t>(k) * stride_z + col_off;
+                    if ((smask[off] & fg_valid) == fg_valid) {
+                        any_k = true;
+                        double val = static_cast<double>(sdata[off]) - static_cast<double>(sbkgrd[off]);
+                        const double* zf_row = zf_ptr + static_cast<std::size_t>(k) * static_cast<std::size_t>(g_dim);
+                        for (int kk = 0; kk < g_dim; ++kk) {
+                            col_prof[kk] += val * zf_row[kk];
+                        }
+                    }
+                }
+                if (!any_k) continue;
+
+                int ii_sub = i - i_min;
+                vert4 input(
+                    gc_sub[static_cast<std::size_t>(jj_sub * sub_nx + ii_sub)],
+                    gc_sub[static_cast<std::size_t>(jj_sub * sub_nx + ii_sub + 1)],
+                    gc_sub[static_cast<std::size_t>((jj_sub + 1) * sub_nx + ii_sub + 1)],
+                    gc_sub[static_cast<std::size_t>((jj_sub + 1) * sub_nx + ii_sub)]
+                );
+                double q_xmin = std::min(std::min(input[0][0], input[1][0]), std::min(input[2][0], input[3][0]));
+                double q_xmax = std::max(std::max(input[0][0], input[1][0]), std::max(input[2][0], input[3][0]));
+                double q_ymin = std::min(std::min(input[0][1], input[1][1]), std::min(input[2][1], input[3][1]));
+                double q_ymax = std::max(std::max(input[0][1], input[1][1]), std::max(input[2][1], input[3][1]));
+                int ox0 = std::max(0, static_cast<int>(std::floor(q_xmin)));
+                int oy0 = std::max(0, static_cast<int>(std::floor(q_ymin)));
+                int ox1 = std::min(g_dim, static_cast<int>(std::ceil(q_xmax)));
+                int oy1 = std::min(g_dim, static_cast<int>(std::ceil(q_ymax)));
+                if (ox0 >= ox1 || oy0 >= oy1) continue;
+                double target_area = reverse_quad_inplace_if_backward(input);
+                double inv_target_area = 1.0 / target_area;
+
+                for (int jj = oy0; jj < oy1; ++jj) {
+                    for (int ii = ox0; ii < ox1; ++ii) {
+                        double result_area = quad_unit_square_intersection_area(
+                            input, ii, jj, q_xmin, q_xmax, q_ymin, q_ymax, target_area
+                        );
+                        if (result_area > 0.0) {
+                            double fraction = result_area * inv_target_area;
+                            std::size_t cell_off = static_cast<std::size_t>(jj) * g_stride_j + static_cast<std::size_t>(ii);
+                            for (int kk = 0; kk < g_dim; ++kk) {
+                                prof_ptr[static_cast<std::size_t>(kk) * g_stride_k + cell_off] += col_prof[kk] * fraction;
                             }
                         }
                     }
@@ -1715,9 +2882,171 @@ struct ThreadSafeTransformForward {
             }
         }
     }
+}
+
+// Exception-free 1D profile fitter over valid kk slices matching DIALS ProfileFitter<double> bit-for-bit
+inline bool fit_1d_noexcept_slices(
+    const double* c_full_or_compact,
+    const double* b_full_or_compact,
+    bool is_compact_slices,
+    const bool* mask1,
+    const int* valid_kk_list,
+    int n_valid_kk,
+    std::size_t g_stride_k,
+    const double* p_raw,
+    std::size_t sz,
+    double eps,
+    std::size_t max_iter,
+    ThreadTransformScratch& scratch,
+    double& out_intensity,
+    double& out_variance,
+    double& out_correlation)
+{
+    if (n_valid_kk <= 0) return false;
+    if (scratch.c_act.size() < sz) {
+        scratch.c_act.resize(sz);
+        scratch.b_act.resize(sz);
+        scratch.p_act.resize(sz);
+        scratch.cb_p.resize(sz);
+        scratch.p2.resize(sz);
+    }
+    double* c_act = scratch.c_act.data();
+    double* b_act = scratch.b_act.data();
+    double* p_act = scratch.p_act.data();
+    double* cb_p = scratch.cb_p.data();
+    double* p2 = scratch.p2.data();
+
+    std::size_t m = 0;
+    double sumd = 0.0;
+    double sumb = 0.0;
+    double sump = 0.0;
+    for (int idx_kk = 0; idx_kk < n_valid_kk; ++idx_kk) {
+        std::size_t full_off = static_cast<std::size_t>(valid_kk_list[idx_kk]) * g_stride_k;
+        std::size_t cb_off = is_compact_slices
+            ? (static_cast<std::size_t>(idx_kk) * g_stride_k)
+            : full_off;
+        const double* c_sl = c_full_or_compact + cb_off;
+        const double* b_sl = b_full_or_compact + cb_off;
+        const double* p_sl = p_raw + full_off;
+        const bool* m1_sl = mask1 + full_off;
+        for (std::size_t j = 0; j < g_stride_k; ++j) {
+            if (m1_sl[j]) {
+                double pj = p_sl[j];
+                if (pj < 0.0) return false;
+                double dj = c_sl[j];
+                double bj = b_sl[j];
+                c_act[m] = dj;
+                b_act[m] = bj;
+                p_act[m] = pj;
+                cb_p[m] = (dj - bj) * pj;
+                p2[m] = pj * pj;
+                sumd += dj;
+                sumb += bj;
+                sump += pj;
+                m++;
+            }
+        }
+    }
+    if (sumb < 0.0 || sumd < 0.0 || sump <= 0.0 || m == 0) return false;
+
+    double I0 = sumd - sumb;
+    double I = 0.0;
+    double V = 0.0;
+    std::size_t n_iter = 0;
+    for (; n_iter < max_iter; ++n_iter) {
+        double sum1 = 0.0;
+        double sum2 = 0.0;
+        for (std::size_t k = 0; k < m; ++k) {
+            double pk = p_act[k];
+            if (pk > 0.0) {
+                double v = 1e-10 + std::abs(b_act[k]) + std::abs(I0 * pk);
+                if (v <= 0.0) return false;
+                sum1 += cb_p[k] / v;
+                sum2 += p2[k] / v;
+            }
+        }
+        if (sum2 <= 0.0) return false;
+        I = sum1 / sum2;
+        V = std::abs(I) + std::abs(sumb);
+        if (std::abs(I - I0) < eps) break;
+        I0 = I;
+    }
+    if (n_iter >= max_iter) {
+        I = sumd - sumb;
+        V = std::abs(I) + std::abs(sumb);
+    }
+    if (!(V >= 0.0 && V >= I)) return false;
+
+    // Pearson correlation matching ProfileFitter::compute_correlation
+    double xb = 0.0, yb = 0.0;
+    for (std::size_t k = 0; k < m; ++k) {
+        xb += I * p_act[k] + b_act[k];
+        yb += c_act[k];
+    }
+    double inv_m = 1.0 / static_cast<double>(m);
+    xb *= inv_m;
+    yb *= inv_m;
+    double sdxdy = 0.0, sdx2 = 0.0, sdy2 = 0.0;
+    for (std::size_t k = 0; k < m; ++k) {
+        double dx = (I * p_act[k] + b_act[k]) - xb;
+        double dy = c_act[k] - yb;
+        sdxdy += dx * dy;
+        sdx2 += dx * dx;
+        sdy2 += dy * dy;
+    }
+    double corr = 0.0;
+    if (sdx2 > 0.0 && sdy2 > 0.0) {
+        corr = sdxdy / (std::sqrt(sdx2) * std::sqrt(sdy2));
+    }
+    out_intensity = I;
+    out_variance = V;
+    out_correlation = corr;
+    return true;
+}
+
+struct CachedTransformStore {
+    std::size_t n_total = 0;
+    std::size_t g_dim = 0;
+    std::size_t g_stride_k = 0;
+    std::vector<uint8_t> was_processed;
+    std::vector<uint32_t> valid_kk_mask;
+    std::vector<uint8_t> tid_of_r;
+    std::vector<uint32_t> slice_offset_of_r;
+    std::vector<std::vector<double>> thread_c_slices;
+    std::vector<std::vector<double>> thread_b_slices;
+
+    CachedTransformStore(std::size_t n, std::size_t gd)
+        : n_total(n),
+          g_dim(gd),
+          g_stride_k(gd * gd),
+          was_processed(n, 0),
+          valid_kk_mask(n, 0),
+          tid_of_r(n, 0),
+          slice_offset_of_r(n, 0),
+          thread_c_slices(20),
+          thread_b_slices(20)
+    {
+        std::size_t est_slices_per_thread = (n / 20 + 64) * 2;
+        for (int t = 0; t < 20; ++t) {
+            thread_c_slices[t].reserve(est_slices_per_thread * g_stride_k);
+            thread_b_slices[t].reserve(est_slices_per_thread * g_stride_k);
+        }
+    }
 };
 
+static std::mutex g_transform_cache_mtx;
+static std::unordered_map<std::size_t, std::shared_ptr<CachedTransformStore>> g_transform_caches;
+static std::size_t g_next_cache_id = 1;
+
+void free_transform_cache(std::size_t cache_id) {
+    std::lock_guard<std::mutex> lock(g_transform_cache_mtx);
+    g_transform_caches.erase(cache_id);
+}
+
 struct ParallelGaussianRS : public dials::algorithms::GaussianRSProfileModeller {
+    std::size_t get_half_grid_size() const {
+        return grid_size_;
+    }
     dials::af::shared<bool> fit_parallel_cols(
         dials::af::const_ref<Shoebox<ProfileFloatType>> sbox,
         const dials::af::const_ref<scitbx::vec3<double>>& s1,
@@ -1741,6 +3070,11 @@ struct ParallelGaussianRS : public dials::algorithms::GaussianRSProfileModeller 
         double sm = sigma_m_;
         double ns = n_sigma_;
         std::size_t hgs = grid_size_;
+        std::size_t g_dim = 2 * hgs + 1;
+        std::size_t g_stride_k = g_dim * g_dim;
+        std::size_t g_vol = g_dim * g_stride_k;
+
+        std::vector<PanelTransformInfo> panel_infos = extract_panel_transform_infos(detector_);
 
         std::size_t n_prof = size();
         std::vector<data_const_reference> prof_data(n_prof);
@@ -1759,7 +3093,8 @@ struct ParallelGaussianRS : public dials::algorithms::GaussianRSProfileModeller 
         bool* succ_ptr = success.begin();
 
         if (fit_method_ == ReciprocalSpace) {
-            parallel_for(n, [&](std::int64_t i) {
+            std::vector<ThreadTransformScratch> thread_scratch(20);
+            parallel_for(n, [&](std::int64_t i, int tid) {
                 intensity_val[i] = 0.0;
                 intensity_var[i] = -1.0;
                 reference_cor[i] = 0.0;
@@ -1767,32 +3102,47 @@ struct ParallelGaussianRS : public dials::algorithms::GaussianRSProfileModeller 
                 bool integrate = !(flags[i] & dials::af::DontIntegrate);
                 if (!integrate) return;
                 try {
-                    std::size_t index = sampler_->nearest(sbox[i].panel, xyzpx[i]);
+                    std::size_t p_idx = sbox[i].panel;
+                    std::size_t index = sampler_->nearest(p_idx, xyzpx[i]);
                     if (index >= n_prof || !prof_valid[index]) return;
                     data_const_reference p = prof_data[index];
                     mask_const_reference mask1 = prof_mask[index];
                     CoordinateSystem cs(m2, s0, s1[i], xyzmm[i][2]);
 
-                    ThreadSafeTransformForward transform(
-                        detector_[sbox[i].panel],
+                    auto& scratch = thread_scratch[tid];
+                    run_transform_forward_fast(
+                        detector_[p_idx],
+                        panel_infos[p_idx],
                         scan_index0, phi0, dphi, sb, sm, ns, hgs,
-                        cs, sbox[i], true
+                        cs, sbox[i], true, false, scratch
                     );
-
-                    data_const_reference c = transform.profile_.const_ref();
-                    data_const_reference b = transform.background_.const_ref();
-                    bool* m2_ptr = transform.mask_.begin();
-                    std::size_t m_sz = transform.mask_.size();
-                    for (std::size_t j = 0; j < m_sz; ++j) {
-                        m2_ptr[j] = mask1[j] && m2_ptr[j];
+                    if (scratch.n_valid_kk == 0 || !scratch.has_fg_pixels) {
+                        return;
                     }
 
-                    ProfileFitter<double> fit(c, b, transform.mask_.const_ref(), p, 1e-3, 100);
-                    intensity_val[i] = fit.intensity()[0];
-                    intensity_var[i] = fit.variance()[0];
-                    reference_cor[i] = fit.correlation();
-                    flags[i] |= dials::af::IntegratedPrf;
-                    succ_ptr[i] = true;
+                    double fit_i = 0.0, fit_v = -1.0, fit_c = 0.0;
+                    if (fit_1d_noexcept_slices(
+                            scratch.profile.data(),
+                            scratch.background.data(),
+                            false,
+                            mask1.begin(),
+                            scratch.valid_kk_list,
+                            scratch.n_valid_kk,
+                            g_stride_k,
+                            p.begin(),
+                            g_vol,
+                            1e-3,
+                            100,
+                            scratch,
+                            fit_i,
+                            fit_v,
+                            fit_c)) {
+                        intensity_val[i] = fit_i;
+                        intensity_var[i] = fit_v;
+                        reference_cor[i] = fit_c;
+                        flags[i] |= dials::af::IntegratedPrf;
+                        succ_ptr[i] = true;
+                    }
                 } catch (...) {
                     return;
                 }
@@ -1809,7 +3159,8 @@ struct ParallelGaussianRS : public dials::algorithms::GaussianRSProfileModeller 
         const dials::af::const_ref<scitbx::vec3<double>>& s1,
         const dials::af::const_ref<scitbx::vec3<double>>& xyzpx,
         const dials::af::const_ref<scitbx::vec3<double>>& xyzmm,
-        dials::af::ref<std::size_t> flags)
+        dials::af::ref<std::size_t> flags,
+        bool require_ref_spot = false)
     {
         using namespace dials::algorithms;
         using dials::model::Foreground;
@@ -1830,6 +3181,8 @@ struct ParallelGaussianRS : public dials::algorithms::GaussianRSProfileModeller 
         std::int64_t n = static_cast<std::int64_t>(sbox.size());
         if (n <= 0) return;
 
+        std::vector<PanelTransformInfo> panel_infos = extract_panel_transform_infos(detector_);
+
         std::size_t n_prof = data_.size();
         std::size_t prof_elems = accessor_.size_1d();
         int nt = num_worker_threads();
@@ -1844,6 +3197,7 @@ struct ParallelGaussianRS : public dials::algorithms::GaussianRSProfileModeller 
             static_cast<std::size_t>(nt),
             std::vector<std::size_t>(n_prof, 0)
         );
+        std::vector<ThreadTransformScratch> thread_scratch(static_cast<std::size_t>(nt));
 
         std::atomic<std::int64_t> next_idx{0};
         constexpr std::int64_t chunk = 16;
@@ -1851,19 +3205,22 @@ struct ParallelGaussianRS : public dials::algorithms::GaussianRSProfileModeller 
         auto worker = [&](int tid) {
             auto& loc_data = thread_data[static_cast<std::size_t>(tid)];
             auto& loc_n = thread_n_refl[static_cast<std::size_t>(tid)];
+            auto& scratch = thread_scratch[static_cast<std::size_t>(tid)];
             while (true) {
                 std::int64_t start = next_idx.fetch_add(chunk, std::memory_order_relaxed);
                 if (start >= n) break;
                 std::int64_t end = std::min(start + chunk, n);
                 for (std::int64_t i = start; i < end; ++i) {
+                    if (require_ref_spot && !(flags[i] & dials::af::ReferenceSpot)) continue;
                     bool full = partiality[i] > 0.99;
                     bool integrated = (flags[i] & dials::af::IntegratedSum) != 0;
                     if (!full || !integrated) continue;
-                    const auto& panel_obj = detector_[sbox[i].panel];
+                    std::size_t p_idx = sbox[i].panel;
+                    const PanelTransformInfo& pinfo = panel_infos[p_idx];
                     bool bbox_valid = (
                         sbox[i].bbox[0] >= 0 && sbox[i].bbox[2] >= 0 &&
-                        sbox[i].bbox[1] <= static_cast<int>(panel_obj.get_image_size()[0]) &&
-                        sbox[i].bbox[3] <= static_cast<int>(panel_obj.get_image_size()[1])
+                        sbox[i].bbox[1] <= pinfo.img_w &&
+                        sbox[i].bbox[3] <= pinfo.img_h
                     );
                     if (!bbox_valid) continue;
                     const uint8_t* m_ptr = sbox[i].mask.begin();
@@ -1879,23 +3236,28 @@ struct ParallelGaussianRS : public dials::algorithms::GaussianRSProfileModeller 
 
                     try {
                         CoordinateSystem cs(m2, s0, s1[i], xyzmm[i][2]);
-                        ThreadSafeTransformForward transform(
-                            panel_obj,
+                        run_transform_forward_fast(
+                            detector_[p_idx],
+                            pinfo,
                             scan_index0, phi0, dphi, sb, sm, ns, hgs,
-                            cs, sbox[i], false
+                            cs, sbox[i], false, false, scratch
                         );
+                        if (!scratch.has_fg_pixels) {
+                            flags[i] |= dials::af::UsedInModelling;
+                            continue;
+                        }
 
-                        const double* prof_ptr = transform.profile_.begin();
+                        const double* prof_ptr = scratch.profile.data();
                         double sum_data = 0.0;
                         for (std::size_t p_i = 0; p_i < prof_elems; ++p_i) {
                             sum_data += prof_ptr[p_i];
                         }
                         if (sum_data > 0.0) {
                             double inv_sum = 1.0 / sum_data;
-                            dials::af::shared<std::size_t> indices = sampler_->nearest_n(sbox[i].panel, xyzpx[i]);
+                            dials::af::shared<std::size_t> indices = sampler_->nearest_n(p_idx, xyzpx[i]);
                             for (std::size_t j = 0; j < indices.size(); ++j) {
                                 std::size_t idx = indices[j];
-                                double w = sampler_->weight(idx, sbox[i].panel, xyzpx[i]) * inv_sum;
+                                double w = sampler_->weight(idx, p_idx, xyzpx[i]) * inv_sum;
                                 auto& vec = loc_data[idx];
                                 if (vec.empty()) {
                                     vec.assign(prof_elems, 0.0);
@@ -1947,7 +3309,366 @@ struct ParallelGaussianRS : public dials::algorithms::GaussianRSProfileModeller 
             n_reflections_[idx] += tot_n;
         }
     }
+
+    void transform_and_model_slab_cols(
+        CachedTransformStore& store,
+        const dials::af::const_ref<std::size_t>& slab_ind,
+        dials::af::const_ref<Shoebox<ProfileFloatType>> sbox,
+        const dials::af::const_ref<double>& partiality,
+        const dials::af::const_ref<scitbx::vec3<double>>& s1,
+        const dials::af::const_ref<scitbx::vec3<double>>& xyzpx,
+        const dials::af::const_ref<scitbx::vec3<double>>& xyzmm,
+        dials::af::ref<std::size_t> flags)
+    {
+        using namespace dials::algorithms;
+        using dials::model::Foreground;
+        using dials::model::Valid;
+        using dials::algorithms::profile_model::gaussian_rs::CoordinateSystem;
+
+        if (fit_method_ != ReciprocalSpace) {
+            throw DIALS_ERROR("DetectorSpace not supported in single-pass slab cache");
+        }
+
+        scitbx::vec3<double> m2 = goniometer_.get_rotation_axis();
+        scitbx::vec3<double> s0 = beam_->get_s0();
+        int scan_index0 = scan_.get_array_range()[0];
+        scitbx::vec2<double> scan_osc = scan_.get_oscillation();
+        double phi0 = scan_osc[0];
+        double dphi = scan_osc[1];
+        double sb = sigma_b_;
+        double sm = sigma_m_;
+        double ns = n_sigma_;
+        std::size_t hgs = grid_size_;
+        std::size_t g_dim = 2 * hgs + 1;
+        std::size_t g_stride_k = g_dim * g_dim;
+
+        std::int64_t n = static_cast<std::int64_t>(sbox.size());
+        if (n <= 0) return;
+
+        std::vector<PanelTransformInfo> panel_infos = extract_panel_transform_infos(detector_);
+
+        std::size_t n_prof = data_.size();
+        std::size_t prof_elems = accessor_.size_1d();
+        int nt = num_worker_threads();
+        if (nt > n) nt = static_cast<int>(n);
+
+        std::vector<std::vector<std::vector<double>>> thread_data(
+            static_cast<std::size_t>(nt),
+            std::vector<std::vector<double>>(n_prof)
+        );
+        std::vector<std::vector<std::size_t>> thread_n_refl(
+            static_cast<std::size_t>(nt),
+            std::vector<std::size_t>(n_prof, 0)
+        );
+        std::vector<ThreadTransformScratch> thread_scratch(static_cast<std::size_t>(nt));
+
+        std::atomic<std::int64_t> next_idx{0};
+        constexpr std::int64_t chunk = 16;
+
+        auto worker = [&](int tid) {
+            auto& loc_data = thread_data[static_cast<std::size_t>(tid)];
+            auto& loc_n = thread_n_refl[static_cast<std::size_t>(tid)];
+            auto& scratch = thread_scratch[static_cast<std::size_t>(tid)];
+            auto& c_store = store.thread_c_slices[static_cast<std::size_t>(tid)];
+            auto& b_store = store.thread_b_slices[static_cast<std::size_t>(tid)];
+
+            while (true) {
+                std::int64_t start = next_idx.fetch_add(chunk, std::memory_order_relaxed);
+                if (start >= n) break;
+                std::int64_t end = std::min(start + chunk, n);
+                for (std::int64_t i = start; i < end; ++i) {
+                    std::size_t global_r = slab_ind[i];
+                    store.was_processed[global_r] = 1;
+                    std::size_t fl = flags[i];
+                    bool do_fit = (fl & dials::af::DontIntegrate) == 0;
+                    bool is_ref = ((fl & dials::af::ReferenceSpot) != 0)
+                                  && (partiality[i] > 0.99)
+                                  && ((fl & dials::af::IntegratedSum) != 0);
+                    std::size_t p_idx = sbox[i].panel;
+                    const PanelTransformInfo& pinfo = panel_infos[p_idx];
+                    if (is_ref) {
+                        bool bbox_valid = (
+                            sbox[i].bbox[0] >= 0 && sbox[i].bbox[2] >= 0 &&
+                            sbox[i].bbox[1] <= pinfo.img_w &&
+                            sbox[i].bbox[3] <= pinfo.img_h
+                        );
+                        if (!bbox_valid) {
+                            is_ref = false;
+                        } else {
+                            const uint8_t* m_ptr = sbox[i].mask.begin();
+                            std::size_t m_sz = sbox[i].mask.size();
+                            for (std::size_t k = 0; k < m_sz; ++k) {
+                                if ((m_ptr[k] & Foreground) && !(m_ptr[k] & Valid)) {
+                                    is_ref = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (!do_fit && !is_ref) continue;
+
+                    try {
+                        CoordinateSystem cs(m2, s0, s1[i], xyzmm[i][2]);
+                        run_transform_forward_fast(
+                            detector_[p_idx],
+                            pinfo,
+                            scan_index0, phi0, dphi, sb, sm, ns, hgs,
+                            cs, sbox[i], true, is_ref, scratch
+                        );
+                        if (!scratch.has_fg_pixels) {
+                            continue;
+                        }
+
+                        if (is_ref) {
+                            const double* net_ptr = scratch.net_profile.data();
+                            double sum_data = 0.0;
+                            for (std::size_t p_i = 0; p_i < prof_elems; ++p_i) {
+                                sum_data += net_ptr[p_i];
+                            }
+                            if (sum_data > 0.0) {
+                                double inv_sum = 1.0 / sum_data;
+                                dials::af::shared<std::size_t> indices = sampler_->nearest_n(p_idx, xyzpx[i]);
+                                for (std::size_t j = 0; j < indices.size(); ++j) {
+                                    std::size_t idx = indices[j];
+                                    double w = sampler_->weight(idx, p_idx, xyzpx[i]) * inv_sum;
+                                    auto& vec = loc_data[idx];
+                                    if (vec.empty()) {
+                                        vec.assign(prof_elems, 0.0);
+                                    }
+                                    for (std::size_t p_i = 0; p_i < prof_elems; ++p_i) {
+                                        vec[p_i] += w * net_ptr[p_i];
+                                    }
+                                    loc_n[idx]++;
+                                }
+                            }
+                        }
+
+                        if (do_fit && scratch.n_valid_kk > 0) {
+                            uint32_t sl_off = static_cast<uint32_t>(c_store.size() / g_stride_k);
+                            std::size_t add_elems = static_cast<std::size_t>(scratch.n_valid_kk) * g_stride_k;
+                            std::size_t old_sz = c_store.size();
+                            c_store.resize(old_sz + add_elems);
+                            b_store.resize(old_sz + add_elems);
+                            double* c_dst = c_store.data() + old_sz;
+                            double* b_dst = b_store.data() + old_sz;
+                            const double* prof_ptr = scratch.profile.data();
+                            const double* bg_ptr = scratch.background.data();
+                            for (int idx_kk = 0; idx_kk < scratch.n_valid_kk; ++idx_kk) {
+                                std::size_t kk_off = static_cast<std::size_t>(scratch.valid_kk_list[idx_kk]) * g_stride_k;
+                                std::memcpy(
+                                    c_dst + static_cast<std::size_t>(idx_kk) * g_stride_k,
+                                    prof_ptr + kk_off,
+                                    g_stride_k * sizeof(double)
+                                );
+                                std::memcpy(
+                                    b_dst + static_cast<std::size_t>(idx_kk) * g_stride_k,
+                                    bg_ptr + kk_off,
+                                    g_stride_k * sizeof(double)
+                                );
+                            }
+                            store.valid_kk_mask[global_r] = scratch.valid_kk_mask;
+                            store.tid_of_r[global_r] = static_cast<uint8_t>(tid);
+                            store.slice_offset_of_r[global_r] = sl_off;
+                        }
+                    } catch (...) {
+                        continue;
+                    }
+                }
+            }
+        };
+
+        std::vector<std::thread> pool;
+        pool.reserve(static_cast<std::size_t>(nt - 1));
+        for (int t = 1; t < nt; ++t) {
+            pool.emplace_back(worker, t);
+        }
+        worker(0);
+        for (auto& th : pool) {
+            th.join();
+        }
+
+        for (std::size_t idx = 0; idx < n_prof; ++idx) {
+            std::size_t tot_n = 0;
+            for (int t = 0; t < nt; ++t) {
+                tot_n += thread_n_refl[static_cast<std::size_t>(t)][idx];
+            }
+            if (tot_n == 0) continue;
+            if (data_[idx].size() == 0) {
+                data_[idx] = data_type(accessor_, 0.0);
+                mask_[idx] = mask_type(accessor_, true);
+            }
+            double* dst = data_[idx].begin();
+            for (int t = 0; t < nt; ++t) {
+                const auto& vec = thread_data[static_cast<std::size_t>(t)][idx];
+                if (!vec.empty()) {
+                    for (std::size_t p_i = 0; p_i < prof_elems; ++p_i) {
+                        dst[p_i] += vec[p_i];
+                    }
+                }
+            }
+            n_reflections_[idx] += tot_n;
+        }
+    }
+
+    dials::af::shared<bool> fit_from_cache_cols(
+        const CachedTransformStore& store,
+        const dials::af::const_ref<std::size_t>& panel,
+        const dials::af::const_ref<scitbx::vec3<double>>& xyzpx,
+        dials::af::ref<std::size_t> flags,
+        dials::af::ref<double> intensity_val,
+        dials::af::ref<double> intensity_var,
+        dials::af::ref<double> reference_cor) const
+    {
+        std::size_t hgs = grid_size_;
+        std::size_t g_dim = 2 * hgs + 1;
+        std::size_t g_stride_k = g_dim * g_dim;
+        std::size_t g_vol = g_dim * g_stride_k;
+
+        std::size_t n_prof = size();
+        std::vector<data_const_reference> prof_data(n_prof);
+        std::vector<mask_const_reference> prof_mask(n_prof);
+        std::vector<uint8_t> prof_valid(n_prof, 0);
+        for (std::size_t k = 0; k < n_prof; ++k) {
+            if (data_[k].size() != 0 && mask_[k].size() != 0) {
+                prof_data[k] = data_[k].const_ref();
+                prof_mask[k] = mask_[k].const_ref();
+                prof_valid[k] = 1;
+            }
+        }
+
+        std::int64_t n = static_cast<std::int64_t>(panel.size());
+        dials::af::shared<bool> success(panel.size(), false);
+        bool* succ_ptr = success.begin();
+
+        std::vector<ThreadTransformScratch> thread_scratch(20);
+        parallel_for(n, [&](std::int64_t i, int tid) {
+            if (!store.was_processed[static_cast<std::size_t>(i)]) {
+                return;
+            }
+            intensity_val[i] = 0.0;
+            intensity_var[i] = -1.0;
+            reference_cor[i] = 0.0;
+            flags[i] &= ~dials::af::IntegratedPrf;
+            if (flags[i] & dials::af::DontIntegrate) {
+                flags[i] |= dials::af::FailedDuringProfileFitting;
+                return;
+            }
+            uint32_t vmask = store.valid_kk_mask[static_cast<std::size_t>(i)];
+            if (vmask == 0) {
+                flags[i] |= dials::af::FailedDuringProfileFitting;
+                return;
+            }
+
+            try {
+                std::size_t index = sampler_->nearest(panel[i], xyzpx[i]);
+                if (index >= n_prof || !prof_valid[index]) {
+                    flags[i] |= dials::af::FailedDuringProfileFitting;
+                    return;
+                }
+                data_const_reference p = prof_data[index];
+                mask_const_reference mask1 = prof_mask[index];
+
+                auto& scratch = thread_scratch[tid];
+                int n_vkk = 0;
+                for (int kk = 0; kk < static_cast<int>(g_dim); ++kk) {
+                    if (vmask & (1u << kk)) {
+                        scratch.valid_kk_list[n_vkk++] = kk;
+                    }
+                }
+                uint8_t src_tid = store.tid_of_r[static_cast<std::size_t>(i)];
+                std::size_t byte_off = static_cast<std::size_t>(store.slice_offset_of_r[static_cast<std::size_t>(i)]) * g_stride_k;
+                const double* c_compact = store.thread_c_slices[src_tid].data() + byte_off;
+                const double* b_compact = store.thread_b_slices[src_tid].data() + byte_off;
+
+                double fit_i = 0.0, fit_v = -1.0, fit_c = 0.0;
+                if (fit_1d_noexcept_slices(
+                        c_compact,
+                        b_compact,
+                        true,
+                        mask1.begin(),
+                        scratch.valid_kk_list,
+                        n_vkk,
+                        g_stride_k,
+                        p.begin(),
+                        g_vol,
+                        1e-3,
+                        100,
+                        scratch,
+                        fit_i,
+                        fit_v,
+                        fit_c)) {
+                    intensity_val[i] = fit_i;
+                    intensity_var[i] = fit_v;
+                    reference_cor[i] = fit_c;
+                    flags[i] |= dials::af::IntegratedPrf;
+                    succ_ptr[i] = true;
+                } else {
+                    flags[i] |= dials::af::FailedDuringProfileFitting;
+                }
+            } catch (...) {
+                flags[i] |= dials::af::FailedDuringProfileFitting;
+                return;
+            }
+        });
+        return success;
+    }
+
+    dials::af::shared<bool> model_and_fit_circular_slab_cols(
+        std::size_t prof_begin,
+        std::size_t prof_end,
+        dials::af::const_ref<Shoebox<ProfileFloatType>> sbox,
+        const dials::af::const_ref<double>& partiality,
+        const dials::af::const_ref<scitbx::vec3<double>>& s1,
+        const dials::af::const_ref<scitbx::vec3<double>>& xyzpx,
+        const dials::af::const_ref<scitbx::vec3<double>>& xyzmm,
+        dials::af::ref<std::size_t> flags,
+        dials::af::ref<double> intensity_val,
+        dials::af::ref<double> intensity_var,
+        dials::af::ref<double> reference_cor)
+    {
+        model_parallel_cols(sbox, partiality, s1, xyzpx, xyzmm, flags, true);
+        std::size_t end_idx = std::min(prof_end, data_.size());
+        for (std::size_t idx = prof_begin; idx < end_idx; ++idx) {
+            if (data_[idx].size() != 0) {
+                finalize(idx);
+            }
+        }
+        return fit_parallel_cols(sbox, s1, xyzpx, xyzmm, flags, intensity_val, intensity_var, reference_cor);
+    }
+
+    void mark_finalized() {
+        set_finalized(true);
+    }
 };
+
+dials::af::shared<bool> parallel_model_and_fit_circular_slab(
+    dials::algorithms::MultiExpProfileModeller& fitter,
+    std::size_t prof_begin,
+    std::size_t prof_end,
+    dials::af::const_ref<Shoebox<ProfileFloatType>> sbox,
+    const dials::af::const_ref<double>& partiality,
+    const dials::af::const_ref<scitbx::vec3<double>>& s1,
+    const dials::af::const_ref<scitbx::vec3<double>>& xyzpx,
+    const dials::af::const_ref<scitbx::vec3<double>>& xyzmm,
+    dials::af::ref<std::size_t> flags,
+    dials::af::ref<double> intensity_val,
+    dials::af::ref<double> intensity_var,
+    dials::af::ref<double> reference_cor)
+{
+    DIALS_ASSERT(fitter.size() == 1);
+    auto* grs = dynamic_cast<dials::algorithms::GaussianRSProfileModeller*>(fitter[0].get());
+    DIALS_ASSERT(grs != nullptr);
+    return static_cast<ParallelGaussianRS*>(grs)->model_and_fit_circular_slab_cols(
+        prof_begin, prof_end, sbox, partiality, s1, xyzpx, xyzmm, flags, intensity_val, intensity_var, reference_cor
+    );
+}
+
+void mark_modeller_finalized(dials::algorithms::MultiExpProfileModeller& fitter) {
+    DIALS_ASSERT(fitter.size() == 1);
+    auto* grs = dynamic_cast<dials::algorithms::GaussianRSProfileModeller*>(fitter[0].get());
+    DIALS_ASSERT(grs != nullptr);
+    static_cast<ParallelGaussianRS*>(grs)->mark_finalized();
+}
 
 dials::af::shared<bool> parallel_fit_multi(
     const dials::algorithms::MultiExpProfileModeller& fitter,
@@ -1982,6 +3703,73 @@ void parallel_model_multi(
     DIALS_ASSERT(grs != nullptr);
     static_cast<ParallelGaussianRS*>(grs)->model_parallel_cols(
         sbox, partiality, s1, xyzpx, xyzmm, flags
+    );
+}
+
+std::size_t create_transform_cache(
+    const dials::algorithms::MultiExpProfileModeller& fitter,
+    std::size_t n_total)
+{
+    DIALS_ASSERT(fitter.size() == 1);
+    const auto* grs = dynamic_cast<const dials::algorithms::GaussianRSProfileModeller*>(fitter[0].get());
+    DIALS_ASSERT(grs != nullptr);
+    std::size_t half_grid_size = static_cast<const ParallelGaussianRS*>(grs)->get_half_grid_size();
+    std::size_t gd = 2 * half_grid_size + 1;
+    auto ptr = std::make_shared<CachedTransformStore>(n_total, gd);
+    std::lock_guard<std::mutex> lock(g_transform_cache_mtx);
+    std::size_t cid = g_next_cache_id++;
+    g_transform_caches[cid] = std::move(ptr);
+    return cid;
+}
+
+void parallel_transform_and_model_slab(
+    dials::algorithms::MultiExpProfileModeller& fitter,
+    std::size_t cache_id,
+    const dials::af::const_ref<std::size_t>& slab_ind,
+    dials::af::const_ref<Shoebox<ProfileFloatType>> sbox,
+    const dials::af::const_ref<double>& partiality,
+    const dials::af::const_ref<scitbx::vec3<double>>& s1,
+    const dials::af::const_ref<scitbx::vec3<double>>& xyzpx,
+    const dials::af::const_ref<scitbx::vec3<double>>& xyzmm,
+    dials::af::ref<std::size_t> flags)
+{
+    DIALS_ASSERT(fitter.size() == 1);
+    auto* grs = dynamic_cast<dials::algorithms::GaussianRSProfileModeller*>(fitter[0].get());
+    DIALS_ASSERT(grs != nullptr);
+    std::shared_ptr<CachedTransformStore> store;
+    {
+        std::lock_guard<std::mutex> lock(g_transform_cache_mtx);
+        auto it = g_transform_caches.find(cache_id);
+        DIALS_ASSERT(it != g_transform_caches.end());
+        store = it->second;
+    }
+    static_cast<ParallelGaussianRS*>(grs)->transform_and_model_slab_cols(
+        *store, slab_ind, sbox, partiality, s1, xyzpx, xyzmm, flags
+    );
+}
+
+dials::af::shared<bool> parallel_fit_from_cache(
+    const dials::algorithms::MultiExpProfileModeller& fitter,
+    std::size_t cache_id,
+    const dials::af::const_ref<std::size_t>& panel,
+    const dials::af::const_ref<scitbx::vec3<double>>& xyzpx,
+    dials::af::ref<std::size_t> flags,
+    dials::af::ref<double> intensity_val,
+    dials::af::ref<double> intensity_var,
+    dials::af::ref<double> reference_cor)
+{
+    DIALS_ASSERT(fitter.size() == 1);
+    const auto* grs = dynamic_cast<const dials::algorithms::GaussianRSProfileModeller*>(fitter[0].get());
+    DIALS_ASSERT(grs != nullptr);
+    std::shared_ptr<CachedTransformStore> store;
+    {
+        std::lock_guard<std::mutex> lock(g_transform_cache_mtx);
+        auto it = g_transform_caches.find(cache_id);
+        DIALS_ASSERT(it != g_transform_caches.end());
+        store = it->second;
+    }
+    return static_cast<const ParallelGaussianRS*>(grs)->fit_from_cache_cols(
+        *store, panel, xyzpx, flags, intensity_val, intensity_var, reference_cor
     );
 }
 
@@ -2044,7 +3832,7 @@ void compute_beam_divergence_variances(
                 if (col_v != 0.0) {
                     double px = static_cast<double>(x0 + static_cast<int>(i)) + 0.5;
                     scitbx::vec3<double> s1_px = panel.get_pixel_lab_coord(scitbx::vec2<double>(px, py));
-                    double angle = s1_px.angle(s1_cent);
+                    double angle = std::atan2(s1_px.cross(s1_cent).length(), s1_px * s1_cent);
                     sum_v_theta2 += col_v * (angle * angle);
                 }
             }
@@ -2462,6 +4250,136 @@ boost::python::tuple match_with_reference_indices(
     return boost::python::make_tuple(sind, oind);
 }
 
+struct ThreadPredVecs {
+    std::vector<cctbx::miller::index<>> hkl;
+    std::vector<std::size_t> panel;
+    std::vector<bool> enter;
+    std::vector<scitbx::vec3<double>> s1;
+    std::vector<scitbx::vec3<double>> xyz_px;
+    std::vector<scitbx::vec3<double>> xyz_mm;
+    std::vector<std::size_t> flags;
+};
+
+boost::python::tuple parallel_predict_scan_varying(
+    const dxtbx::model::BeamBase& beam,
+    const dxtbx::model::Detector& detector,
+    const dxtbx::model::Goniometer& goniometer,
+    const dxtbx::model::Scan& scan,
+    const cctbx::sgtbx::space_group_type& space_group_type,
+    double dmin,
+    std::size_t margin,
+    double padding,
+    const dials::af::const_ref<scitbx::mat3<double>>& A)
+{
+    using namespace dials::algorithms;
+    using dials::model::Ray;
+    using scitbx::vec2;
+    using scitbx::vec3;
+    using scitbx::mat3;
+    using scitbx::constants::pi;
+    using scitbx::math::r3_rotation::axis_and_angle_as_matrix;
+
+    DIALS_ASSERT(A.size() == static_cast<std::size_t>(scan.get_num_images() + 1));
+
+    vec2<int> array_range = scan.get_array_range();
+    double a0 = scan.get_oscillation_range()[0];
+    double a1 = scan.get_oscillation_range()[1];
+    int z0 = static_cast<int>(std::floor(scan.get_array_index_from_angle(a0 - padding * pi / 180.0) + 0.5));
+    int z1 = static_cast<int>(std::floor(scan.get_array_index_from_angle(a1 + padding * pi / 180.0) + 0.5));
+    const int offset = array_range[0];
+    std::int64_t n_frames = static_cast<std::int64_t>(std::max(0, z1 - z0));
+
+    vec3<double> m2 = goniometer.get_rotation_axis_datum();
+    vec3<double> s0 = beam.get_s0();
+    mat3<double> r_fixed = goniometer.get_fixed_rotation();
+    mat3<double> r_setting = goniometer.get_setting_rotation();
+    ScanVaryingRayPredictor predict_rays(s0, m2, array_range[0], scan.get_oscillation(), dmin);
+
+    cctbx::sgtbx::space_group sg_base = space_group_type.group();
+    std::vector<ThreadPredVecs> frame_preds(static_cast<std::size_t>(n_frames));
+    parallel_for(n_frames, [&](std::int64_t f_idx) {
+        int frame = z0 + static_cast<int>(f_idx);
+        int i = frame - offset;
+        if (i < 0) i = 0;
+        if (i >= static_cast<int>(A.size()) - 1) i = static_cast<int>(A.size()) - 2;
+
+        double phi_beg = scan.get_angle_from_array_index(frame);
+        double phi_end = scan.get_angle_from_array_index(frame + 1);
+        mat3<double> r_beg = axis_and_angle_as_matrix(m2, phi_beg);
+        mat3<double> r_end = axis_and_angle_as_matrix(m2, phi_end);
+        mat3<double> A1 = r_setting * r_beg * r_fixed * A[i];
+        mat3<double> A2 = r_setting * r_end * r_fixed * A[i + 1];
+
+        auto& out = frame_preds[static_cast<std::size_t>(f_idx)];
+        ReekeModel model(A1, A2, m2, -s0, -s0, dmin, static_cast<int>(margin));
+        mat3<std::size_t> perm = model.permutation();
+        vec2<int> p_lim = model.p_limits();
+        for (int p0 = p_lim[0]; p0 < p_lim[1]; ++p0) {
+            vec2<int> q_lim = model.q_limits(p0);
+            for (int q0 = q_lim[0]; q0 < q_lim[1]; ++q0) {
+                dials::af::small<vec2<int>, 2> r_lim = model.r_limits(p0, q0);
+                for (std::size_t ridx = 0; ridx < r_lim.size(); ++ridx) {
+                    for (int r0 = r_lim[ridx][0]; r0 < r_lim[ridx][1]; ++r0) {
+                        cctbx::miller::index<> pqr(p0, q0, r0);
+                        if (pqr.is_zero()) continue;
+                        cctbx::miller::index<> h = perm * pqr;
+                        if (h.is_zero() || sg_base.is_sys_absent(h)) continue;
+                        boost::optional<Ray> ray = predict_rays(h, A1, A2, frame, 1);
+                        if (ray) {
+                            auto impact = detector.try_get_ray_intersection(ray->s1);
+                            if (!impact) continue;
+                            std::size_t panel_idx = impact->first;
+                            vec2<double> mm = impact->second;
+                            vec2<double> px = detector[panel_idx].millimeter_to_pixel(mm);
+                            double f_obs = scan.get_array_index_from_angle(ray->angle);
+                            out.hkl.push_back(h);
+                            out.enter.push_back(ray->entering);
+                            out.s1.push_back(ray->s1);
+                            out.xyz_mm.push_back(vec3<double>(mm[0], mm[1], ray->angle));
+                            out.xyz_px.push_back(vec3<double>(px[0], px[1], f_obs));
+                            out.panel.push_back(panel_idx);
+                            out.flags.push_back(dials::af::Predicted);
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    std::size_t total = 0;
+    for (std::int64_t f_idx = 0; f_idx < n_frames; ++f_idx) {
+        total += frame_preds[static_cast<std::size_t>(f_idx)].hkl.size();
+    }
+
+    dials::af::shared<cctbx::miller::index<>> hkl_col(total, dials::af::init_functor_null<cctbx::miller::index<>>());
+    dials::af::shared<std::size_t> panel_col(total, dials::af::init_functor_null<std::size_t>());
+    dials::af::shared<bool> enter_col(total, dials::af::init_functor_null<bool>());
+    dials::af::shared<vec3<double>> s1_col(total, dials::af::init_functor_null<vec3<double>>());
+    dials::af::shared<vec3<double>> xyz_px_col(total, dials::af::init_functor_null<vec3<double>>());
+    dials::af::shared<vec3<double>> xyz_mm_col(total, dials::af::init_functor_null<vec3<double>>());
+    dials::af::shared<std::size_t> flags_col(total, dials::af::init_functor_null<std::size_t>());
+    dials::af::shared<int> id_col(total, 0);
+
+    std::size_t pos = 0;
+    for (std::int64_t f_idx = 0; f_idx < n_frames; ++f_idx) {
+        const auto& fp = frame_preds[static_cast<std::size_t>(f_idx)];
+        std::size_t m = fp.hkl.size();
+        for (std::size_t k = 0; k < m; ++k) {
+            hkl_col[pos] = fp.hkl[k];
+            panel_col[pos] = fp.panel[k];
+            enter_col[pos] = fp.enter[k];
+            s1_col[pos] = fp.s1[k];
+            xyz_px_col[pos] = fp.xyz_px[k];
+            xyz_mm_col[pos] = fp.xyz_mm[k];
+            flags_col[pos] = fp.flags[k];
+            pos++;
+        }
+    }
+    return boost::python::make_tuple(
+        hkl_col, panel_col, enter_col, s1_col, xyz_px_col, xyz_mm_col, flags_col, id_col
+    );
+}
+
 } // namespace dials_gpu
 
 BOOST_PYTHON_MODULE(_shoebox_pack_ext)
@@ -2471,6 +4389,8 @@ BOOST_PYTHON_MODULE(_shoebox_pack_ext)
     def("fill_glm_constant3d_bg", &dials_gpu::fill_glm_constant3d_bg);
     def("extract_glm_constant3d_hist", &dials_gpu::extract_glm_constant3d_hist);
     def("fill_glm_constant3d_tail", &dials_gpu::fill_glm_constant3d_tail);
+    def("compute_glm_constant3d_fast", &dials_gpu::compute_glm_constant3d_fast);
+    def("compute_glm_constant2d_fast", &dials_gpu::compute_glm_constant2d_fast);
     def("unpack_constant3d_bg_and_mask", &dials_gpu::unpack_constant3d_bg_and_mask);
     def("extract_simple_constant3d_bg", &dials_gpu::extract_simple_constant3d_bg);
     def("get_shoebox_shapes", &dials_gpu::get_shoebox_shapes);
@@ -2479,9 +4399,11 @@ BOOST_PYTHON_MODULE(_shoebox_pack_ext)
     def("count_foreground_pixels", &dials_gpu::count_foreground_pixels);
     def("fill_foreground_pixels", &dials_gpu::fill_foreground_pixels);
     def("extract_centroid_moments", &dials_gpu::extract_centroid_moments);
+    def("compute_centroid_fast", &dials_gpu::compute_centroid_fast);
     def("extract_summation_stats", &dials_gpu::extract_summation_stats);
     def("fill_summation_fg_pixels", &dials_gpu::fill_summation_fg_pixels);
     def("extract_summation_totals", &dials_gpu::extract_summation_totals);
+    def("compute_summation_fast", &dials_gpu::compute_summation_fast);
     def("extract_shoeboxes_from_volume", &dials_gpu::extract_shoeboxes_from_volume);
     def("extract_wide_shoeboxes_slice_from_volume", &dials_gpu::extract_wide_shoeboxes_slice_from_volume);
     def("parallel_compute_mask", &dials_gpu::parallel_compute_mask);
@@ -2490,12 +4412,20 @@ BOOST_PYTHON_MODULE(_shoebox_pack_ext)
     def("parallel_compute_bbox_3d_fast", &dials_gpu::parallel_compute_bbox_3d_fast);
     def("parallel_pre_background_mask_flags", &dials_gpu::parallel_pre_background_mask_flags);
     def("parallel_post_mask_counts", &dials_gpu::parallel_post_mask_counts);
+    def("parallel_deallocate_shoeboxes", &dials_gpu::parallel_deallocate_shoeboxes);
     def("parallel_check_overloads_single_panel", &dials_gpu::parallel_check_overloads_single_panel);
     def("parallel_fit_multi", &dials_gpu::parallel_fit_multi);
     def("parallel_model_multi", &dials_gpu::parallel_model_multi);
+    def("create_transform_cache", &dials_gpu::create_transform_cache);
+    def("free_transform_cache", &dials_gpu::free_transform_cache);
+    def("parallel_transform_and_model_slab", &dials_gpu::parallel_transform_and_model_slab);
+    def("parallel_fit_from_cache", &dials_gpu::parallel_fit_from_cache);
+    def("parallel_model_and_fit_circular_slab", &dials_gpu::parallel_model_and_fit_circular_slab);
+    def("mark_modeller_finalized", &dials_gpu::mark_modeller_finalized);
     def("compute_beam_divergence_variances", &dials_gpu::compute_beam_divergence_variances);
     def("count_extended_sigma_m_frames", &dials_gpu::count_extended_sigma_m_frames);
     def("fill_extended_sigma_m_frames", &dials_gpu::fill_extended_sigma_m_frames);
     def("parallel_mask_neighbouring", &dials_gpu::parallel_mask_neighbouring);
     def("match_with_reference_indices", &dials_gpu::match_with_reference_indices);
+    def("parallel_predict_scan_varying", &dials_gpu::parallel_predict_scan_varying);
 }

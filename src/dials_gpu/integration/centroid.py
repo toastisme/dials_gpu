@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dxtbx.flumpy as flumpy
 import numpy as np
 import torch
 
@@ -31,8 +32,84 @@ def compute_centroid_gpu(
     if n_refl == 0:
         return
 
-    dev = _get_device(device)
     shoeboxes = reflections["shoebox"]
+    if hasattr(_shoebox_pack_ext, "compute_centroid_fast"):
+        has_single_panel_px2mm = (
+            len(experiments) == 1
+            and experiments[0].detector is not None
+            and len(experiments[0].detector) == 1
+            and experiments[0].detector[0].get_px_mm_strategy().name()
+            in ("SimplePxMmStrategy", "ParallaxCorrectedPxMmStrategy")
+            and tuple(experiments[0].detector[0].get_raw_image_offset()) == (0, 0)
+            and (
+                experiments[0].scan is None
+                or not experiments[0].scan.has_property("time_of_flight")
+            )
+        )
+        if has_single_panel_px2mm:
+            panel = experiments[0].detector[0]
+            scan = experiments[0].scan
+            px_x, px_y = panel.get_pixel_size()
+            if scan is None or not scan.has_property("oscillation"):
+                osc0, osc_w, arr0 = 0.0, 0.0, 0.0
+            else:
+                osc0, osc_w = scan.get_oscillation(deg=False)
+                arr0 = float(scan.get_array_range()[0])
+            strat = panel.get_px_mm_strategy()
+            if strat.name() == "ParallaxCorrectedPxMmStrategy":
+                px2mm_mode = 1
+                mu = float(strat.mu())
+                t0 = float(strat.t0())
+            else:
+                px2mm_mode = 0
+                mu = 0.0
+                t0 = 0.0
+            px_pos, px_var, mm_pos, mm_var = _shoebox_pack_ext.compute_centroid_fast(
+                shoeboxes,
+                MASK_FG_VALID,
+                MASK_OVERLAPPED,
+                True,
+                px2mm_mode,
+                float(px_x),
+                float(px_y),
+                mu,
+                t0,
+                panel.get_fast_axis(),
+                panel.get_slow_axis(),
+                panel.get_origin(),
+                float(osc0),
+                float(osc_w),
+                float(arr0),
+            )
+            reflections["xyzobs.px.value"] = px_pos
+            reflections["xyzobs.px.variance"] = px_var
+            reflections["xyzobs.mm.value"] = mm_pos
+            reflections["xyzobs.mm.variance"] = mm_var
+            return
+        else:
+            px_pos, px_var = _shoebox_pack_ext.compute_centroid_fast(
+                shoeboxes,
+                MASK_FG_VALID,
+                MASK_OVERLAPPED,
+                False,
+                0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                (1.0, 0.0, 0.0),
+                (0.0, 1.0, 0.0),
+                (0.0, 0.0, 0.0),
+                0.0,
+                0.0,
+                0.0,
+            )
+            reflections["xyzobs.px.value"] = px_pos
+            reflections["xyzobs.px.variance"] = px_var
+            reflections.centroid_px_to_mm(experiments)
+            return
+
+    dev = _get_device(device)
     bbox_np = np.column_stack([p.as_numpy_array() for p in reflections["bbox"].parts()])
 
     fg_counts = np.empty(n_refl, dtype=np.int64)
