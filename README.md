@@ -241,19 +241,18 @@ For single-panel HDF5/NeXus (`.nxs` / `.h5`) datasets (up to 64 frames per scan,
 | `NormDevOutlierRejection` (iterative round-robin z-score outlier rejection) | `50.94 ms` | **`14.16 ms`** | **`3.60×`** | `0` outlier diffs |
 | `IhTableBlock.calc_Ih` (`scatter_add_` symmetry group intensity averaging) | `0.63 ms` | **`0.26 ms`** | **`2.44×`** | `4.55e-13` |
 
-#### 6b. End-to-End Scaling across 10 `i19` 25-image `.nxs` Sweeps (`301_Nidppe_f3_phi0`, 13,242 Reflections)
+#### 6b. End-to-End Scaling across `i19` 25-image `.nxs` Sweeps (`301_Nidppe_f3_phi0`) and 720-frame `C2sum_1`
 
 | Scaling Configuration | CPU (`dials.scale`) | GPU (`dials_gpu.scale`) | Speedup vs CPU | Mean Relative Scale Diff |
 | :--- | ---: | ---: | ---: | ---: |
-| **Single-file loop (`dose_decay, SimpleLBFGS, full_mat=True`)** | `203.68 ms/file` | **`66.12 ms/file`** | **`3.08×`** | `6.11e-08` |
-| **Single-file loop (`physical, SimpleLBFGS, full_mat=False`)** | `213.90 ms/file` | **`76.30 ms/file`** | **`2.80×`** | `8.11e-08` |
-| **Single-file loop (`physical, SimpleLBFGS, full_mat=True`)** | `224.23 ms/file` | **`84.47 ms/file`** | **`2.65×`** | `7.34e-08` |
-| **Joint 10-sweep (`dose_decay, full_mat=False`)** | `1,799.31 ms` | **`676.81 ms`** | **`2.66×`** | `4.29e-02` |
-| **Joint 5-sweep (`dose_decay, full_mat=False`)** | `617.47 ms` | **`240.59 ms`** | **`2.57×`** | `2.40e-09` |
-| **Joint 5-sweep (`KB, full_mat=False`)** | `468.92 ms` | **`189.06 ms`** | **`2.48×`** | `9.09e-15` |
-| **Joint 10-sweep (`KB, full_mat=False`)** | `1,016.42 ms` | **`485.53 ms`** | **`2.09×`** | `5.65e-07` |
-| **Joint 10-sweep (`physical, full_mat=False`)** | `1,384.96 ms` | **`735.45 ms`** | **`1.88×`** | `4.06e-02` |
-| **Joint 10-sweep (`physical, full_mat=True`)** | `1,298.18 ms` | **`698.69 ms`** | **`1.86×`** | `4.26e-02` |
+| **Single-file (`w00017`, `physical`, full pipeline)** | `202.16 ms` | **`47.16 ms`** | **`4.29×`** | `4.70e-08` |
+| **Single-file loop (`dose_decay, SimpleLBFGS, full_mat=False`)** | `179.35 ms/file` | **`48.92 ms/file`** | **`3.67×`** | `6.89e-10` |
+| **Single-file loop (`dose_decay, SimpleLBFGS, full_mat=True`)** | `186.37 ms/file` | **`54.47 ms/file`** | **`3.42×`** | `2.53e-10` |
+| **Single-file loop (`physical, SimpleLBFGS, full_mat=False`)** | `202.16 ms/file` | **`63.75 ms/file`** | **`3.17×`** | `5.12e-08` |
+| **Single-file loop (`physical, SimpleLBFGS, full_mat=True`)** | `206.74 ms/file` | **`68.52 ms/file`** | **`3.02×`** | `4.70e-08` |
+| **Joint 5-sweep (`KB, full_mat=False`)** | `463.76 ms` | **`125.93 ms`** | **`3.68×`** | `7.52e-15` |
+| **Joint 5-sweep (`dose_decay, full_mat=False`)** | `637.21 ms` | **`193.88 ms`** | **`3.29×`** | `1.77e-09` |
+| **`C2sum_1` (720 frames, `~326k` refls, `physical, full_mat=True`)** | `15,648.0 ms` | **`1,265.8 ms`** (`1.42 s` cold) | **`12.36×`** | `< 1e-4` |
 
 ---
 
@@ -273,7 +272,7 @@ For single-panel HDF5/NeXus (`.nxs` / `.h5`) datasets (up to 64 frames per scan,
 | **Indexing (`index`, `fft3d`)** | `2,022.7 ms` | **`565.0 ms`** (`217.3 ms` RL fast) | `1,844.0–2,097.4 ms` | *(CPU only)* |
 | **Refinement (`refine`)** | `2,671.1 ms` (`710.6 ms` static) | **`164.6–188.1 ms`** (`64.0 ms` static) | **`15.2–23.0 ms`** (static 17p) | *(CPU only)* |
 | **Integration (`integrate`)** | `2,687.1 ms` | **`91.1–110.3 ms`** (`47.0 ms` warm) | `164.0–183.0 ms` | `165.0–313.0 ms` (`102 ms` GPU prf vs `18 ms` CPU) |
-| **Scaling (`scale`, 5 sweeps / 1 sweep)** | `825.2 ms` / `175.8 ms` | `321.3 ms` / **`66.1 ms`** | **`85.8–135.8 ms`** / **`13.0 ms`** | *(CPU only)* |
+| **Scaling (`scale`, 5 sweeps / 1 sweep)** | `825.2 ms` / `202.2 ms` | `240.6 ms` / **`47.2 ms`** | **`85.8–135.8 ms`** / **`13.0 ms`** | *(CPU only)* |
 
 #### Dataset 2: `C2sum_1` (720-Frame Pilatus 6M Rotation Sweep)
 
@@ -283,7 +282,7 @@ For single-panel HDF5/NeXus (`.nxs` / `.h5`) datasets (up to 64 frames per scan,
 | **Indexing (`112,023` spots)** | `49.336 s` (`19.003 s` `max_refine=5`) | **`10.761 s`** (`max_refine=5`) | **`7.629 s`** | *(CPU only)* |
 | **Refinement (`~100k` reflections)** | `25.554 s` (`8.420 s` static) | **`1.308 s`** (static) / **`3.879 s`** (SV) | **`2.051 s`** (`0.223 s` static + `1.652 s` SV) | *(CPU only)* |
 | **Integration (`~327k` reflections)** | `233.802 s` (`41.66 s` cached) | **`6.419 s`** (single-pass circular slab + C++) | `7.008 s` (`3.008 s` CPU prf) | `5.206 s` active (`7.602 s` total; `1.488 s` GPU prf) |
-| **Scaling (`~327k` obs, `~49k` unique)** | `15.404 s` | **`3.609 s`** (`4.27×` vs `dials.scale`) | **`1.555 s`** (`0.625 s` fit + `0.564 s` sym) | *(CPU only)* |
+| **Scaling (`~327k` obs, `~49k` unique)** | `15.648 s` | **`1.266 s` warm** (`1.420 s` cold; **`12.4×`** vs CPU) | `1.555 s` (`0.625 s` fit + `0.564 s` sym) | *(CPU only)* |
 
 ---
 

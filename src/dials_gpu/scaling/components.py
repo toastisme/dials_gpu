@@ -132,8 +132,15 @@ def _get_smoother_1d_weights_gpu(
     idx = torch.arange(nvalues, dtype=torch.int64, device=device)[None, :]
     mask = (idx >= i1[:, None]) & (idx < i2[:, None])
     ds = (z[:, None] - positions[None, :]) / sigma
-    weight = torch.where(mask, torch.exp(-(ds * ds)), torch.zeros_like(ds))
-    sumweight = weight.sum(dim=1)
+    if device.type == "cpu":
+        ds_np = ds.numpy()
+        exp_t = torch.from_numpy(np.exp(-(ds_np * ds_np)))
+    else:
+        exp_t = torch.exp(-(ds * ds))
+    weight = torch.where(mask, exp_t, torch.zeros_like(ds))
+    sumweight = torch.zeros_like(z)
+    for k in range(nvalues):
+        sumweight = sumweight + weight[:, k]
     safe_sw = torch.where(sumweight > 0.0, sumweight, torch.ones_like(sumweight))
     inv_sw = torch.where(sumweight > 0.0, 1.0 / safe_sw, torch.zeros_like(sumweight))
 
@@ -142,8 +149,8 @@ def _get_smoother_1d_weights_gpu(
     else:
         dv_dp = weight * inv_sw[:, None]
 
-    smoother._gpu_weight_cache = (key, x_gpu, weight, inv_sw, dv_dp)
-    return weight, inv_sw, dv_dp
+    smoother._gpu_weight_cache = (key, x_gpu, weight, safe_sw, dv_dp)
+    return weight, safe_sw, dv_dp
 
 
 def eval_smoother_1d_gpu(
@@ -166,9 +173,11 @@ def eval_smoother_1d_gpu(
             else None,
         )
 
-    weight, inv_sw, dv_dp = _get_smoother_1d_weights_gpu(smoother, x_gpu, first_fixed)
-    sumwv = torch.mv(weight, values_gpu[:nvalues])
-    value = sumwv * inv_sw
+    weight, safe_sw, dv_dp = _get_smoother_1d_weights_gpu(smoother, x_gpu, first_fixed)
+    sumwv = torch.zeros_like(safe_sw)
+    for k in range(nvalues):
+        sumwv = sumwv + weight[:, k] * values_gpu[k]
+    value = torch.where(safe_sw > 0.0, sumwv / safe_sw, torch.zeros_like(safe_sw))
 
     if not compute_derivatives:
         return value, None
@@ -511,10 +520,245 @@ def _get_cached_block_tensor(
     return cache[block_id][1]
 
 
+def _get_param_tensor(component, flex_params, device: torch.device) -> torch.Tensor:
+    """Return a 1D float64 tensor for `flex_params` on `device`, reusing zero-copy CPU views when possible."""
+    if device.type == "cpu":
+        cache = getattr(component, "_gpu_cpu_param_cache", None)
+        if cache is not None and cache[0] is flex_params:
+            return cache[1]
+        t = torch.from_numpy(flumpy.to_numpy(flex_params))
+        component._gpu_cpu_param_cache = (flex_params, t)
+        return t
+    return torch.from_numpy(flumpy.to_numpy(flex_params)).to(
+        device=device, dtype=torch.float64
+    )
+
+
+def eval_sph_harm_dense_gpu(
+    s0c_flex,
+    s1c_flex,
+    lmax: int,
+    quantize: bool = False,
+    device: torch.device | str | None = None,
+) -> torch.Tensor:
+    """Evaluate real spherical harmonics (N_refl, n_params) on GPU/CPU matching
+    C++ `create_sph_harm_table` (when quantize=False) or `create_sph_harm_lookup_table`
+    with points_per_degree=2 (when quantize=True) to ~1e-15."""
+    s0_np = flumpy.to_numpy(s0c_flex).reshape(-1, 3)
+    s1_np = flumpy.to_numpy(s1c_flex).reshape(-1, 3)
+    n_refl = s0_np.shape[0]
+    n_params = int(lmax * (lmax + 2))
+    dev = _get_minimization_device(n_refl, device)
+    if n_refl == 0 or n_params == 0:
+        return torch.empty((n_refl, n_params), dtype=torch.float64, device=dev)
+
+    s0_xyz = torch.from_numpy(np.ascontiguousarray(s0_np, dtype=np.float64)).to(
+        device=dev
+    )
+    s1_xyz = torch.from_numpy(np.ascontiguousarray(s1_np, dtype=np.float64)).to(
+        device=dev
+    )
+
+    def _get_tp(xyz: torch.Tensor):
+        x, y, z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
+        theta = torch.atan2(torch.sqrt(x * x + y * y), z)
+        phi = torch.fmod(torch.atan2(y, x) + (2.0 * math.pi), 2.0 * math.pi)
+        if quantize:
+            idx = 720 * torch.floor(theta * (360.0 / math.pi)).to(
+                torch.int64
+            ) + torch.floor(phi * (360.0 / math.pi)).to(torch.int64)
+            theta = torch.floor(idx.to(torch.float64) / 720.0) * (math.pi / 360.0)
+            phi = (idx % 720).to(torch.float64) * (math.pi / 360.0)
+        return theta, phi
+
+    t0, p0 = _get_tp(s0_xyz)
+    t1, p1 = _get_tp(s1_xyz)
+    x0, x1 = torch.cos(t0), torch.cos(t1)
+    s_0 = torch.sqrt(torch.clamp((1.0 - x0) * (1.0 + x0), min=0.0))
+    s_1 = torch.sqrt(torch.clamp((1.0 - x1) * (1.0 + x1), min=0.0))
+
+    P0 = {}
+    P1 = {}
+    for m in range(lmax + 1):
+        if m == 0:
+            pmm0 = torch.ones_like(x0)
+            pmm1 = torch.ones_like(x1)
+        else:
+            fact = 2.0 * m - 1.0
+            pmm0 = -P0[(m - 1, m - 1)] * fact * s_0
+            pmm1 = -P1[(m - 1, m - 1)] * fact * s_1
+        P0[(m, m)] = pmm0
+        P1[(m, m)] = pmm1
+        if m + 1 <= lmax:
+            P0[(m + 1, m)] = x0 * (2 * m + 1) * pmm0
+            P1[(m + 1, m)] = x1 * (2 * m + 1) * pmm1
+        for l in range(m + 2, lmax + 1):
+            P0[(l, m)] = (
+                x0 * (2 * l - 1) * P0[(l - 1, m)] - (l + m - 1) * P0[(l - 2, m)]
+            ) / (l - m)
+            P1[(l, m)] = (
+                x1 * (2 * l - 1) * P1[(l - 1, m)] - (l + m - 1) * P1[(l - 2, m)]
+            ) / (l - m)
+
+    sqrt2 = 1.414213562
+    cols = []
+    for l in range(1, lmax + 1):
+        for m in range(-l, l + 1):
+            am = abs(m)
+            norm = math.sqrt(
+                (2.0 * l + 1.0)
+                / (4.0 * math.pi)
+                * math.factorial(l - am)
+                / math.factorial(l + am)
+            )
+            plm0 = norm * P0[(l, am)]
+            plm1 = norm * P1[(l, am)]
+            if m < 0:
+                pref = sqrt2 * ((-1.0) ** m) / 2.0
+                val = pref * (plm0 * torch.sin(am * p0) + plm1 * torch.sin(am * p1))
+            elif m == 0:
+                val = 0.5 * (plm0 + plm1)
+            else:
+                pref = sqrt2 * ((-1.0) ** m) / 2.0
+                val = pref * (plm0 * torch.cos(am * p0) + plm1 * torch.cos(am * p1))
+            cols.append(val)
+    return torch.stack(cols, dim=1)
+
+
+class SHScaleComponentGPU(SHScaleComponent):
+    """GPU-accelerated SHScaleComponent storing a dense (N_refl, n_params) harmonic
+    array/tensor directly instead of scitbx.sparse.matrix or lookup tables."""
+
+    def update_reflection_data(self, selection=None, block_selections=None):
+        if getattr(self, "_mode", None) != "gpu_dense":
+            return super().update_reflection_data(selection, block_selections)
+
+        full_t = getattr(self, "_gpu_full_sh_tensor", None)
+        full_np = self._gpu_full_sh_np
+        dev = full_t.device if full_t is not None else torch.device("cpu")
+
+        if selection is not None:
+            sel_np = flumpy.to_numpy(selection)
+            if full_t is not None and dev.type == "cuda":
+                sel_t = torch.from_numpy(np.ascontiguousarray(sel_np)).to(device=dev)
+                b_t = full_t[sel_t]
+                self._gpu_block_sh_tensors = [b_t]
+                self._n_refl = [int(b_t.shape[0])]
+            else:
+                b_np = full_np[sel_np]
+                self._gpu_block_sh_tensors = [torch.from_numpy(b_np)]
+                self._n_refl = [int(b_np.shape[0])]
+        elif block_selections is not None:
+            # Check if single block selection is 0..N-1 (as in expand_scales_to_all_reflections)
+            if (
+                len(block_selections) == 1
+                and len(block_selections[0]) == full_np.shape[0]
+            ):
+                sel0_np = flumpy.to_numpy(block_selections[0])
+                if sel0_np.size == 0 or (
+                    sel0_np[0] == 0
+                    and sel0_np[-1] == full_np.shape[0] - 1
+                    and np.all(sel0_np == np.arange(full_np.shape[0], dtype=sel0_np.dtype))
+                ):
+                    self._gpu_block_sh_tensors = [
+                        full_t if full_t is not None else torch.from_numpy(full_np)
+                    ]
+                    self._n_refl = [int(full_np.shape[0])]
+                    self._gpu_sh_cache = None
+                    return
+
+            blocks_t = []
+            n_refls = []
+            for sel in block_selections:
+                sel_np = flumpy.to_numpy(sel)
+                if full_t is not None and dev.type == "cuda":
+                    sel_t = torch.from_numpy(
+                        np.ascontiguousarray(sel_np, dtype=np.int64)
+                    ).to(device=dev)
+                    b_t = full_t[sel_t]
+                else:
+                    b_np = full_np[sel_np]
+                    b_t = torch.from_numpy(np.ascontiguousarray(b_np, dtype=np.float64))
+                blocks_t.append(b_t)
+                n_refls.append(int(b_t.shape[0]))
+            self._gpu_block_sh_tensors = blocks_t
+            self._n_refl = n_refls
+        else:
+            self._gpu_block_sh_tensors = [
+                full_t if full_t is not None else torch.from_numpy(full_np)
+            ]
+            self._n_refl = [int(full_np.shape[0])]
+        self._gpu_sh_cache = None
+
+    def calculate_scales(self, block_id=0):
+        if getattr(self, "_mode", None) != "gpu_dense":
+            return super().calculate_scales(block_id)
+        sh_t = self._gpu_block_sh_tensors[block_id]
+        params_t = _get_param_tensor(self, self._parameters, sh_t.device)
+        scales_t = 1.0 + torch.mv(sh_t, params_t)
+        scales_np = np.ascontiguousarray(scales_t.cpu().numpy(), dtype=np.float64)
+        return flumpy.from_numpy(scales_np)
+
+    def calculate_scales_and_derivatives(self, block_id=0):
+        if getattr(self, "_mode", None) != "gpu_dense":
+            return super().calculate_scales_and_derivatives(block_id)
+        sh_t = self._gpu_block_sh_tensors[block_id]
+        params_t = _get_param_tensor(self, self._parameters, sh_t.device)
+        scales_t = 1.0 + torch.mv(sh_t, params_t)
+        scales_np = np.ascontiguousarray(scales_t.cpu().numpy(), dtype=np.float64)
+        sh_np = np.ascontiguousarray(sh_t.cpu().numpy(), dtype=np.float64)
+        n_rows, n_cols = sh_np.shape
+        d_mat = sparse.matrix(n_rows, n_cols)
+        if n_rows > 0 and n_cols > 0:
+            b = flumpy.from_numpy(sh_np)
+            b.reshape(flex.grid(n_rows, n_cols))
+            d_mat.assign_block(b, 0, 0)
+        return flumpy.from_numpy(scales_np), d_mat
+
+
+def configure_absorption_component_gpu(model, reflection_table) -> None:
+    """Configure `model.components['absorption']` with `SHScaleComponentGPU` and
+    dense GPU/CPU spherical harmonic matrix."""
+    lmax = int(model.configdict["lmax"])
+    comp = model.components["absorption"]
+    if not isinstance(comp, SHScaleComponentGPU):
+        comp.__class__ = SHScaleComponentGPU
+
+    quantize = reflection_table.size() > 100000
+    sh_t = eval_sph_harm_dense_gpu(
+        reflection_table["s0c"], reflection_table["s1c"], lmax, quantize=quantize
+    )
+    if sh_t.shape[1] != comp.n_params:
+        sh_t = sh_t[:, : comp.n_params]
+    comp._mode = "gpu_dense"
+    comp._gpu_full_sh_tensor = sh_t
+    comp._gpu_full_sh_np = (
+        sh_t.numpy()
+        if sh_t.device.type == "cpu"
+        else np.ascontiguousarray(sh_t.cpu().numpy(), dtype=np.float64)
+    )
+    comp._gpu_block_sh_tensors = [sh_t]
+    comp._n_refl = [int(sh_t.shape[0])]
+
+    surface_weight = model.configdict["abs_surface_weight"]
+    parameter_restraints = flex.double([])
+    for i in range(1, lmax + 1):
+        parameter_restraints.extend(flex.double([1.0] * ((2 * i) + 1)))
+    parameter_restraints *= surface_weight
+    comp.parameter_restraints = parameter_restraints
+
+
 def _get_cached_sh_matrix_gpu(
     component: SHScaleComponent, block_id: int, device: torch.device
 ) -> torch.Tensor:
     """Return cached (N_refl, N_params) spherical harmonic matrix on GPU for block_id."""
+    if getattr(component, "_mode", None) == "gpu_dense":
+        b_t = component._gpu_block_sh_tensors[block_id]
+        if b_t.device != device:
+            b_t = b_t.to(device=device, dtype=torch.float64)
+            component._gpu_block_sh_tensors[block_id] = b_t
+        return b_t
+
     cache = getattr(component, "_gpu_sh_cache", None)
     src = component._harmonic_values[block_id]
 
@@ -590,8 +834,7 @@ def evaluate_component_gpu(
 
     # Fast paths for each component type (check subclasses before base classes!)
     if isinstance(component, SmoothBScaleComponent1D):
-        params_np = np.asarray(flumpy.to_numpy(component.value), dtype=np.float64)
-        params_gpu = torch.from_numpy(params_np).to(device=dev, dtype=torch.float64)
+        params_gpu = _get_param_tensor(component, component._parameters, dev)
         x_gpu = _get_cached_block_tensor(
             component, "norm_x", block_id, component._normalised_values, dev
         )
@@ -605,7 +848,10 @@ def evaluate_component_gpu(
             first_fixed=bool(component._fixed_initial),
             compute_derivatives=compute_derivatives,
         )
-        scales = torch.exp(b_val * prefac)
+        if dev.type == "cpu":
+            scales = torch.from_numpy(np.exp((b_val * prefac).numpy()))
+        else:
+            scales = torch.exp(b_val * prefac)
         if not compute_derivatives:
             return scales, None
         derivs = db_dp * (scales * prefac)[:, None]
@@ -615,8 +861,7 @@ def evaluate_component_gpu(
         isinstance(component, SmoothScaleComponent1D)
         and not isinstance(component, SmoothBScaleComponent1D)
     ):
-        params_np = np.asarray(flumpy.to_numpy(component.value), dtype=np.float64)
-        params_gpu = torch.from_numpy(params_np).to(device=dev, dtype=torch.float64)
+        params_gpu = _get_param_tensor(component, component._parameters, dev)
         x_gpu = _get_cached_block_tensor(
             component, "norm_x", block_id, component._normalised_values, dev
         )
@@ -629,8 +874,7 @@ def evaluate_component_gpu(
         )
 
     if isinstance(component, SmoothScaleComponent2D):
-        params_np = np.asarray(flumpy.to_numpy(component.value), dtype=np.float64)
-        params_gpu = torch.from_numpy(params_np).to(device=dev, dtype=torch.float64)
+        params_gpu = _get_param_tensor(component, component._parameters, dev)
         x_gpu = _get_cached_block_tensor(
             component, "norm_x", block_id, component._normalised_x_values, dev
         )
@@ -646,8 +890,7 @@ def evaluate_component_gpu(
         )
 
     if isinstance(component, SmoothScaleComponent3D):
-        params_np = np.asarray(flumpy.to_numpy(component.value), dtype=np.float64)
-        params_gpu = torch.from_numpy(params_np).to(device=dev, dtype=torch.float64)
+        params_gpu = _get_param_tensor(component, component._parameters, dev)
         x_gpu = _get_cached_block_tensor(
             component, "norm_x", block_id, component._normalised_x_values, dev
         )
@@ -668,8 +911,7 @@ def evaluate_component_gpu(
 
     if isinstance(component, SHScaleComponent):
         sh_mat = _get_cached_sh_matrix_gpu(component, block_id, dev)
-        params_np = np.asarray(flumpy.to_numpy(component.parameters), dtype=np.float64)
-        params_gpu = torch.from_numpy(params_np).to(device=dev, dtype=torch.float64)
+        params_gpu = _get_param_tensor(component, component._parameters, dev)
         scales = 1.0 + torch.mv(sh_mat, params_gpu)
         if not compute_derivatives:
             return scales, None
@@ -761,8 +1003,11 @@ class RefinerCalculatorGPU(RefinerCalculator):
 
     @staticmethod
     def calculate_scales_and_derivatives_gpu(
-        apm, block_id: int, device: torch.device | str | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        apm,
+        block_id: int,
+        device: torch.device | str | None = None,
+        compute_derivatives: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Compute (scales_gpu, derivatives_gpu) on the GPU for an active_parameter_manager."""
         comp_scales = []
         comp_derivs = []
@@ -770,11 +1015,12 @@ class RefinerCalculatorGPU(RefinerCalculator):
             s_gpu, d_gpu = evaluate_component_gpu(
                 comp["object"],
                 block_id=block_id,
-                compute_derivatives=True,
+                compute_derivatives=compute_derivatives,
                 device=device,
             )
             comp_scales.append(s_gpu)
-            comp_derivs.append(d_gpu)
+            if compute_derivatives:
+                comp_derivs.append(d_gpu)
 
         if comp_scales:
             dev = comp_scales[0].device
@@ -793,11 +1039,16 @@ class RefinerCalculatorGPU(RefinerCalculator):
             )
 
         if not comp_scales:
+            empty_d = (
+                torch.empty((0, 0), dtype=torch.float64, device=dev)
+                if compute_derivatives
+                else None
+            )
             if const_g_gpu is not None:
-                return const_g_gpu, torch.empty((0, 0), dtype=torch.float64, device=dev)
+                return const_g_gpu, empty_d
             return (
                 torch.empty(0, dtype=torch.float64, device=dev),
-                torch.empty((0, 0), dtype=torch.float64, device=dev),
+                empty_d,
             )
 
         n_obs = comp_scales[0].shape[0]
@@ -805,9 +1056,13 @@ class RefinerCalculatorGPU(RefinerCalculator):
             total_scales = comp_scales[0]
             if const_g_gpu is not None:
                 total_scales = total_scales * const_g_gpu
-                total_derivs = comp_derivs[0] * const_g_gpu[:, None]
+                total_derivs = (
+                    comp_derivs[0] * const_g_gpu[:, None]
+                    if compute_derivatives
+                    else None
+                )
             else:
-                total_derivs = comp_derivs[0]
+                total_derivs = comp_derivs[0] if compute_derivatives else None
             return total_scales, total_derivs
 
         # Multiply all component scales
@@ -816,6 +1071,9 @@ class RefinerCalculatorGPU(RefinerCalculator):
             total_scales = total_scales * s
         if const_g_gpu is not None:
             total_scales = total_scales * const_g_gpu
+
+        if not compute_derivatives:
+            return total_scales, None
 
         # Chain rule for each component's derivative block
         scaled_deriv_blocks = []
@@ -874,17 +1132,48 @@ def rotate_vectors_about_axis_gpu(
     return flumpy.vec_from_numpy(rot_np)
 
 
+def _alignment_rotation_matrix(alignment_axis) -> np.ndarray:
+    """Return 3x3 rotation matrix R such that v_aligned = v @ R.T aligns `alignment_axis` with +z."""
+    ux, uy, uz = (
+        float(alignment_axis[0]),
+        float(alignment_axis[1]),
+        float(alignment_axis[2]),
+    )
+    if (ux, uy, uz) == (0.0, 0.0, 1.0):
+        return np.eye(3, dtype=np.float64)
+    ax, ay, az = uy, -ux, 0.0
+    norm_a = math.hypot(ax, ay)
+    if norm_a > 0.0:
+        ax /= norm_a
+        ay /= norm_a
+    angle = acos(uz / math.sqrt(ux * ux + uy * uy + uz * uz))
+    c = math.cos(angle)
+    s = math.sin(angle)
+    omc = 1.0 - c
+    return np.array(
+        [
+            [c + ax * ax * omc, ax * ay * omc - az * s, az * ax * omc + ay * s],
+            [ax * ay * omc + az * s, c + ay * ay * omc, az * ay * omc - ax * s],
+            [ax * az * omc - ay * s, ay * az * omc + ax * s, c + az * az * omc],
+        ],
+        dtype=np.float64,
+    )
+
+
 def align_axis_along_z_gpu(
     alignment_axis, vectors, device: torch.device | str | None = None
 ):
     """GPU implementation of dials.algorithms.scaling.scaling_utilities.align_axis_along_z."""
     if tuple(alignment_axis) == (0.0, 0.0, 1.0):
         return vectors
-    ux, uy, uz = alignment_axis
-    cross_prod_uz = flex.vec3_double([(uy, -1.0 * ux, 0.0)])
-    angle_between_u_z = +1.0 * acos(uz / ((ux**2 + uy**2 + uz**2) ** 0.5))
-    phi = flex.double(vectors.size(), angle_between_u_z)
-    return rotate_vectors_about_axis_gpu(cross_prod_uz, vectors, phi, device=device)
+    R_np = _alignment_rotation_matrix(alignment_axis)
+    vec_np = np.asarray(flumpy.to_numpy(vectors), dtype=np.float64).reshape(-1, 3)
+    dev = _get_minimization_device(vec_np.shape[0], device)
+    vec_t = torch.from_numpy(vec_np).to(device=dev, dtype=torch.float64)
+    R_t = torch.from_numpy(R_np.T.copy()).to(device=dev, dtype=torch.float64)
+    rot_t = torch.mm(vec_t, R_t)
+    rot_np = np.ascontiguousarray(rot_t.cpu().numpy(), dtype=np.float64)
+    return flumpy.vec_from_numpy(rot_np)
 
 
 def calc_theta_phi_gpu(xyz, device: torch.device | str | None = None):
@@ -919,15 +1208,22 @@ def calc_lookup_index_gpu(
 
 
 def calc_crystal_frame_vectors_gpu(
-    reflection_table, experiment, device: torch.device | str | None = None
+    reflection_table,
+    experiment,
+    device: torch.device | str | None = None,
+    align_axis: tuple[float, float, float] | None = None,
 ):
     """GPU implementation of dials.algorithms.scaling.scaling_utilities.calc_crystal_frame_vectors."""
     n_refl = len(reflection_table)
     dev = _get_minimization_device(n_refl, device)
     gonio = experiment.goniometer
-    fixed_rot_t = torch.tensor(
-        gonio.get_fixed_rotation(), dtype=torch.float64, device=dev
-    ).reshape(3, 3)
+    fixed_rot_np = np.array(gonio.get_fixed_rotation(), dtype=np.float64).reshape(3, 3)
+    if align_axis is not None and tuple(align_axis) != (0.0, 0.0, 1.0):
+        R_align = _alignment_rotation_matrix(align_axis)
+        fixed_rot_np = fixed_rot_np @ R_align.T
+    fixed_rot_t = torch.from_numpy(np.ascontiguousarray(fixed_rot_np)).to(
+        device=dev, dtype=torch.float64
+    )
     setting_rot_t = torch.tensor(
         gonio.get_setting_rotation(), dtype=torch.float64, device=dev
     ).reshape(3, 3)
@@ -936,54 +1232,82 @@ def calc_crystal_frame_vectors_gpu(
     )
     axis_t = axis_t / torch.linalg.norm(axis_t)
 
-    s0c_t = torch.zeros((n_refl, 3), dtype=torch.float64, device=dev)
-    s1c_t = torch.zeros((n_refl, 3), dtype=torch.float64, device=dev)
-
     s0_t = torch.tensor(
         experiment.beam.get_sample_to_source_direction(),
         dtype=torch.float64,
         device=dev,
     )
-    s1_np = np.asarray(flumpy.to_numpy(reflection_table["s1"]), dtype=np.float64)
-    phi_np = np.asarray(
-        flumpy.to_numpy(
-            experiment.scan.get_angle_from_array_index(
-                reflection_table["xyzobs.px.value"].parts()[2], deg=False
-            )
-        ),
-        dtype=np.float64,
+    s1_np = flumpy.to_numpy(reflection_table["s1"])
+    xyz_np = flumpy.to_numpy(reflection_table["xyzobs.px.value"])
+    z_px_np = np.ascontiguousarray(xyz_np[:, 2], dtype=np.float64)
+    s1_t = torch.from_numpy(np.ascontiguousarray(s1_np, dtype=np.float64)).to(
+        device=dev
     )
-    s1_t = torch.from_numpy(s1_np).to(device=dev, dtype=torch.float64)
-    phi_t = torch.from_numpy(phi_np).to(device=dev, dtype=torch.float64)
+    z_px_t = torch.from_numpy(z_px_np).to(device=dev)
+    osc = experiment.scan.get_oscillation(deg=False)
+    i0 = float(experiment.scan.get_array_range()[0])
+    phi_t = float(osc[0]) + (z_px_t - i0) * float(osc[1])
 
     lengths = torch.linalg.norm(s1_t, dim=1)
     valid = lengths > 0.0
-    if bool(valid.any()):
-        s1n = s1_t[valid] / lengths[valid, None]
-        ang = phi_t[valid]
-        ux, uy, uz = axis_t[0], axis_t[1], axis_t[2]
-        cos_a = torch.cos(ang)
-        sin_a = torch.sin(ang)
+    ux, uy, uz = axis_t[0], axis_t[1], axis_t[2]
+
+    # Matrix-free Rodrigues rotation: R_inv @ v = F^T @ R_{-phi} @ (S^T @ v)
+    w0 = torch.mv(setting_rot_t.t(), s0_t)
+    u_dot_w0 = torch.dot(axis_t, w0)
+    u_cross_w0 = torch.linalg.cross(axis_t, w0)
+    a0 = torch.mv(fixed_rot_t.t(), w0)
+    b0 = torch.mv(fixed_rot_t.t(), u_cross_w0)
+    c0 = torch.mv(fixed_rot_t.t(), u_dot_w0 * axis_t)
+
+    if bool(valid.all()):
+        cos_a = torch.cos(phi_t)
+        sin_a = torch.sin(phi_t)
         omc = 1.0 - cos_a
-
-        # Batched Rodrigues rotation matrices (M, 3, 3)
-        rot_mat = torch.empty((ang.shape[0], 3, 3), dtype=torch.float64, device=dev)
-        rot_mat[:, 0, 0] = cos_a + ux * ux * omc
-        rot_mat[:, 0, 1] = ux * uy * omc - uz * sin_a
-        rot_mat[:, 0, 2] = uz * ux * omc + uy * sin_a
-        rot_mat[:, 1, 0] = ux * uy * omc + uz * sin_a
-        rot_mat[:, 1, 1] = cos_a + uy * uy * omc
-        rot_mat[:, 1, 2] = uz * uy * omc - ux * sin_a
-        rot_mat[:, 2, 0] = ux * uz * omc - uy * sin_a
-        rot_mat[:, 2, 1] = uy * uz * omc + ux * sin_a
-        rot_mat[:, 2, 2] = cos_a + uz * uz * omc
-
-        R = torch.matmul(
-            setting_rot_t[None, :, :], torch.matmul(rot_mat, fixed_rot_t[None, :, :])
+        s0c_t = (
+            cos_a[:, None] * a0[None, :]
+            - sin_a[:, None] * b0[None, :]
+            + omc[:, None] * c0[None, :]
         )
-        R_inv = R.transpose(1, 2)
-        s0c_t[valid] = torch.matmul(R_inv, s0_t)
-        s1c_t[valid] = torch.einsum("ijk,ik->ij", R_inv, s1n)
+        s1n = s1_t / lengths[:, None]
+        w1 = torch.mm(s1n, setting_rot_t)
+        w1x, w1y, w1z = w1[:, 0], w1[:, 1], w1[:, 2]
+        u_dot_w1 = ux * w1x + uy * w1y + uz * w1z
+        cx = uy * w1z - uz * w1y
+        cy = uz * w1x - ux * w1z
+        cz = ux * w1y - uy * w1x
+        rot_s1 = (
+            cos_a[:, None] * w1
+            - sin_a[:, None] * torch.stack([cx, cy, cz], dim=1)
+            + (omc * u_dot_w1)[:, None] * axis_t[None, :]
+        )
+        s1c_t = torch.mm(rot_s1, fixed_rot_t)
+    else:
+        s0c_t = torch.zeros((n_refl, 3), dtype=torch.float64, device=dev)
+        s1c_t = torch.zeros((n_refl, 3), dtype=torch.float64, device=dev)
+        if bool(valid.any()):
+            ang = phi_t[valid]
+            cos_a = torch.cos(ang)
+            sin_a = torch.sin(ang)
+            omc = 1.0 - cos_a
+            s0c_t[valid] = (
+                cos_a[:, None] * a0[None, :]
+                - sin_a[:, None] * b0[None, :]
+                + omc[:, None] * c0[None, :]
+            )
+            s1n = s1_t[valid] / lengths[valid, None]
+            w1 = torch.mm(s1n, setting_rot_t)
+            w1x, w1y, w1z = w1[:, 0], w1[:, 1], w1[:, 2]
+            u_dot_w1 = ux * w1x + uy * w1y + uz * w1z
+            cx = uy * w1z - uz * w1y
+            cy = uz * w1x - ux * w1z
+            cz = ux * w1y - uy * w1x
+            rot_s1 = (
+                cos_a[:, None] * w1
+                - sin_a[:, None] * torch.stack([cx, cy, cz], dim=1)
+                + (omc * u_dot_w1)[:, None] * axis_t[None, :]
+            )
+            s1c_t[valid] = torch.mm(rot_s1, fixed_rot_t)
 
     s0c_np = np.ascontiguousarray(s0c_t.cpu().numpy(), dtype=np.float64)
     s1c_np = np.ascontiguousarray(s1c_t.cpu().numpy(), dtype=np.float64)

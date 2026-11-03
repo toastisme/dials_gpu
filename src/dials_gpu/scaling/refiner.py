@@ -9,6 +9,7 @@ import logging
 import numpy as np
 import torch
 from dxtbx import flumpy
+from scitbx import sparse
 
 from dials.algorithms.refinement.engine import (
     GaussNewtonIterations,
@@ -128,6 +129,11 @@ class ScalingLstbxBuildUpMixinGPU(ScalingLstbxBuildUpMixin):
 
         work_blocks = self._scaler.get_blocks_for_minimisation()
         has_gpu_update = hasattr(self._scaler, "update_for_minimisation_gpu")
+        need_explicit_jacobian = (
+            "jacobian_structure" in self.history
+            or "parameter_correlation" in self.history
+            or "condition_number" in self.history
+        )
         use_fast_dense = (
             hasattr(self._target, "compute_residuals_and_dense_jacobian_gpu")
             and "jacobian_structure" not in self.history
@@ -163,15 +169,79 @@ class ScalingLstbxBuildUpMixinGPU(ScalingLstbxBuildUpMixin):
                     )
                     if red_mat_gpu is not None:
                         J_gpu = torch.mm(J_gpu, red_mat_gpu)
+                    n_obs, n_par = int(J_gpu.shape[0]), int(J_gpu.shape[1])
+                    if (
+                        n_obs >= 8000
+                        and n_obs > n_par > 0
+                        and not need_explicit_jacobian
+                    ):
+                        Jw = J_gpu * w_gpu[:, None]
+                        AtWA_np = torch.mm(J_gpu.t(), Jw).cpu().numpy()
+                        rhs_np = (
+                            torch.mm(Jw.t(), res_gpu[:, None])
+                            .squeeze(1)
+                            .cpu()
+                            .numpy()
+                        )
+                        tot_wr2 = float(torch.sum(res_gpu * res_gpu * w_gpu).item())
+                        try:
+                            L_np = np.linalg.cholesky(AtWA_np)
+                            z_np = np.ascontiguousarray(
+                                np.linalg.solve(L_np, rhs_np), dtype=np.float64
+                            )
+                            U_np = np.ascontiguousarray(L_np.T, dtype=np.float64)
+                        except np.linalg.LinAlgError:
+                            evals, evecs = np.linalg.eigh(AtWA_np)
+                            evals = np.maximum(evals, 0.0)
+                            sqrt_evals = np.sqrt(evals)
+                            U_np = np.ascontiguousarray(
+                                sqrt_evals[:, None] * evecs.T, dtype=np.float64
+                            )
+                            vt_rhs = evecs.T @ rhs_np
+                            cutoff = (
+                                1e-12 * float(sqrt_evals[-1])
+                                if sqrt_evals[-1] > 0.0
+                                else 0.0
+                            )
+                            safe_se = np.where(sqrt_evals > cutoff, sqrt_evals, 1.0)
+                            z_np = np.ascontiguousarray(
+                                np.where(sqrt_evals > cutoff, vt_rhs / safe_se, 0.0),
+                                dtype=np.float64,
+                            )
+                        z_sq = float(np.dot(z_np, z_np))
+                        U_flex = flumpy.from_numpy(U_np)
+                        U_flex.reshape(flex.grid(n_par, n_par))
+                        self.add_equations(
+                            flumpy.from_numpy(z_np),
+                            U_flex,
+                            flex.double(n_par, 1.0),
+                        )
+                        rem_n = n_obs - n_par
+                        rem_wr2 = max(0.0, tot_wr2 - z_sq)
+                        self.add_residuals(
+                            flex.double(rem_n, 1.0),
+                            flex.double(rem_n, rem_wr2 / rem_n),
+                        )
+                        continue
+
                     res_np = np.ascontiguousarray(
                         res_gpu.cpu().numpy(), dtype=np.float64
                     )
                     w_np = np.ascontiguousarray(w_gpu.cpu().numpy(), dtype=np.float64)
-                    J_np = np.ascontiguousarray(J_gpu.cpu().numpy(), dtype=np.float64)
                     residuals = flumpy.from_numpy(res_np)
                     weights = flumpy.from_numpy(w_np)
+                    J_np = np.ascontiguousarray(J_gpu.cpu().numpy(), dtype=np.float64)
                     jacobian = flumpy.from_numpy(J_np)
-                    jacobian.reshape(flex.grid(J_np.shape[0], J_np.shape[1]))
+                    jacobian.reshape(flex.grid(n_obs, n_par))
+                    if (
+                        J_gpu.device.type == "cpu"
+                        and n_obs <= 2000
+                        and len(getattr(self._scaler, "active_scalers", (1,))) == 1
+                        and not need_explicit_jacobian
+                    ):
+                        sp = sparse.matrix(n_obs, n_par)
+                        sp.assign_block(jacobian, 0, 0)
+                        jacobian = sp
                 else:
                     (
                         residuals,

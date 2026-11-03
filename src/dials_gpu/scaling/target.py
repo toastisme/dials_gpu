@@ -180,20 +180,52 @@ class ScalingTargetGPU(ScalingTarget):
         n_groups = Ih_table.n_groups
 
         # dIh_by_dpi has shape (n_groups, n_params)
-        dIh_by_dpi = torch.zeros((n_groups, n_params), dtype=torch.float64, device=dev)
-        inv_sumgsq = (1.0 / sumgsq_gpu)[:, None]
-        for r0, r1, c0, c1, D_j in derivs_blocks:
-            if c1 > c0:
-                group_sum = sum_in_groups_gpu(
-                    dIh[r0:r1, None] * D_j, n_groups, group_ids_gpu[r0:r1], "per_group"
+        if (
+            len(derivs_blocks) == 1
+            and derivs_blocks[0][0] == 0
+            and derivs_blocks[0][1] == Ih_table.size
+            and derivs_blocks[0][2] == 0
+            and derivs_blocks[0][3] == n_params
+            and Ih_table.size >= 8000
+        ):
+            D_0 = derivs_blocks[0][4]
+            dIh_by_dpi = (
+                sum_in_groups_gpu(
+                    dIh[:, None] * D_0, n_groups, group_ids_gpu, "per_group"
                 )
-                dIh_by_dpi[:, c0:c1] = group_sum * inv_sumgsq
+                / sumgsq_gpu[:, None]
+            )
+            J_gpu = (
+                -D_0 * Ih_gpu[:, None] - g_gpu[:, None] * dIh_by_dpi[group_ids_gpu, :]
+            )
+            return resids_gpu, J_gpu, w_gpu
 
-        # Jacobian J_{i, k} = -Ih_i * D_{i, k} - g_i * dIh_by_dpi[h(i), k]
-        J_gpu = -g_gpu[:, None] * dIh_by_dpi[group_ids_gpu, :]
+        dIh_by_dpi = torch.zeros((n_groups, n_params), dtype=torch.float64, device=dev)
+        sumgsq_refl = sumgsq_gpu[group_ids_gpu]
+        if Ih_table.size >= 8000:
+            dIh_scaled = dIh / sumgsq_refl
+            for r0, r1, c0, c1, D_j in derivs_blocks:
+                if c1 > c0:
+                    term = dIh_scaled[r0:r1, None] * D_j
+                    dIh_by_dpi[:, c0:c1] = sum_in_groups_gpu(
+                        term, n_groups, group_ids_gpu[r0:r1], "per_group"
+                    )
+        else:
+            for r0, r1, c0, c1, D_j in derivs_blocks:
+                if c1 > c0:
+                    term = (dIh[r0:r1, None] * D_j) / sumgsq_refl[r0:r1, None]
+                    dIh_by_dpi[:, c0:c1] = sum_in_groups_gpu(
+                        term, n_groups, group_ids_gpu[r0:r1], "per_group"
+                    )
+
+        # Jacobian J_{i, k} = -D_{i, k} * Ih_i - g_i * dIh_by_dpi[h(i), k]
+        J_gpu = torch.zeros(
+            (Ih_table.size, n_params), dtype=torch.float64, device=dev
+        )
         for r0, r1, c0, c1, D_j in derivs_blocks:
             if c1 > c0:
-                J_gpu[r0:r1, c0:c1] -= Ih_gpu[r0:r1, None] * D_j
+                J_gpu[r0:r1, c0:c1] -= D_j * Ih_gpu[r0:r1, None]
+        J_gpu -= g_gpu[:, None] * dIh_by_dpi[group_ids_gpu, :]
 
         return resids_gpu, J_gpu, w_gpu
 

@@ -10,6 +10,7 @@ import time
 
 import numpy as np
 import torch
+from cctbx import crystal, miller
 from dxtbx import flumpy
 from libtbx import Auto
 from scitbx import sparse
@@ -55,6 +56,7 @@ from dials.algorithms.scaling.scaling_utilities import (
     quasi_normalisation,
 )
 from dials.array_family import flex
+from dials.util import tabulate
 from dials.util.filter_reflections import sum_partial_reflections
 from dials.util.observer import Subject
 
@@ -64,15 +66,20 @@ from .combine_intensities import (
 )
 from .components import (
     RefinerCalculatorGPU,
+    SHScaleComponentGPU,
     _get_device,
     _get_minimization_device,
     align_axis_along_z_gpu,
     calc_crystal_frame_vectors_gpu,
+    configure_absorption_component_gpu,
     evaluate_component_gpu,
 )
 from .error_model import run_error_model_refinement_gpu
 from .ih_table import IhTableGPU, calc_Ih_gpu
-from .outlier_rejection import determine_Esq_outlier_index_arrays, determine_outlier_index_arrays_gpu
+from .outlier_rejection import (
+    determine_Esq_outlier_index_arrays_gpu,
+    determine_outlier_index_arrays_gpu,
+)
 from .refiner import scaling_refinery_gpu
 from .target import ScalingTargetFixedIHGPU, ScalingTargetGPU
 
@@ -217,17 +224,21 @@ class SingleScalerGPU(_GPUScalerMixin, SingleScaler):
         apm_i = apm.apm_list[0]
         scales_gpu, derivs_gpu = (
             RefinerCalculatorGPU.calculate_scales_and_derivatives_gpu(
-                apm_i, block_id, device=dev
+                apm_i, block_id, device=dev, compute_derivatives=calc_derivs
             )
         )
         n_obs = scales_gpu.shape[0]
-        n_params = derivs_gpu.shape[1]
-        block._gpu_derivs_blocks = [(0, n_obs, 0, n_params, derivs_gpu)]
-        block._gpu_n_params = n_params
+        if calc_derivs and derivs_gpu is not None:
+            n_params = derivs_gpu.shape[1]
+            block._gpu_derivs_blocks = [(0, n_obs, 0, n_params, derivs_gpu)]
+            block._gpu_n_params = n_params
+        else:
+            n_params = 0
+            block._gpu_derivs_blocks = None
 
         calc_Ih_gpu(block, scales_gpu=scales_gpu, sync_to_cpu=sync_to_cpu, device=dev)
 
-        if sync_to_cpu and calc_derivs:
+        if sync_to_cpu and calc_derivs and derivs_gpu is not None:
             d_np = np.ascontiguousarray(derivs_gpu.cpu().numpy(), dtype=np.float64)
             d_sparse = sparse.matrix(n_obs, n_params)
             if n_obs > 0 and n_params > 0:
@@ -241,10 +252,93 @@ class SingleScalerGPU(_GPUScalerMixin, SingleScaler):
             apm, block_id, calc_derivs=True, sync_to_cpu=True
         )
 
+    def _get_valid_ih_table(
+        self, sub_selection=None, anomalous=False, include_partiality=False
+    ):
+        """Build a lightweight reflection_table containing only the columns required by IhTableGPU,
+        reusing cached ASU Miller indices and suitable reflection selections."""
+        rt = self._reflection_table
+        cache_key = (id(rt), id(self.suitable_refl_for_scaling_sel), rt.size())
+        cache = getattr(self, "_gpu_valid_cache", None)
+        if cache is None or cache["key"] != cache_key:
+            isel = self.suitable_refl_for_scaling_sel.iselection()
+            valid_hkl = rt["miller_index"].select(isel)
+            valid_d = rt["d"].select(isel) if "d" in rt else None
+            valid_part = rt["partiality"].select(isel) if "partiality" in rt else None
+            cache = {
+                "key": cache_key,
+                "isel": isel,
+                "hkl": valid_hkl,
+                "d": valid_d,
+                "partiality": valid_part,
+                "asu_hkl": {},
+            }
+            self._gpu_valid_cache = cache
+
+        anom_flag = bool(anomalous)
+        asu_hkl = cache["asu_hkl"].get(anom_flag)
+        if asu_hkl is None:
+            cs = crystal.symmetry(space_group=self.experiment.crystal.get_space_group())
+            ms = miller.set(
+                crystal_symmetry=cs, indices=cache["hkl"], anomalous_flag=anom_flag
+            )
+            asu_hkl = ms.map_to_asu().indices()
+            cache["asu_hkl"][anom_flag] = asu_hkl
+
+        out = flex.reflection_table()
+        if sub_selection is None:
+            final_isel = cache["isel"]
+            out["miller_index"] = cache["hkl"]
+            out["asu_miller_index"] = asu_hkl
+            if cache["d"] is not None:
+                out["d"] = cache["d"]
+            if include_partiality and cache["partiality"] is not None:
+                out["partiality"] = cache["partiality"]
+        else:
+            final_isel = cache["isel"].select(sub_selection)
+            out["miller_index"] = cache["hkl"].select(sub_selection)
+            out["asu_miller_index"] = asu_hkl.select(sub_selection)
+            if cache["d"] is not None:
+                out["d"] = cache["d"].select(sub_selection)
+            if include_partiality and cache["partiality"] is not None:
+                out["partiality"] = cache["partiality"].select(sub_selection)
+
+        out["intensity"] = rt["intensity"].select(final_isel)
+        out["variance"] = rt["variance"].select(final_isel)
+        out["inverse_scale_factor"] = rt["inverse_scale_factor"].select(final_isel)
+        return out
+
+    def _configure_model_and_datastructures(self, for_multi=False):
+        sel_reflections = self.get_valid_reflections()
+        model = self.experiment.scaling_model
+        abs_comp = model._components.pop("absorption", None)
+        try:
+            model.configure_components(sel_reflections, self.experiment, self.params)
+        finally:
+            if abs_comp is not None:
+                model._components["absorption"] = abs_comp
+        if abs_comp is not None:
+            configure_absorption_component_gpu(model, sel_reflections)
+
+        free_set_percentage = 0
+        if self.params.scaling_options.use_free_set and not for_multi:
+            free_set_percentage = self.params.scaling_options.free_set_percentage
+        self._global_Ih_table, self._free_Ih_table = self._create_global_Ih_table(
+            free_set_percentage=free_set_percentage, anomalous=self.params.anomalous
+        )
+        rows = [[key, str(val.n_params)] for key, val in self.components.items()]
+        logger.info("The following corrections will be applied to this dataset: \n")
+        logger.info(tabulate(rows, ["correction", "n_parameters"]))
+
     def _create_Ih_table(self):
         """Create an IhTableGPU from the reflection table using the scaling selection."""
         self._Ih_table = IhTableGPU(
-            [self.get_reflections_for_model_minimisation()],
+            [
+                self._get_valid_ih_table(
+                    sub_selection=self.scaling_selection,
+                    anomalous=self.params.anomalous,
+                )
+            ],
             self.experiment.crystal.get_space_group(),
             indices_lists=[self.scaling_selection.iselection()],
             nblocks=self.params.scaling_options.nproc,
@@ -256,9 +350,12 @@ class SingleScalerGPU(_GPUScalerMixin, SingleScaler):
     def _create_global_Ih_table(
         self, free_set_percentage=0, anomalous=False, remove_outliers=False
     ):
-        sel_reflections = self.get_valid_reflections()
-        if remove_outliers:
-            sel_reflections = sel_reflections.select(~self.outliers)
+        sub_sel = ~self.outliers if remove_outliers else None
+        sel_reflections = self._get_valid_ih_table(
+            sub_selection=sub_sel,
+            anomalous=anomalous,
+            include_partiality=True,
+        )
         free_Ih_table = None
         global_Ih_table = IhTableGPU(
             [sel_reflections],
@@ -368,7 +465,7 @@ class SingleScalerGPU(_GPUScalerMixin, SingleScaler):
             self.outliers = flex.bool(self.n_suitable_refl, False)
             self.outliers.set_selected(outlier_indices, True)
             if self.params.scaling_options.emax:
-                Esq_outlier_indices = determine_Esq_outlier_index_arrays(
+                Esq_outlier_indices = determine_Esq_outlier_index_arrays_gpu(
                     self.global_Ih_table,
                     self.experiment,
                     self.params.scaling_options.emax,
@@ -384,7 +481,7 @@ class SingleScalerGPU(_GPUScalerMixin, SingleScaler):
                     flumpy.from_numpy(free_outlier_indices), True
                 )
                 if self.params.scaling_options.emax:
-                    free_Esq_outlier_indices = determine_Esq_outlier_index_arrays(
+                    free_Esq_outlier_indices = determine_Esq_outlier_index_arrays_gpu(
                         self._free_Ih_table,
                         self.experiment,
                         self.params.scaling_options.emax,
@@ -399,13 +496,12 @@ class SingleScalerGPU(_GPUScalerMixin, SingleScaler):
         self._reflection_table["inverse_scale_factor_variance"] = flex.double(
             self.reflection_table.size(), 0.0
         )
-        block_isel = flex.size_t(range(0, self.n_suitable_refl))
         do_cov = bool(calc_cov and self.var_cov_matrix.non_zeroes > 0)
 
         scales_list = []
         derivs_list = []
         for component in self.components.values():
-            component.update_reflection_data(block_selections=[block_isel])
+            component.update_reflection_data()
             s_gpu, d_gpu = evaluate_component_gpu(
                 component, block_id=0, compute_derivatives=do_cov, device=dev
             )
@@ -423,6 +519,7 @@ class SingleScalerGPU(_GPUScalerMixin, SingleScaler):
             all_scales = flumpy.from_numpy(all_scales_np)
         else:
             all_scales = flex.double(self.n_suitable_refl, 1.0)
+        self._last_all_scales = all_scales
 
         scaled_isel = self.suitable_refl_for_scaling_sel.iselection()
         self.reflection_table["inverse_scale_factor"].set_selected(
@@ -467,9 +564,7 @@ class SingleScalerGPU(_GPUScalerMixin, SingleScaler):
 
         if caller is None:
             self.global_Ih_table.update_data_in_blocks(
-                self.reflection_table["inverse_scale_factor"].select(
-                    self.suitable_refl_for_scaling_sel
-                ),
+                all_scales,
                 dataset_id=0,
                 column="inverse_scale_factor",
             )
@@ -477,9 +572,7 @@ class SingleScalerGPU(_GPUScalerMixin, SingleScaler):
                 calc_Ih_gpu(block, sync_to_cpu=True, device=dev)
             if self._free_Ih_table:
                 self._free_Ih_table.update_data_in_blocks(
-                    self.reflection_table["inverse_scale_factor"].select(
-                        self.suitable_refl_for_scaling_sel
-                    ),
+                    all_scales,
                     dataset_id=0,
                     column="inverse_scale_factor",
                 )
@@ -494,6 +587,36 @@ class SingleScalerGPU(_GPUScalerMixin, SingleScaler):
 
 class _MultiScalerGPUMixin(_GPUScalerMixin):
     """GPU methods for MultiScalerBase subclasses (MultiScalerGPU, TargetScalerGPU)."""
+
+    def expand_scales_to_all_reflections(self, calc_cov=False):
+        for i, scaler in enumerate(self.active_scalers):
+            scaler.expand_scales_to_all_reflections(caller=self, calc_cov=calc_cov)
+            scales = getattr(scaler, "_last_all_scales", None)
+            if scales is None:
+                scales = scaler.reflection_table["inverse_scale_factor"].select(
+                    scaler.suitable_refl_for_scaling_sel
+                )
+            self.global_Ih_table.update_data_in_blocks(
+                scales,
+                dataset_id=i,
+                column="inverse_scale_factor",
+            )
+            if self._free_Ih_table:
+                self._free_Ih_table.update_data_in_blocks(
+                    scales,
+                    dataset_id=i,
+                    column="inverse_scale_factor",
+                )
+
+        for block in self.global_Ih_table.blocked_data_list:
+            calc_Ih_gpu(block, sync_to_cpu=True)
+        if self._free_Ih_table:
+            for block in self._free_Ih_table.blocked_data_list:
+                calc_Ih_gpu(block, sync_to_cpu=True)
+        logger.info(
+            "Scale factors determined during minimisation have now been\n"
+            "applied to all datasets.\n"
+        )
 
     def _update_for_minimisation_gpu(
         self,
@@ -511,22 +634,23 @@ class _MultiScalerGPUMixin(_GPUScalerMixin):
         for j, apm_i in enumerate(apm.apm_list):
             scales_i, derivs_i = (
                 RefinerCalculatorGPU.calculate_scales_and_derivatives_gpu(
-                    apm_i, block_id, device=dev
+                    apm_i, block_id, device=dev, compute_derivatives=calc_derivs
                 )
             )
             scales_parts.append(scales_i)
-            n_rows_i = scales_i.shape[0]
-            c0 = int(apm.apm_data[j]["start_idx"])
-            c1 = int(apm.apm_data[j]["end_idx"])
-            derivs_blocks.append((start_row, start_row + n_rows_i, c0, c1, derivs_i))
-            start_row += n_rows_i
+            if calc_derivs and derivs_i is not None:
+                n_rows_i = scales_i.shape[0]
+                c0 = int(apm.apm_data[j]["start_idx"])
+                c1 = int(apm.apm_data[j]["end_idx"])
+                derivs_blocks.append((start_row, start_row + n_rows_i, c0, c1, derivs_i))
+                start_row += n_rows_i
 
         scales_gpu = (
             torch.cat(scales_parts, dim=0)
             if scales_parts
             else torch.empty(0, dtype=torch.float64, device=dev)
         )
-        block._gpu_derivs_blocks = derivs_blocks
+        block._gpu_derivs_blocks = derivs_blocks if calc_derivs else None
         block._gpu_n_params = int(apm.n_active_params)
 
         if calc_Ih:
@@ -569,7 +693,12 @@ class _MultiScalerGPUMixin(_GPUScalerMixin):
     def _create_Ih_table(self):
         """Create a new IhTableGPU from the reflection tables."""
         tables = [
-            s.get_reflections_for_model_minimisation() for s in self.active_scalers
+            s._get_valid_ih_table(
+                sub_selection=s.scaling_selection, anomalous=self.params.anomalous
+            )
+            if hasattr(s, "_get_valid_ih_table")
+            else s.get_reflections_for_model_minimisation()
+            for s in self.active_scalers
         ]
         indices_lists = [s.scaling_selection.iselection() for s in self.active_scalers]
         self._Ih_table = IhTableGPU(
@@ -585,13 +714,20 @@ class _MultiScalerGPUMixin(_GPUScalerMixin):
                 self._Ih_table.update_weights(error_model, dataset_id=i)
 
     def _create_global_Ih_table(self, anomalous=False, remove_outliers=False):
-        if remove_outliers:
-            tables = [
-                s.get_valid_reflections().select(~s.outliers)
-                for s in self.active_scalers
-            ]
-        else:
-            tables = [s.get_valid_reflections() for s in self.active_scalers]
+        tables = []
+        for s in self.active_scalers:
+            if hasattr(s, "_get_valid_ih_table"):
+                tables.append(
+                    s._get_valid_ih_table(
+                        sub_selection=(~s.outliers if remove_outliers else None),
+                        anomalous=anomalous,
+                        include_partiality=True,
+                    )
+                )
+            elif remove_outliers:
+                tables.append(s.get_valid_reflections().select(~s.outliers))
+            else:
+                tables.append(s.get_valid_reflections())
         free_set_percentage = 0.0
         free_Ih_table = None
         if self.params.scaling_options.use_free_set:
@@ -668,7 +804,7 @@ class _MultiScalerGPUMixin(_GPUScalerMixin):
                 scaler.outliers = flex.bool(scaler.n_suitable_refl, False)
                 scaler.outliers.set_selected(flumpy.from_numpy(outlier_indices), True)
             if self.params.scaling_options.emax:
-                Esq_outlier_indices = determine_Esq_outlier_index_arrays(
+                Esq_outlier_indices = determine_Esq_outlier_index_arrays_gpu(
                     self.global_Ih_table,
                     self.active_scalers[0].experiment,
                     self.params.scaling_options.emax,
@@ -692,7 +828,7 @@ class _MultiScalerGPUMixin(_GPUScalerMixin):
                         flumpy.from_numpy(outlier_indices), True
                     )
                 if self.params.scaling_options.emax:
-                    free_Esq_outlier_indices = determine_Esq_outlier_index_arrays(
+                    free_Esq_outlier_indices = determine_Esq_outlier_index_arrays_gpu(
                         self._free_Ih_table,
                         self.active_scalers[0].experiment,
                         self.params.scaling_options.emax,
@@ -717,7 +853,14 @@ class _MultiScalerGPUMixin(_GPUScalerMixin):
             error_model = scalers[0]._experiment.scaling_model.error_model
             if not error_model.params.minimisation:
                 continue
-            tables = [s.get_valid_reflections().select(~s.outliers) for s in scalers]
+            tables = [
+                s._get_valid_ih_table(
+                    sub_selection=~s.outliers, anomalous=True, include_partiality=True
+                )
+                if hasattr(s, "_get_valid_ih_table")
+                else s.get_valid_reflections().select(~s.outliers)
+                for s in scalers
+            ]
             space_group = scalers[0].experiment.crystal.get_space_group()
             Ih_table = IhTableGPU(
                 tables,
@@ -847,8 +990,234 @@ class TargetScalerGPU(_MultiScalerGPUMixin, TargetScaler):
         self._active_scalers = self._target_active_scalers
 
 
+def _choose_initial_scaling_intensities_fast(
+    reflection_table, intensity_choice="profile"
+):
+    """Vectorized 1D NumPy equivalent of dials.algorithms.scaling.scaling_library.choose_initial_scaling_intensities
+    that avoids full-table .select() clones."""
+    n = reflection_table.size()
+    choice = "prf" if intensity_choice == "profile" else intensity_choice
+    flags_np = flumpy.to_numpy(reflection_table["flags"])
+    prf_flag = (flags_np & int(reflection_table.flags.integrated_prf)) != 0
+    if "intensity.prf.value" not in reflection_table:
+        choice = "sum"
+    elif choice == "prf" and not prf_flag.any():
+        logger.warning(
+            "No profile fitted reflections in this dataset, using summation intensities"
+        )
+        choice = "sum"
+
+    conv_np = np.ones(n, dtype=np.float64)
+    if "lp" in reflection_table:
+        conv_np = conv_np * flumpy.to_numpy(reflection_table["lp"])
+    qe_np = None
+    if "qe" in reflection_table:
+        qe_np = flumpy.to_numpy(reflection_table["qe"])
+    elif "dqe" in reflection_table:
+        qe_np = flumpy.to_numpy(reflection_table["dqe"])
+    if qe_np is not None:
+        nz_qe = qe_np > 0.0
+        inv_qe = np.ones(n, dtype=np.float64)
+        inv_qe[nz_qe] = 1.0 / qe_np[nz_qe]
+        conv_np = conv_np * inv_qe
+    reflection_table["prescaling_correction"] = flumpy.from_numpy(conv_np)
+
+    if choice == "prf":
+        i_np = flumpy.to_numpy(reflection_table["intensity.prf.value"]) * conv_np
+        v_np = (
+            flumpy.to_numpy(reflection_table["intensity.prf.variance"])
+            * conv_np
+            * conv_np
+        )
+    else:
+        if "partiality" in reflection_table:
+            part_np = flumpy.to_numpy(reflection_table["partiality"])
+            nz_p = part_np > 0.0
+            inv_p = np.ones(n, dtype=np.float64)
+            inv_p[nz_p] = 1.0 / part_np[nz_p]
+            ci = conv_np * inv_p
+            i_np = (
+                flumpy.to_numpy(reflection_table["intensity.sum.value"])
+                * conv_np
+                * inv_p
+            )
+            v_np = flumpy.to_numpy(reflection_table["intensity.sum.variance"]) * (
+                ci * ci
+            )
+            if "partiality.inv.variance" in reflection_table:
+                sc = (
+                    flumpy.to_numpy(reflection_table["intensity.sum.value"]) * conv_np
+                )
+                v_np = v_np + (sc * sc) * flumpy.to_numpy(
+                    reflection_table["partiality.inv.variance"]
+                )
+        else:
+            i_np = flumpy.to_numpy(reflection_table["intensity.sum.value"]) * conv_np
+            v_np = (
+                flumpy.to_numpy(reflection_table["intensity.sum.variance"])
+                * conv_np
+                * conv_np
+            )
+        if choice == "combine":
+            i_prf = flumpy.to_numpy(reflection_table["intensity.prf.value"]) * conv_np
+            v_prf = (
+                flumpy.to_numpy(reflection_table["intensity.prf.variance"])
+                * conv_np
+                * conv_np
+            )
+            i_np = np.where(prf_flag, i_prf, i_np)
+            v_np = np.where(prf_flag, v_prf, v_np)
+
+    reflection_table["intensity"] = flumpy.from_numpy(
+        np.ascontiguousarray(i_np, dtype=np.float64)
+    )
+    reflection_table["variance"] = flumpy.from_numpy(
+        np.ascontiguousarray(v_np, dtype=np.float64)
+    )
+    var_mask = flumpy.from_numpy(np.ascontiguousarray(v_np <= 0.0))
+    reflection_table.set_flags(var_mask, reflection_table.flags.excluded_for_scaling)
+    return reflection_table
+
+
 class SingleScalerFactoryGPU(SingleScalerFactory):
     """GPU-accelerated SingleScalerFactory."""
+
+    @staticmethod
+    def filter_bad_reflections(
+        reflections, partiality_cutoff=0.4, min_isigi=-5.0, intensity_choice="combine"
+    ):
+        """Vectorized 1D NumPy implementation of ScalerFactory.filter_bad_reflections
+        that avoids 6 full-table .select()/.del_selected() copies."""
+        logger.info(
+            "Applying filter of min_isigi > %s, partiality > %s",
+            min_isigi,
+            partiality_cutoff,
+        )
+        n = reflections.size()
+        if n == 0:
+            raise ValueError("All data has been filtered from the reflection table")
+        if intensity_choice not in ("combine", "profile", "sum"):
+            return ScalerFactory.filter_bad_reflections(
+                reflections,
+                partiality_cutoff=partiality_cutoff,
+                min_isigi=min_isigi,
+                intensity_choice=intensity_choice,
+            )
+
+        if intensity_choice == "combine":
+            if "intensity.sum.value" not in reflections:
+                if "intensity.prf.value" not in reflections:
+                    return reflections
+                mode = "prf"
+            elif "intensity.prf.value" not in reflections:
+                mode = "sum"
+            else:
+                mode = "sum_or_prf"
+        elif intensity_choice == "profile":
+            if "intensity.prf.value" not in reflections:
+                raise ValueError("Cannot filter intensity kind 'profile'; missing column")
+            mode = "prf"
+        else:
+            if "intensity.sum.value" not in reflections:
+                raise ValueError("Cannot filter intensity kind 'sum'; missing column")
+            mode = "sum"
+
+        reflections["original_index"] = flumpy.from_numpy(
+            np.arange(n, dtype=np.uint64)
+        )
+        keep = flumpy.to_numpy(reflections["id"]) >= 0
+        if not keep.any():
+            raise ValueError("All data has been filtered from the reflection table")
+
+        flags_np = flumpy.to_numpy(reflections["flags"])
+        prf_flag = (flags_np & int(reflections.flags.integrated_prf)) != 0
+        sum_flag = (flags_np & int(reflections.flags.integrated_sum)) != 0
+
+        if mode == "sum_or_prf":
+            if not (keep & prf_flag).any():
+                mode = "sum"
+            else:
+                keep = keep & (prf_flag | sum_flag)
+        if mode == "prf":
+            keep = keep & prf_flag
+        elif mode == "sum":
+            keep = keep & sum_flag
+        if not keep.any():
+            raise ValueError("All data has been filtered from the reflection table")
+
+        v_sum = None
+        v_prf = None
+        if mode in ("sum", "sum_or_prf"):
+            v_sum = flumpy.to_numpy(reflections["intensity.sum.variance"])
+            keep = keep & ~((v_sum <= 0.0) & sum_flag)
+            if not keep.any():
+                raise ValueError("All data has been filtered from the reflection table")
+        if mode in ("prf", "sum_or_prf"):
+            v_prf = flumpy.to_numpy(reflections["intensity.prf.variance"])
+            keep = keep & ~((v_prf <= 0.0) & prf_flag)
+            if not keep.any():
+                raise ValueError("All data has been filtered from the reflection table")
+
+        qe_np = None
+        if "qe" in reflections:
+            qe_np = flumpy.to_numpy(reflections["qe"])
+            keep = keep & (qe_np > 0.0)
+        elif "dqe" in reflections:
+            qe_np = flumpy.to_numpy(reflections["dqe"])
+            keep = keep & (qe_np > 0.0)
+        if not keep.any():
+            raise ValueError("All data has been filtered from the reflection table")
+
+        part_np = None
+        if "partiality" in reflections:
+            part_np = flumpy.to_numpy(reflections["partiality"])
+            keep = keep & (part_np > 0.0) & (part_np >= partiality_cutoff)
+            if not keep.any():
+                raise ValueError("All data has been filtered from the reflection table")
+            reflections["fractioncalc"] = reflections["partiality"]
+
+        if min_isigi:
+            idx = np.flatnonzero(keep)
+            conv = np.ones(idx.size, dtype=np.float64)
+            if qe_np is not None:
+                conv /= qe_np[idx]
+            if "lp" in reflections:
+                conv *= flumpy.to_numpy(reflections["lp"])[idx]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                if mode in ("sum", "sum_or_prf"):
+                    sum_conv = (conv / part_np[idx]) if part_np is not None else conv
+                    i_s = (
+                        flumpy.to_numpy(reflections["intensity.sum.value"])[idx]
+                        * sum_conv
+                    )
+                    v_s = v_sum[idx] * (sum_conv * sum_conv)
+                    bad_s = (i_s / np.sqrt(v_s)) < min_isigi
+                    if bad_s.any():
+                        keep[idx[bad_s]] = False
+                        if not keep.any():
+                            raise ValueError(
+                                "All data has been filtered from the reflection table"
+                            )
+                        idx = idx[~bad_s]
+                        if mode == "sum_or_prf":
+                            conv = conv[~bad_s]
+                if mode in ("prf", "sum_or_prf"):
+                    i_p = (
+                        flumpy.to_numpy(reflections["intensity.prf.value"])[idx]
+                        * conv
+                    )
+                    v_p = v_prf[idx] * (conv * conv)
+                    bad_p = (i_p / np.sqrt(v_p)) < min_isigi
+                    if bad_p.any():
+                        keep[idx[bad_p]] = False
+                        if not keep.any():
+                            raise ValueError(
+                                "All data has been filtered from the reflection table"
+                            )
+
+        mask = flumpy.from_numpy(np.ascontiguousarray(~keep))
+        reflections.set_flags(mask, reflections.flags.excluded_for_scaling)
+        return reflections
 
     @classmethod
     def create(cls, params, experiment, reflection_table, for_multi=False):
@@ -880,7 +1249,7 @@ class SingleScalerFactoryGPU(SingleScalerFactory):
             reflection_table["inverse_scale_factor"] = flex.double(
                 reflection_table.size(), 1.0
             )
-        reflection_table = choose_initial_scaling_intensities(
+        reflection_table = _choose_initial_scaling_intensities_fast(
             reflection_table, params.reflection_selection.intensity_choice
         )
 
@@ -923,14 +1292,9 @@ class SingleScalerFactoryGPU(SingleScalerFactory):
         ):
             if experiment.scan and (experiment.scan.get_oscillation()[1] != 0.0):
                 reflection_table = calc_crystal_frame_vectors_gpu(
-                    reflection_table, experiment
-                )
-                alignment_axis = (1.0, 0.0, 0.0)
-                reflection_table["s0c"] = align_axis_along_z_gpu(
-                    alignment_axis, reflection_table["s0c"]
-                )
-                reflection_table["s1c"] = align_axis_along_z_gpu(
-                    alignment_axis, reflection_table["s1c"]
+                    reflection_table,
+                    experiment,
+                    align_axis=(1.0, 0.0, 0.0),
                 )
         try:
             scaler = SingleScalerGPU(params, experiment, reflection_table, for_multi)
@@ -1199,7 +1563,7 @@ class ScalingAlgorithmGPU(ScalingAlgorithm):
         if (
             self.params.output.html
             or self.params.output.json
-            or logger.isEnabledFor(logging.INFO)
+            or getattr(self.params.output, "additional_stats", False)
         ):
             return super().run()
 

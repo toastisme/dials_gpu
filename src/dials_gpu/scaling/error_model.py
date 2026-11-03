@@ -5,11 +5,13 @@ GPU-accelerated error model classes and refinement targets for scaling using PyT
 from __future__ import annotations
 
 import logging
-from math import ceil
+import types
+from math import ceil, exp, log
 
 import numpy as np
 import torch
 from dxtbx import flumpy
+from scitbx import sparse
 from scipy.stats import norm
 
 from dials.algorithms.scaling.error_model.engine import (
@@ -47,6 +49,164 @@ from .ih_table import _np_to_tensor, get_block_group_ids_gpu, sum_in_groups_gpu
 
 logger = logging.getLogger("dials")
 
+_NORM_PPF_CACHE: dict[int, tuple[int, int, flex.double]] = {}
+_V1_CDF = float(norm.cdf(-1.5))
+_V2_CDF = float(norm.cdf(1.5))
+
+
+class ErrorModelBinnerGPU(ErrorModelBinner):
+    """GPU-accelerated ErrorModelBinner that builds dense bin summation matrices
+    without a per-reflection Python loop over scitbx.sparse.matrix."""
+
+    def __init__(self, Ih_table, min_reflections_required=250, n_bins=10):
+        self.binning_info = {
+            "initial_variances": [],
+            "bin_boundaries": [],
+            "mean_intensities": np.array([], dtype=float).reshape((0,)),
+            "bin_variances": [],
+            "refl_per_bin": [],
+            "n_reflections": None,
+        }
+        self.n_bins = n_bins
+        self.Ih_table = Ih_table
+        self.min_reflections_required = min_reflections_required
+        self.n_h = self.Ih_table.calc_nh()
+        self._smat_dense_np = self._create_summation_matrix_dense()
+        self._summation_matrix_lazy = None
+        self.weights = np.array(self.binning_info["mean_intensities"])
+        self._sigmaprime_np = None
+        self._delta_hl_np = None
+        self._last_gpu_params = None
+        update_binner_gpu(self, [1.0, 0.0])
+        self.binning_info["initial_variances"] = self.binning_info["bin_variances"]
+
+    @property
+    def summation_matrix(self):
+        if self._summation_matrix_lazy is None:
+            n_rows, n_cols = self._smat_dense_np.shape
+            smat = sparse.matrix(n_rows, n_cols)
+            if n_rows > 0 and n_cols > 0:
+                b = flumpy.from_numpy(
+                    np.ascontiguousarray(self._smat_dense_np, dtype=np.float64)
+                )
+                b.reshape(flex.grid(n_rows, n_cols))
+                smat.assign_block(b, 0, 0)
+            self._summation_matrix_lazy = smat
+        return self._summation_matrix_lazy
+
+    @summation_matrix.setter
+    def summation_matrix(self, value):
+        self._summation_matrix_lazy = value
+        if value is not None:
+            self._smat_dense_np = np.asarray(
+                flumpy.to_numpy(value.as_dense_matrix()), dtype=np.float64
+            ).reshape(value.n_rows, value.n_cols)
+
+    @property
+    def sigmaprime(self):
+        if self._sigmaprime_np is None:
+            cache = getattr(self, "_gpu_cache", None)
+            if cache is not None and "sigmaprime" in cache:
+                self._sigmaprime_np = cache["sigmaprime"].cpu().numpy()
+            else:
+                self._sigmaprime_np = calc_sigmaprime([1.0, 0.0], self.Ih_table)
+        return self._sigmaprime_np
+
+    @sigmaprime.setter
+    def sigmaprime(self, value):
+        self._sigmaprime_np = value
+
+    @property
+    def delta_hl(self):
+        if self._delta_hl_np is None:
+            cache = getattr(self, "_gpu_cache", None)
+            if cache is not None and "delta_hl" in cache:
+                self._delta_hl_np = cache["delta_hl"].cpu().numpy()
+            else:
+                self._delta_hl_np = calc_deltahl(
+                    self.Ih_table, self.n_h, self.sigmaprime
+                )
+        return self._delta_hl_np
+
+    @delta_hl.setter
+    def delta_hl(self, value):
+        self._delta_hl_np = value
+
+    def update(self, parameters):
+        update_binner_gpu(self, parameters)
+
+    def _create_summation_matrix_dense(self) -> np.ndarray:
+        n = self.Ih_table.size
+        self.binning_info["n_reflections"] = n
+        Ih = self.Ih_table.Ih_values * self.Ih_table.inverse_scale_factors
+        if "partiality" in self.Ih_table.Ih_table:
+            Ih = Ih * self.Ih_table.Ih_table["partiality"].to_numpy()
+        size_order = np.argsort(-Ih, kind="stable")
+        Imax = float(Ih.max())
+        min_Ih = float(Ih.min())
+        Imin = max(1.0, min_Ih)
+        spacing = (log(Imax) - log(Imin)) / float(self.n_bins)
+        boundaries = [Imax] + [
+            exp(log(Imax) - (i * spacing)) for i in range(1, self.n_bins + 1)
+        ]
+        boundaries[-1] = min_Ih - 0.01
+        self.binning_info["bin_boundaries"] = np.array(boundaries)
+
+        n_cumul = 0
+        if Ih.size > 100 * self.min_reflections_required:
+            self.min_reflections_required = int(Ih.size / 100.0)
+        min_per_bin = min(self.min_reflections_required, int(n / (3.0 * self.n_bins)))
+
+        bin_Boundaries = self.binning_info["bin_boundaries"]
+        sels = []
+        refl_per_bin = []
+        for i in range(len(bin_Boundaries) - 1):
+            maximum = bin_Boundaries[i]
+            minimum = bin_Boundaries[i + 1]
+            sel1 = Ih <= maximum
+            sel2 = Ih > minimum
+            sel = sel1 & sel2
+            n_in_bin = int(np.count_nonzero(sel))
+            if n_in_bin < min_per_bin:
+                m = n_cumul + min_per_bin
+                if m < n:
+                    idx = size_order[m]
+                    intensity = Ih[idx]
+                    bin_Boundaries[i + 1] = intensity
+                    minimum = intensity
+                    sel = sel1 & (Ih > minimum)
+                    n_in_bin = int(np.count_nonzero(sel))
+            refl_per_bin.append(float(n_in_bin))
+            sels.append(sel)
+            n_cumul += n_in_bin
+
+        keep_cols = [
+            i for i, cnt in enumerate(refl_per_bin) if cnt >= (min_per_bin - 5)
+        ]
+        if len(keep_cols) == self.n_bins:
+            self.binning_info["refl_per_bin"] = np.array(refl_per_bin, dtype=float)
+            mean_ints = [float(np.mean(Ih[s])) for s in sels]
+            self.binning_info["mean_intensities"] = np.array(mean_ints, dtype=float)
+            smat_dense = np.zeros((n, self.n_bins), dtype=np.float64)
+            for i, s in enumerate(sels):
+                smat_dense[s, i] = 1.0
+            return smat_dense
+
+        new_refl_per_bin = [refl_per_bin[i] for i in keep_cols]
+        new_bounds = [bin_Boundaries[i] for i in keep_cols] + [bin_Boundaries[-1]]
+        self.binning_info["refl_per_bin"] = np.array(new_refl_per_bin, dtype=float)
+        self.binning_info["bin_boundaries"] = np.array(new_bounds, dtype=float)
+        smat_dense = np.zeros((n, len(keep_cols)), dtype=np.float64)
+        mean_ints = []
+        for next_col, i in enumerate(keep_cols):
+            smat_dense[sels[i], next_col] = 1.0
+            maximum = new_bounds[next_col]
+            minimum = new_bounds[next_col + 1]
+            sel = (Ih <= maximum) & (Ih > minimum)
+            mean_ints.append(float(np.mean(Ih[sel])))
+        self.binning_info["mean_intensities"] = np.array(mean_ints, dtype=float)
+        return smat_dense
+
 
 def _get_binner_gpu_cache(binner: ErrorModelBinner, dev: torch.device):
     """Fetch or create cached GPU tensors for an ErrorModelBinner."""
@@ -61,11 +221,13 @@ def _get_binner_gpu_cache(binner: ErrorModelBinner, dev: torch.device):
         prefac_t = torch.sqrt((nh_t - 1.0) / nh_t)
         diff_t = prefac_t * ((I_t / g_t) - Ih_t)
 
-        smat = binner.summation_matrix
-        smat_np = np.asarray(
-            flumpy.to_numpy(smat.as_dense_matrix()), dtype=np.float64
-        ).reshape(smat.n_rows, smat.n_cols)
-        smat_t = _np_to_tensor(smat_np, dev, dtype=torch.float64)
+        smat_dense_np = getattr(binner, "_smat_dense_np", None)
+        if smat_dense_np is None:
+            smat = binner.summation_matrix
+            smat_dense_np = np.asarray(
+                flumpy.to_numpy(smat.as_dense_matrix()), dtype=np.float64
+            ).reshape(smat.n_rows, smat.n_cols)
+        smat_t = _np_to_tensor(smat_dense_np, dev, dtype=torch.float64)
 
         counts_t = _np_to_tensor(
             binner.binning_info["refl_per_bin"], dev, dtype=torch.float64
@@ -101,6 +263,9 @@ def update_binner_gpu(
     c = _get_binner_gpu_cache(binner, dev)
     a = float(parameters[0])
     b = float(parameters[1])
+    param_key = (a, b, dev)
+    if getattr(binner, "_last_gpu_params", None) == param_key and "bin_vars" in c:
+        return
 
     sigmaprime_t = (a * torch.sqrt(c["var"] + (b * b) * c["I_sq"])) / c["g"]
     delta_hl_t = c["diff"] / sigmaprime_t
@@ -114,9 +279,14 @@ def update_binner_gpu(
     c["sigmaprime"] = sigmaprime_t
     c["delta_hl"] = delta_hl_t
     c["bin_vars"] = bin_vars_t
+    binner._last_gpu_params = param_key
 
-    binner.sigmaprime = sigmaprime_t.cpu().numpy()
-    binner.delta_hl = delta_hl_t.cpu().numpy()
+    if isinstance(binner, ErrorModelBinnerGPU):
+        binner._sigmaprime_np = None
+        binner._delta_hl_np = None
+    else:
+        binner.sigmaprime = sigmaprime_t.cpu().numpy()
+        binner.delta_hl = delta_hl_t.cpu().numpy()
     bin_vars_np = bin_vars_t.cpu().numpy()
     binner.bin_variances = bin_vars_np
     binner.binning_info["bin_variances"] = bin_vars_np
@@ -127,6 +297,16 @@ class ErrorModelTargetAGPU(ErrorModelTargetA):
 
     def _get_xy_gpu(self, dev: torch.device):
         em = self.error_model
+        sx_gpu = getattr(em, "_gpu_sortedx", None)
+        sy_gpu = getattr(em, "_gpu_sortedy", None)
+        if (
+            sx_gpu is not None
+            and sy_gpu is not None
+            and getattr(em, "_gpu_sortedx_ref", None) is em.sortedx
+            and getattr(em, "_gpu_sortedy_ref", None) is em.sortedy
+            and sx_gpu.device == dev
+        ):
+            return sx_gpu, sy_gpu
         cache = getattr(self, "_gpu_sorted_xy_cache", None)
         if (
             cache is None
@@ -319,14 +499,93 @@ def error_model_refinery_gpu(
     return None
 
 
+def _calculate_sorted_deviations_gpu(self, parameters):
+    """GPU-accelerated replacement for BasicErrorModel.calculate_sorted_deviations."""
+    block = self.filtered_Ih_table
+    n = block.size
+    dev = _get_minimization_device(n)
+    if self.binner is not None and self.binner.Ih_table is block:
+        update_binner_gpu(self.binner, parameters, dev)
+        delta_hl_t = self.binner._gpu_cache["delta_hl"]
+    else:
+        a = float(parameters[0])
+        b = float(parameters[1])
+        var_t = _np_to_tensor(block.variances, dev, dtype=torch.float64)
+        I_t = _np_to_tensor(block.intensities, dev, dtype=torch.float64)
+        g_t = _np_to_tensor(block.inverse_scale_factors, dev, dtype=torch.float64)
+        Ih_t = _np_to_tensor(block.Ih_values, dev, dtype=torch.float64)
+        nh_t = _np_to_tensor(block.calc_nh(), dev, dtype=torch.float64)
+        sigmaprime_t = (a * torch.sqrt(var_t + (b * b) * (I_t * I_t))) / g_t
+        delta_hl_t = torch.sqrt((nh_t - 1.0) / nh_t) * ((I_t / g_t) - Ih_t) / sigmaprime_t
+
+    ppf_entry = _NORM_PPF_CACHE.get(n)
+    if ppf_entry is None:
+        idx_cutoff_min = ceil((_V1_CDF * n) - 0.5)
+        idx_cutoff_max = ceil((_V2_CDF * n) - 0.5)
+        central_n = idx_cutoff_max - idx_cutoff_min
+        v_np = np.linspace(
+            start=(idx_cutoff_min + 0.5) / n,
+            stop=(idx_cutoff_max + 0.5) / n,
+            endpoint=False,
+            num=central_n,
+        )
+        v_t = torch.from_numpy(v_np).to(device=dev, dtype=torch.float64)
+        ppf_t = torch.special.ndtri(v_t)
+        sortedx_flex = flumpy.from_numpy(
+            np.ascontiguousarray(ppf_t.cpu().numpy(), dtype=np.float64)
+        )
+        ppf_entry = (idx_cutoff_min, idx_cutoff_max, sortedx_flex, ppf_t)
+        _NORM_PPF_CACHE[n] = ppf_entry
+    else:
+        idx_cutoff_min, idx_cutoff_max, sortedx_flex, ppf_t = ppf_entry
+        if ppf_t.device != dev:
+            ppf_t = ppf_t.to(device=dev)
+
+    sortedy_t = torch.sort(delta_hl_t)[0][idx_cutoff_min:idx_cutoff_max]
+    sortedy_np = np.ascontiguousarray(sortedy_t.cpu().numpy(), dtype=np.float64)
+    sortedy_flex = flumpy.from_numpy(sortedy_np)
+
+    self.sortedx = sortedx_flex
+    self.sortedy = sortedy_flex
+    self._gpu_sortedx = ppf_t
+    self._gpu_sortedy = sortedy_t
+    self._gpu_sortedx_ref = sortedx_flex
+    self._gpu_sortedy_ref = sortedy_flex
+
+
+def _configure_error_model_for_refinement_gpu(
+    model: BasicErrorModel, Ih_table_block, min_partiality=0.4, use_stills_filtering=False
+):
+    """Configure BasicErrorModel using ErrorModelBinnerGPU and GPU sorted deviations."""
+    model.filtered_Ih_table = model.filter_unsuitable_reflections(
+        Ih_table_block,
+        model.params,
+        min_partiality,
+        use_stills_filtering,
+    )
+    model.binner = ErrorModelBinnerGPU(
+        model.filtered_Ih_table, model.min_reflections_required, model.params.n_bins
+    )
+    model.calculate_sorted_deviations = types.MethodType(
+        _calculate_sorted_deviations_gpu, model
+    )
+    model.binner.update(model.parameters)
+    model.calculate_sorted_deviations(model.parameters)
+
+
 def run_error_model_refinement_gpu(
     model: BasicErrorModel, Ih_table, min_partiality=0.4, use_stills_filtering=False
 ) -> BasicErrorModel:
     """GPU-accelerated drop-in replacement for run_error_model_refinement."""
     assert Ih_table.n_work_blocks == 1
-    model.configure_for_refinement(
-        Ih_table.blocked_data_list[0], min_partiality, use_stills_filtering
-    )
+    if isinstance(model, BasicErrorModel):
+        _configure_error_model_for_refinement_gpu(
+            model, Ih_table.blocked_data_list[0], min_partiality, use_stills_filtering
+        )
+    else:
+        model.configure_for_refinement(
+            Ih_table.blocked_data_list[0], min_partiality, use_stills_filtering
+        )
     if not model.active_parameters:
         logger.info("All error model parameters fixed, skipping refinement")
     else:

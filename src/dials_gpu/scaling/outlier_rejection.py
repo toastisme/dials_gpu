@@ -34,6 +34,119 @@ from .ih_table import (
 logger = logging.getLogger("dials")
 
 
+def limit_outlier_weights_gpu(block, device=None) -> np.ndarray:
+    """Vectorized group-median weight clamping matching C++ `limit_outlier_weights`
+    without constructing or iterating over `scitbx.sparse.matrix` `h_index_matrix`."""
+    if block.size == 0 or block.n_groups == 0:
+        w_np = block.weights.copy()
+        block._gpu_clamped_weights = None
+        return w_np
+    dev = _get_minimization_device(block.size, device)
+    group_ids_gpu = get_block_group_ids_gpu(block, dev)
+    w_gpu = _np_to_tensor(block.weights, dev, dtype=torch.float64)
+    n_groups = block.n_groups
+
+    p1 = torch.argsort(w_gpu)
+    p2 = torch.argsort(group_ids_gpu[p1], stable=True)
+    sorted_w = w_gpu[p1[p2]]
+    counts = torch.bincount(group_ids_gpu, minlength=n_groups)
+    ends = torch.cumsum(counts, dim=0)
+    starts = ends - counts
+    safe_counts = torch.clamp(counts, min=1)
+    max_idx = w_gpu.numel() - 1
+    mid1 = torch.clamp(starts + (safe_counts - 1) // 2, max=max_idx)
+    mid2 = torch.clamp(starts + safe_counts // 2, max=max_idx)
+    med_g = 0.5 * (sorted_w[mid1] + sorted_w[mid2])
+    w_clamped = torch.minimum(w_gpu, 10.0 * med_g[group_ids_gpu])
+    block._gpu_clamped_weights = w_clamped
+    return w_clamped.cpu().numpy()
+
+
+def determine_Esq_outlier_index_arrays_gpu(Ih_table, experiment, emax=10.0):
+    """Fast cached version of `determine_Esq_outlier_index_arrays` that caches
+    the resolution binner, `1 / epsilons`, and bin assignments across outlier
+    rejection rounds on the same `IhTableBlock`."""
+    from cctbx import crystal, miller, uctbx
+
+    block = Ih_table.Ih_table_blocks[0]
+    if block.size == 0:
+        return [np.array([], dtype=np.uint64)] * Ih_table.n_datasets
+
+    uc = experiment.crystal.get_unit_cell()
+    uc_key = tuple(round(x, 8) for x in uc.parameters())
+    sg_key = Ih_table.space_group.type().hall_symbol()
+    cache = getattr(block, "_gpu_quasi_norm_cache", None)
+
+    if cache is None or cache[0] != (block.size, uc_key, sg_key):
+        miller_set = miller.set(
+            crystal_symmetry=crystal.symmetry(
+                unit_cell=uc,
+                space_group=Ih_table.space_group,
+                assert_is_compatible_unit_cell=False,
+            ),
+            indices=block.asu_miller_index,
+            anomalous_flag=False,
+        )
+        n = block.size
+        if n > 20000:
+            n_refl_shells = 20
+        elif n > 15000:
+            n_refl_shells = 15
+        else:
+            n_refl_shells = 10
+        d_star_sq = miller_set.d_star_sq().data()
+        d_star_sq_max = flex.max(d_star_sq)
+        d_star_sq_min = flex.min(d_star_sq)
+        span = d_star_sq_max - d_star_sq_min
+        if span <= 0.0:
+            return determine_Esq_outlier_index_arrays(Ih_table, experiment, emax=emax)
+        d_star_sq_max += span * 1e-6
+        d_star_sq_min -= span * 1e-6
+        if d_star_sq_min <= 0.0:
+            return determine_Esq_outlier_index_arrays(Ih_table, experiment, emax=emax)
+        d_star_sq_step = (d_star_sq_max - d_star_sq_min) / n_refl_shells
+        binner = miller_set.setup_binner_d_star_sq_step(
+            d_min=uctbx.d_star_sq_as_d(d_star_sq_min),
+            d_max=uctbx.d_star_sq_as_d(d_star_sq_max),
+            d_star_sq_step=d_star_sq_step,
+            auto_binning=False,
+        )
+        if binner.n_bin_d_too_large_or_small() != 0:
+            return determine_Esq_outlier_index_arrays(Ih_table, experiment, emax=emax)
+        inv_eps_np = 1.0 / flumpy.to_numpy(miller_set.epsilons().data().as_double())
+        used_bins = list(binner.range_used())
+        bin_idx_np = np.zeros(n, dtype=np.int64)
+        bin_counts = np.zeros(len(used_bins), dtype=np.int64)
+        for k, i_bin in enumerate(used_bins):
+            sel_k = flumpy.to_numpy(binner.selection(i_bin))
+            bin_idx_np[sel_k] = k
+            bin_counts[k] = int(np.count_nonzero(sel_k))
+        cache = ((block.size, uc_key, sg_key), binner, inv_eps_np, bin_idx_np, bin_counts)
+        block._gpu_quasi_norm_cache = cache
+
+    _, binner, inv_eps_np, bin_idx_np, bin_counts = cache
+    raw_iobs = block.intensities / block.inverse_scale_factors
+    pos_iobs = np.maximum(raw_iobs, 0.0)
+    f_sq_over_eps = pos_iobs * inv_eps_np
+    sums = np.bincount(bin_idx_np, weights=f_sq_over_eps, minlength=len(bin_counts))
+    means = np.where(bin_counts > 0, sums / np.maximum(bin_counts, 1), 0.0)
+    mean_flex = flumpy.from_numpy(np.ascontiguousarray(means, dtype=np.float64))
+    norm_interp = flumpy.to_numpy(binner.interpolate(mean_flex, 1))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        sel_np = (raw_iobs / norm_interp) > (emax**2)
+
+    n_e2_outliers = int(np.count_nonzero(sel_np))
+    if n_e2_outliers:
+        logger.info(
+            f"{n_e2_outliers} outliers identified from normalised intensity analysis (E\xb2 > {(emax**2)})"
+        )
+    outlier_indices = block.Ih_table["loc_indices"].to_numpy()[sel_np]
+    if Ih_table.n_datasets == 1:
+        return [outlier_indices]
+    datasets = block.Ih_table["dataset_id"].to_numpy()[sel_np]
+    return [outlier_indices[datasets == i] for i in range(Ih_table.n_datasets)]
+
+
 class TargetedOutlierRejectionGPU(TargetedOutlierRejection):
     """GPU-accelerated TargetedOutlierRejection."""
 
@@ -108,6 +221,10 @@ class TargetedOutlierRejectionGPU(TargetedOutlierRejection):
 class SimpleNormDevOutlierRejectionGPU(SimpleNormDevOutlierRejection):
     """GPU-accelerated SimpleNormDevOutlierRejection."""
 
+    def __init__(self, Ih_table, zmax):
+        OutlierRejectionBase.__init__(self, Ih_table, zmax)
+        self.weights = limit_outlier_weights_gpu(self._Ih_table_block)
+
     def _do_outlier_rejection(self):
         block = self._Ih_table_block
         if block.size == 0:
@@ -118,7 +235,11 @@ class SimpleNormDevOutlierRejectionGPU(SimpleNormDevOutlierRejection):
 
         I_gpu = _np_to_tensor(block.intensities, dev, dtype=torch.float64)
         g_gpu = _np_to_tensor(block.inverse_scale_factors, dev, dtype=torch.float64)
-        w_gpu = _np_to_tensor(self.weights, dev, dtype=torch.float64)
+        w_cached = getattr(block, "_gpu_clamped_weights", None)
+        if w_cached is not None and w_cached.device == dev and w_cached.shape[0] == block.size:
+            w_gpu = w_cached
+        else:
+            w_gpu = _np_to_tensor(self.weights, dev, dtype=torch.float64)
 
         assert bool(torch.all(w_gpu > 0.0).item())
 
@@ -158,6 +279,10 @@ class NormDevOutlierRejectionGPU(NormDevOutlierRejection):
     repeatedly slicing scitbx.sparse.matrix or pandas DataFrames.
     """
 
+    def __init__(self, Ih_table, zmax):
+        OutlierRejectionBase.__init__(self, Ih_table, zmax)
+        self.weights = limit_outlier_weights_gpu(self._Ih_table_block)
+
     def _do_outlier_rejection(self):
         block = self._Ih_table_block
         if block.size == 0:
@@ -168,7 +293,11 @@ class NormDevOutlierRejectionGPU(NormDevOutlierRejection):
         n_groups = block.n_groups
         I_gpu = _np_to_tensor(block.intensities, dev, dtype=torch.float64)
         g_gpu = _np_to_tensor(block.inverse_scale_factors, dev, dtype=torch.float64)
-        w_gpu = _np_to_tensor(self.weights, dev, dtype=torch.float64)
+        w_cached = getattr(block, "_gpu_clamped_weights", None)
+        if w_cached is not None and w_cached.device == dev and w_cached.shape[0] == block.size:
+            w_gpu = w_cached
+        else:
+            w_gpu = _np_to_tensor(self.weights, dev, dtype=torch.float64)
         loc_indices_np = block.Ih_table["loc_indices"].to_numpy()
         dataset_ids_np = block.Ih_table["dataset_id"].to_numpy()
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 
+import boost_adaptbx.boost.python
 import numpy as np
 import torch
 from cctbx import miller
@@ -27,8 +28,26 @@ from dials.array_family import flex
 from dials.util import tabulate
 
 from .components import _get_device
+from .ih_table import _pack_hkl
 
+miller_ext = boost_adaptbx.boost.python.import_ext("cctbx_miller_ext")
 logger = logging.getLogger("dials")
+
+
+def _fast_merging_stats_presorted(array):
+    """Calculate merging stats on a miller.array already sorted by packed_indices."""
+    assert array.sigmas() is not None
+    positive_sel = array.sigmas() > 0
+    i_over_sigma_sel = (array.data() / array.sigmas()) > 1.0
+    array = array.select(positive_sel & i_over_sigma_sel)
+    if not array.size():
+        return -1.0, -1.0
+    merge_ext = miller_ext.merge_equivalents_obs(
+        array.indices(), array.data(), array.sigmas(), use_internal_variance=True
+    )
+    r_meas = merge_ext.r_meas
+    cc_one_half = miller.compute_cc_one_half(unmerged=array, return_n_refl=False)
+    return r_meas, cc_one_half
 
 
 def _calculate_combined_raw_intensities_gpu(
@@ -225,6 +244,12 @@ class SingleDatasetIntensityCombinerGPU(SingleDatasetIntensityCombiner):
         dev = _get_device()
         rows = []
         results = {}
+        if self.dataset.size() > 0:
+            hkl_np = flumpy.to_numpy(self.dataset["miller_index"])
+            perm_np = np.ascontiguousarray(
+                np.argsort(_pack_hkl(hkl_np), kind="stable"), dtype=np.uint64
+            )
+            self.dataset = self.dataset.select(flumpy.from_numpy(perm_np))
         miller_set = miller.set(
             crystal_symmetry=self.experiment.crystal.get_crystal_symmetry(
                 assert_is_compatible_unit_cell=False
@@ -240,7 +265,7 @@ class SingleDatasetIntensityCombinerGPU(SingleDatasetIntensityCombiner):
             i_obs.set_observation_type_xray_intensity()
             i_obs.set_sigmas(flumpy.from_numpy(s_np))
             try:
-                rmeas, cchalf = fast_merging_stats(array=i_obs)
+                rmeas, cchalf = _fast_merging_stats_presorted(array=i_obs)
                 logger.debug("Imid: %s, Rmeas %s, cchalf %s", Imid, rmeas, cchalf)
             except RuntimeError:
                 raise DialsMergingStatisticsError(
@@ -272,6 +297,16 @@ class MultiDatasetIntensityCombinerGPU(MultiDatasetIntensityCombiner):
         combined_indices = flex.miller_index([])
         for dataset in self.datasets:
             combined_indices.extend(dataset["miller_index"])
+        perm_gpu = None
+        if combined_indices.size() > 0:
+            hkl_np = flumpy.to_numpy(combined_indices)
+            perm_np = np.ascontiguousarray(
+                np.argsort(_pack_hkl(hkl_np), kind="stable"), dtype=np.int64
+            )
+            combined_indices = combined_indices.select(
+                flumpy.from_numpy(perm_np.view(np.uint64))
+            )
+            perm_gpu = torch.from_numpy(perm_np).to(device=dev, dtype=torch.int64)
         miller_set = miller.set(
             crystal_symmetry=self.active_scalers[
                 0
@@ -288,13 +323,16 @@ class MultiDatasetIntensityCombinerGPU(MultiDatasetIntensityCombiner):
                 s_parts.append(sig_obs_t)
             all_i_t = torch.cat(i_parts, dim=0)
             all_s_t = torch.cat(s_parts, dim=0)
+            if perm_gpu is not None:
+                all_i_t = all_i_t[perm_gpu]
+                all_s_t = all_s_t[perm_gpu]
             i_np = np.ascontiguousarray(all_i_t.cpu().numpy(), dtype=np.float64)
             s_np = np.ascontiguousarray(all_s_t.cpu().numpy(), dtype=np.float64)
             i_obs = miller.array(miller_set, data=flumpy.from_numpy(i_np))
             i_obs.set_observation_type_xray_intensity()
             i_obs.set_sigmas(flumpy.from_numpy(s_np))
             try:
-                rmeas, cchalf = fast_merging_stats(array=i_obs)
+                rmeas, cchalf = _fast_merging_stats_presorted(array=i_obs)
                 logger.debug("Imid: %s, Rmeas %s, cchalf %s", Imid, rmeas, cchalf)
             except RuntimeError:
                 raise DialsMergingStatisticsError(

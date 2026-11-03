@@ -27,17 +27,21 @@ from .components import (
     GaussianSmoother2DGPU,
     GaussianSmoother3DGPU,
     RefinerCalculatorGPU,
+    SHScaleComponentGPU,
     align_axis_along_z_gpu,
     calc_crystal_frame_vectors_gpu,
     calc_lookup_index_gpu,
     calc_theta_phi_gpu,
+    configure_absorption_component_gpu,
     eval_smoother_1d_gpu,
     eval_smoother_2d_gpu,
     eval_smoother_3d_gpu,
+    eval_sph_harm_dense_gpu,
     evaluate_component_gpu,
     rotate_vectors_about_axis_gpu,
 )
 from .error_model import (
+    ErrorModelBinnerGPU,
     ErrorModelRefineryGPU,
     ErrorModelTargetAGPU,
     ErrorModelTargetBGPU,
@@ -47,6 +51,7 @@ from .error_model import (
     update_binner_gpu,
 )
 from .ih_table import (
+    IhTableBlockGPU,
     IhTableGPU,
     calc_Ih_gpu,
     get_block_group_ids_gpu,
@@ -57,7 +62,9 @@ from .outlier_rejection import (
     NormDevOutlierRejectionGPU,
     SimpleNormDevOutlierRejectionGPU,
     TargetedOutlierRejectionGPU,
+    determine_Esq_outlier_index_arrays_gpu,
     determine_outlier_index_arrays_gpu,
+    limit_outlier_weights_gpu,
     reject_outliers_gpu,
 )
 from .refiner import (
