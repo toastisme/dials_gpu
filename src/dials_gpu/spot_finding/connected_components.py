@@ -141,6 +141,8 @@ class PixelListLabellerGPU:
             return self._coords_list[0], self._values_list[0]
         coords = torch.cat(self._coords_list, dim=0)
         values = torch.cat(self._values_list, dim=0)
+        self._coords_list = [coords]
+        self._values_list = [values]
         return coords, values
 
     def coords(self):
@@ -206,48 +208,60 @@ class PixelListLabellerGPU:
 
         # 1. Right neighbor (z, y, x + 1): if present, must be at k + 1
         if M > 1:
-            k_idx = torch.arange(M - 1, dtype=torch.int64, device=self.device)
             has_right = (x[:-1] < W - 1) & (lin_idx[1:] == lin_idx[:-1] + 1)
-            u_x = k_idx[has_right]
-            v_x = u_x + 1
+            u_x = torch.nonzero(has_right, as_tuple=False).squeeze(1)
+            del has_right
             if u_x.numel() > 0:
                 edge_src.append(u_x)
-                edge_dst.append(v_x)
-
-        all_k = torch.arange(M, dtype=torch.int64, device=self.device)
+                edge_dst.append(u_x + 1)
+            else:
+                del u_x
 
         # 2. Down neighbor (z, y + 1, x): target linear index is lin_idx + W
         valid_y = y < H - 1
         if bool(valid_y.any().item()):
-            k_y = all_k[valid_y]
+            k_y = torch.nonzero(valid_y, as_tuple=False).squeeze(1)
+            del valid_y
             target_y = lin_idx[k_y] + W
             pos_y = torch.searchsorted(lin_idx, target_y)
             pos_y_clamped = torch.clamp(pos_y, max=M - 1)
             found_y = (pos_y < M) & (lin_idx[pos_y_clamped] == target_y)
+            del target_y, pos_y
             if bool(found_y.any().item()):
                 edge_src.append(k_y[found_y])
                 edge_dst.append(pos_y_clamped[found_y])
+            del k_y, pos_y_clamped, found_y
+        else:
+            del valid_y
 
         # 3. Next frame neighbor (z + 1, y, x) if 3D
         if not twod:
             valid_z = z < self._last_frame - 1
             if bool(valid_z.any().item()):
-                k_z = all_k[valid_z]
+                k_z = torch.nonzero(valid_z, as_tuple=False).squeeze(1)
+                del valid_z
                 target_z = lin_idx[k_z] + (H * W)
                 pos_z = torch.searchsorted(lin_idx, target_z)
                 pos_z_clamped = torch.clamp(pos_z, max=M - 1)
                 found_z = (pos_z < M) & (lin_idx[pos_z_clamped] == target_z)
+                del target_z, pos_z
                 if bool(found_z.any().item()):
                     edge_src.append(k_z[found_z])
                     edge_dst.append(pos_z_clamped[found_z])
+                del k_z, pos_z_clamped, found_z
+            else:
+                del valid_z
 
+        del lin_idx
         labels = torch.arange(M, dtype=torch.int64, device=self.device)
         if edge_src:
             u = torch.cat(edge_src, dim=0)
             v = torch.cat(edge_dst, dim=0)
+            del edge_src, edge_dst
             # Undirected edges
             u_all = torch.cat([u, v], dim=0)
             v_all = torch.cat([v, u], dim=0)
+            del u, v
 
             while True:
                 next_labels = labels.clone()
@@ -260,9 +274,11 @@ class PixelListLabellerGPU:
                 if torch.equal(next_labels, labels):
                     break
                 labels = next_labels
+            del u_all, v_all
 
         unique_roots, comp_labels = torch.unique(labels, sorted=True, return_inverse=True)
         num_components = int(unique_roots.numel())
+        del labels, unique_roots
         return coords, values, comp_labels, num_components
 
 
@@ -388,11 +404,15 @@ def extract_spots_from_labeller_gpu(
     new_spot_id[valid_spot_mask] = torch.arange(K, dtype=torch.int64, device=device)
 
     pixel_spot_id = new_spot_id[labels]
+    del labels, new_spot_id
     valid_pix_mask = pixel_spot_id >= 0
 
     v_coords = coords[valid_pix_mask]
     v_values = values[valid_pix_mask]
     v_labels = pixel_spot_id[valid_pix_mask]
+    del coords, values, pixel_spot_id, valid_pix_mask
+    labeller._coords_list.clear()
+    labeller._values_list.clear()
 
     vz = v_coords[:, 0]
     vy = v_coords[:, 1]
@@ -514,9 +534,6 @@ def extract_spots_from_labeller_gpu(
     px = vx.to(torch.float64) + 0.5
     py = vy.to(torch.float64) + 0.5
     pz = (vz + zstart).to(torch.float64) + 0.5
-    dx_abs = px - cx[v_labels]
-    dy_abs = py - cy[v_labels]
-    dz_abs = pz - cz[v_labels]
 
     # Summed intensity: Summation<float> accumulates in float32 in Shoebox::summed_intensity()
     # We compute in float64 from float32 values (which for integer photon counts <= 2^24 is exact)
@@ -536,6 +553,7 @@ def extract_spots_from_labeller_gpu(
         0, v_labels, cand_pix_idx, reduce="amin", include_self=False
     )
     peak_coords = torch.stack([px[best_pix_idx], py[best_pix_idx], pz[best_pix_idx]], dim=1)
+    del px, py, pz, max_w, is_max, pix_idx, cand_pix_idx, best_pix_idx
 
     panel_tensor = torch.full((K,), panel_id, dtype=torch.int64, device=device)
 
@@ -608,7 +626,9 @@ def build_shoeboxes_from_gpu_spots(
     )
     shoeboxes = flex.shoebox(panel_flex, bbox_flex, allocate=True)
 
-    # Populate flat buffers on GPU and transfer once via ShoeboxExtractFromData
+    # Compute sparse foreground offsets on GPU and populate flat buffers on CPU
+    # (avoids allocating 9 * total_elems bytes of dense cuboid zeros in GPU VRAM,
+    # which can exceed 4-8 GB when a near-zero RL threshold produces >1M noise spots).
     xsize = bbox_t[:, 1] - bbox_t[:, 0]
     ysize = bbox_t[:, 3] - bbox_t[:, 2]
     zsize = bbox_t[:, 5] - bbox_t[:, 4]
@@ -617,9 +637,8 @@ def build_shoeboxes_from_gpu_spots(
     sbox_starts = sbox_ends - sbox_sizes
     total_elems = int(sbox_ends[-1].item())
 
-    flat_data = torch.zeros((total_elems,), dtype=torch.float32, device=device)
-    flat_bg = torch.zeros((total_elems,), dtype=torch.float32, device=device)
-    flat_mask = torch.zeros((total_elems,), dtype=torch.uint8, device=device)
+    flat_data_np = np.zeros(total_elems, dtype=np.float32)
+    flat_mask_np = np.zeros(total_elems, dtype=np.uint8)
 
     if pixel_coords.shape[0] > 0:
         kk = (pixel_coords[:, 0] + zstart) - bbox_t[pixel_spot_idx, 4]
@@ -627,13 +646,19 @@ def build_shoeboxes_from_gpu_spots(
         ii = pixel_coords[:, 2] - bbox_t[pixel_spot_idx, 0]
         ys = ysize[pixel_spot_idx]
         xs = xsize[pixel_spot_idx]
-        offsets = sbox_starts[pixel_spot_idx] + (kk * ys + jj) * xs + ii
-        flat_data[offsets] = pixel_values_f32
-        flat_mask[offsets] = int(MaskCode.Valid | MaskCode.Foreground)
+        offsets_np = (
+            (sbox_starts[pixel_spot_idx] + (kk * ys + jj) * xs + ii)
+            .detach()
+            .cpu()
+            .numpy()
+        )
+        vals_np = pixel_values_f32.detach().cpu().numpy()
+        flat_data_np[offsets_np] = vals_np
+        flat_mask_np[offsets_np] = int(MaskCode.Valid | MaskCode.Foreground)
 
-    data_flex = flumpy.from_numpy(np.ascontiguousarray(flat_data.detach().cpu().numpy(), dtype=np.float32))
-    bg_flex = flumpy.from_numpy(np.ascontiguousarray(flat_bg.detach().cpu().numpy(), dtype=np.float32))
-    mask_flex = flumpy.from_numpy(np.ascontiguousarray(flat_mask.detach().cpu().numpy(), dtype=np.uint8))
+    data_flex = flumpy.from_numpy(flat_data_np)
+    bg_flex = flex.float(total_elems, 0.0)
+    mask_flex = flumpy.from_numpy(flat_mask_np)
 
     dials_array_family_flex_ext.ShoeboxExtractFromData(shoeboxes, data_flex, bg_flex, mask_flex)
     return shoeboxes

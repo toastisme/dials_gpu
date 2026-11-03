@@ -1323,3 +1323,23 @@ class RadialProfileSpotFinderThresholdGPU:
         thresh_img = thresh_bins[full_bins].reshape(H, W)
         result = (work_img > thresh_img) & mask_t
         return result
+
+    def compute_threshold_batch_tensor(
+        self,
+        img_vol: torch.Tensor,
+        mask_vol: torch.Tensor,
+        *,
+        imageset=None,
+        i_panel: int = 0,
+        region_of_interest=None,
+    ) -> torch.Tensor:
+        out_vol = torch.empty_like(mask_vol, dtype=torch.bool)
+        for b in range(img_vol.shape[0]):
+            out_vol[b] = self.compute_threshold_tensor(
+                img_vol[b].to(torch.float64),
+                mask_vol[b],
+                imageset=imageset,
+                i_panel=i_panel,
+                region_of_interest=region_of_interest,
+            )
+        return out_vol

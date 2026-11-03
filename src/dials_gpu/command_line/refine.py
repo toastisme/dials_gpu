@@ -173,8 +173,9 @@ def run_dials_refine(experiments, reflections, params):
             )
             params.refinement.reflections.outlier.algorithm = "null"
 
-        params.input.reflections = None
-        params.input.experiments = None
+        if hasattr(params, "input"):
+            params.input.reflections = None
+            params.input.experiments = None
 
         refinement_sets = []
         for ids in disjoint_sets:
