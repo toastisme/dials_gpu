@@ -1073,6 +1073,7 @@ class ExtractSpotsGPU:
         min_chunksize: int = 50,
         write_hot_pixel_mask: bool = False,
         force_2d: bool = False,
+        output_shoeboxes: bool = True,
         device: torch.device | None = None,
     ):
         self.threshold_function = threshold_function
@@ -1091,6 +1092,7 @@ class ExtractSpotsGPU:
         self.min_chunksize = min_chunksize
         self.write_hot_pixel_mask = write_hot_pixel_mask
         self.force_2d = force_2d
+        self.output_shoeboxes = output_shoeboxes
         self.device = device or get_default_device()
 
     def __call__(self, imageset):
@@ -1197,8 +1199,8 @@ class ExtractSpotsGPU:
             min_spot_size=self.min_spot_size,
             max_spot_size=self.max_spot_size,
             write_hot_pixel_mask=self.write_hot_pixel_mask,
-            include_shoeboxes=True,
-            include_n_signal=False,
+            include_shoeboxes=self.output_shoeboxes,
+            include_n_signal=not self.output_shoeboxes,
             force_2d=self.force_2d,
             device=self.device,
         )
@@ -1413,11 +1415,7 @@ class ExtractSpotsGPU:
                 if rej:
                     out_vol[i].zero_()
 
-        zyx = torch.nonzero(out_vol, as_tuple=False)
-        if zyx.shape[0] > 0:
-            frame_counts = torch.bincount(zyx[:, 0], minlength=B).cpu().tolist()
-        else:
-            frame_counts = [0] * B
+        frame_counts = out_vol.sum(dim=(1, 2)).cpu().tolist()
 
         max_strong = (
             int(math.ceil(self.max_strong_pixel_fraction * (H * W)))
@@ -1443,7 +1441,8 @@ class ExtractSpotsGPU:
                 )
                 logger.info(f"Average background on image {frame_log} is {avg_bg}")
 
-        if zyx.shape[0] > 0:
+        if sum(frame_counts) > 0:
+            zyx = torch.nonzero(out_vol, as_tuple=False)
             vals = work_vol[out_vol].to(torch.float64)
             if first_frame != 0:
                 zyx[:, 0] += first_frame
@@ -1619,6 +1618,63 @@ class _SpotFinderGPUMixin:
     to use ExtractSpotsGPU on the GPU.
     """
 
+    def find_spots(self, experiments: ExperimentList) -> flex.reflection_table:
+        imagesets = []
+        for experiment in experiments:
+            if experiment.imageset not in imagesets:
+                imagesets.append(experiment.imageset)
+
+        reflections = flex.reflection_table()
+        for j, imageset in enumerate(imagesets):
+            logger.info(
+                "-" * 80 + f"\nFinding strong spots in imageset {j}\n" + "-" * 80
+            )
+            table, hot_mask = self._find_spots_in_imageset(imageset)
+
+            table["id"] = flex.int(table.nrows(), -1)
+            for i, experiment in enumerate(experiments):
+                if experiment.imageset is not imageset:
+                    continue
+                if not self.is_stills and experiment.scan:
+                    z0, z1 = experiment.scan.get_array_range()
+                    z = table["xyzobs.px.value"].parts()[2]
+                    table["id"].set_selected((z > z0) & (z < z1), i)
+                    if experiment.identifier:
+                        table.experiment_identifiers()[i] = experiment.identifier
+                else:
+                    table["id"] = flex.int(table.nrows(), j)
+                    if experiment.identifier:
+                        table.experiment_identifiers()[j] = experiment.identifier
+            missed = table["id"] == -1
+            assert missed.count(True) == 0, (
+                f"Failed to remap {missed.count(True)} experiment IDs"
+            )
+
+            reflections.extend(table)
+            if self.write_hot_mask:
+                if not imageset.external_lookup.mask.data.empty():
+                    for m1, m2 in zip(hot_mask, imageset.external_lookup.mask.data):
+                        m1 &= m2.data()
+                    imageset.external_lookup.mask.data = ImageBool(hot_mask)
+                else:
+                    imageset.external_lookup.mask.data = ImageBool(hot_mask)
+                imageset.external_lookup.mask.filename = "%s_%d.pickle" % (
+                    self.hot_mask_prefix,
+                    i,
+                )
+                with open(imageset.external_lookup.mask.filename, "wb") as outfile:
+                    pickle.dump(hot_mask, outfile, protocol=pickle.HIGHEST_PROTOCOL)
+
+        reflections.set_flags(
+            flex.size_t_range(len(reflections)), reflections.flags.strong
+        )
+
+        if "shoebox" in reflections:
+            reflections.is_overloaded(experiments)
+
+        reflections = self._post_process(reflections)
+        return reflections
+
     def _find_spots_in_imageset(self, imageset):
         skip_cpu_mask_gen = False
         if (
@@ -1661,6 +1717,7 @@ class _SpotFinderGPUMixin:
             min_chunksize=self.min_chunksize,
             write_hot_pixel_mask=self.write_hot_mask,
             force_2d=getattr(self, "force_2d", False),
+            output_shoeboxes=getattr(self, "output_shoeboxes", True),
             device=getattr(self, "device", None),
         )
 
@@ -1703,9 +1760,17 @@ class _SpotFinderGPUMixin:
 
 
 class SpotFinderGPU(_SpotFinderGPUMixin, SpotFinder):
-    def __init__(self, *args, force_2d: bool = False, device: torch.device | None = None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        force_2d: bool = False,
+        output_shoeboxes: bool = True,
+        device: torch.device | None = None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.force_2d = force_2d
+        self.output_shoeboxes = output_shoeboxes
         self.device = device or get_default_device()
 
 
@@ -1850,6 +1915,7 @@ class SpotFinderFactoryGPU(SpotFinderFactory):
             min_chunksize=params.spotfinder.mp.min_chunksize,
             is_stills=is_stills,
             force_2d=params.spotfinder.force_2d,
+            output_shoeboxes=bool(output_shoeboxes),
             device=device,
         )
 

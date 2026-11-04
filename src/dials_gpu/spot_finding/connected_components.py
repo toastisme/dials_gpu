@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+import triton
+import triton.language as tl
 from dxtbx import flumpy
 
 import dials_array_family_flex_ext
@@ -9,6 +11,38 @@ from dials.algorithms.shoebox import MaskCode
 from dials.array_family import flex
 from dials.model.data import PixelList
 from dials_gpu.spot_finding.threshold import flex_to_tensor, get_default_device
+
+
+@triton.jit
+def _triton_hook_edges_kernel(
+    u_ptr, v_ptr, labels_ptr, changed_ptr, E, BLOCK: tl.constexpr
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    m = offs < E
+    u = tl.load(u_ptr + offs, mask=m, other=0)
+    v = tl.load(v_ptr + offs, mask=m, other=0)
+    lu = tl.load(labels_ptr + u, mask=m, other=0)
+    lv = tl.load(labels_ptr + v, mask=m, other=0)
+    diff = m & (lu != lv)
+    if tl.max(diff.to(tl.int32), axis=0) != 0:
+        hi = tl.maximum(lu, lv)
+        lo = tl.minimum(lu, lv)
+        tl.atomic_min(labels_ptr + hi, lo, mask=diff)
+        tl.atomic_min(labels_ptr + u, lo, mask=diff & (u > lo))
+        tl.atomic_min(labels_ptr + v, lo, mask=diff & (v > lo))
+        tl.store(changed_ptr, 1)
+
+
+@triton.jit
+def _triton_pointer_jump_kernel(labels_ptr, M, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    m = offs < M
+    p = tl.load(labels_ptr + offs, mask=m, other=0)
+    pp = tl.load(labels_ptr + p, mask=m, other=0)
+    ppp = tl.load(labels_ptr + pp, mask=m, other=0)
+    tl.store(labels_ptr + offs, ppp, mask=m)
 
 
 class PixelListLabellerGPU:
@@ -203,13 +237,15 @@ class PixelListLabellerGPU:
             y = coords[:, 1]
             x = coords[:, 2]
 
+        use_triton_cc = coords.is_cuda and M < (1 << 31)
+        idx_dtype = torch.int32 if use_triton_cc else torch.int64
         edge_src = []
         edge_dst = []
 
         # 1. Right neighbor (z, y, x + 1): if present, must be at k + 1
         if M > 1:
             has_right = (x[:-1] < W - 1) & (lin_idx[1:] == lin_idx[:-1] + 1)
-            u_x = torch.nonzero(has_right, as_tuple=False).squeeze(1)
+            u_x = torch.nonzero(has_right, as_tuple=False).squeeze(1).to(idx_dtype)
             del has_right
             if u_x.numel() > 0:
                 edge_src.append(u_x)
@@ -228,8 +264,8 @@ class PixelListLabellerGPU:
             found_y = (pos_y < M) & (lin_idx[pos_y_clamped] == target_y)
             del target_y, pos_y
             if bool(found_y.any().item()):
-                edge_src.append(k_y[found_y])
-                edge_dst.append(pos_y_clamped[found_y])
+                edge_src.append(k_y[found_y].to(idx_dtype))
+                edge_dst.append(pos_y_clamped[found_y].to(idx_dtype))
             del k_y, pos_y_clamped, found_y
         else:
             del valid_y
@@ -246,13 +282,41 @@ class PixelListLabellerGPU:
                 found_z = (pos_z < M) & (lin_idx[pos_z_clamped] == target_z)
                 del target_z, pos_z
                 if bool(found_z.any().item()):
-                    edge_src.append(k_z[found_z])
-                    edge_dst.append(pos_z_clamped[found_z])
+                    edge_src.append(k_z[found_z].to(idx_dtype))
+                    edge_dst.append(pos_z_clamped[found_z].to(idx_dtype))
                 del k_z, pos_z_clamped, found_z
             else:
                 del valid_z
 
         del lin_idx
+        if use_triton_cc:
+            labels_i32 = torch.arange(M, dtype=torch.int32, device=self.device)
+            if edge_src:
+                u = torch.cat(edge_src, dim=0)
+                v = torch.cat(edge_dst, dim=0)
+                del edge_src, edge_dst
+                E = int(u.numel())
+                if E > 0:
+                    changed = torch.zeros(1, dtype=torch.int32, device=self.device)
+                    grid_e = ((E + 1023) // 1024,)
+                    grid_m = ((M + 1023) // 1024,)
+                    while True:
+                        changed.zero_()
+                        _triton_hook_edges_kernel[grid_e](
+                            u, v, labels_i32, changed, E, BLOCK=1024
+                        )
+                        _triton_pointer_jump_kernel[grid_m](labels_i32, M, BLOCK=1024)
+                        if int(changed.item()) == 0:
+                            break
+                    del changed
+                del u, v
+            unique_roots, comp_labels = torch.unique(
+                labels_i32, sorted=True, return_inverse=True
+            )
+            num_components = int(unique_roots.numel())
+            del labels_i32, unique_roots
+            return coords, values, comp_labels, num_components
+
         labels = torch.arange(M, dtype=torch.int64, device=self.device)
         if edge_src:
             u = torch.cat(edge_src, dim=0)
@@ -265,8 +329,13 @@ class PixelListLabellerGPU:
 
             while True:
                 next_labels = labels.clone()
+                lu = labels[u_all]
+                lv = labels[v_all]
                 next_labels.scatter_reduce_(
-                    0, u_all, labels[v_all], reduce="amin", include_self=True
+                    0, lu, lv, reduce="amin", include_self=True
+                )
+                next_labels.scatter_reduce_(
+                    0, u_all, lv, reduce="amin", include_self=True
                 )
                 # Pointer jumping
                 next_labels = next_labels[next_labels]
@@ -466,7 +535,7 @@ def extract_spots_from_labeller_gpu(
     # (sum_sq >= 2^23 or non-integer pixel weights), match scitbx::af::sum / sum_sq sequential float32 order:
     has_non_int = not bool(torch.all(w_f32 == torch.floor(w_f32)).item())
     needs_seq = (sum_w_sq_f64 >= 8388608.0) | (sum_w_f64 >= 8388608.0)
-    if has_non_int or bool(torch.any(needs_seq).item()):
+    if K <= 50000 and (has_non_int or bool(torch.any(needs_seq).item())):
         if has_non_int:
             sel_pix = torch.ones_like(v_labels, dtype=torch.bool)
             spot_ids = torch.arange(K, dtype=torch.int64, device=device)

@@ -192,15 +192,41 @@ def _batch_erode_horiz_bg(
 
 
 @triton.jit
-def _batch_pass2_sparse(
+def _batch_pass2_horiz(
+    src_ptr, bg_mask_ptr, m2h_ptr, x2h_ptr, H, W, kx2, BLOCK_W: tl.constexpr
+):
+    br = tl.program_id(0)
+    c = tl.program_id(1) * BLOCK_W + tl.arange(0, BLOCK_W)
+    in_b = c < W
+    row_off = br * W
+    m = tl.zeros((BLOCK_W,), dtype=tl.int32)
+    x = tl.zeros((BLOCK_W,), dtype=tl.float32)
+    for dx in range(-kx2, kx2 + 1):
+        nc = c + dx
+        v_c = (nc >= 0) & (nc < W)
+        idx = row_off + nc
+        bg = tl.load(bg_mask_ptr + idx, mask=v_c, other=False).to(tl.int1)
+        val = tl.load(src_ptr + idx, mask=v_c & bg, other=0).to(tl.float32)
+        v = v_c & bg & (val < 16777216.0)
+        vx = tl.where(v, val, 0.0)
+        m += tl.where(v, 1, 0)
+        x += vx
+    out_idx = row_off + c
+    tl.store(m2h_ptr + out_idx, m.to(tl.uint8), mask=in_b)
+    tl.store(x2h_ptr + out_idx, x, mask=in_b)
+
+
+@triton.jit
+def _batch_pass2_vert(
     src_ptr,
     mask_ptr,
     bg_mask_ptr,
+    m2h_ptr,
+    x2h_ptr,
     out_ptr,
     H,
     W,
     ky2,
-    kx2,
     nsig_s,
     global_threshold,
     gain_ptr,
@@ -226,17 +252,10 @@ def _batch_pass2_sparse(
     x = tl.zeros((BLOCK_W,), dtype=tl.float32)
     for dy in range(-ky2, ky2 + 1):
         nr = r + dy
-        v_r = (nr >= 0) & (nr < H)
-        row_off = base_b + nr * W
-        for dx in range(-kx2, kx2 + 1):
-            nc = c + dx
-            v_c = v_r & (nc >= 0) & (nc < W) & cand
-            idx = row_off + nc
-            bg_nb = tl.load(bg_mask_ptr + idx, mask=v_c, other=False).to(tl.int1)
-            val_nb = tl.load(src_ptr + idx, mask=v_c & bg_nb, other=0).to(tl.float32)
-            v = v_c & bg_nb & (val_nb < 16777216.0)
-            m_i += tl.where(v, 1, 0)
-            x += tl.where(v, val_nb, 0.0)
+        v_r = (nr >= 0) & (nr < H) & cand
+        idx = base_b + nr * W + c
+        m_i += tl.load(m2h_ptr + idx, mask=v_r, other=0).to(tl.int32)
+        x += tl.load(x2h_ptr + idx, mask=v_r, other=0.0)
     m = m_i.to(tl.float32)
     mean = tl.where(m_i >= 2, x / tl.maximum(m, 1.0), 0.0)
     if mode == 0:
@@ -955,15 +974,19 @@ def dispersion_extended_threshold_batch_gpu(
     r_erode = erosion_distance - 1
     _batch_erode_vert[grid](bufs["dst"], bufs["ev"], H, W, r_erode, 256)
     _batch_erode_horiz_bg[grid](mask, bufs["ev"], bufs["bg_mask"], H, W, r_erode, 256)
-    _batch_pass2_sparse[grid](
+    _batch_pass2_horiz[grid](
+        src, bufs["bg_mask"], bufs["mh"], bufs["xh"], H, W, kx + 2, 256
+    )
+    _batch_pass2_vert[grid](
         src,
         mask,
         bufs["bg_mask"],
+        bufs["mh"],
+        bufs["xh"],
         out,
         H,
         W,
         ky + 2,
-        kx + 2,
         float(nsig_s),
         float(global_threshold),
         gain_ptr,
