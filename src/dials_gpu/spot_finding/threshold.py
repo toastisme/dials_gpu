@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -107,18 +108,27 @@ def _batch_pass1_vert(
     c = tl.program_id(1) * BLOCK_W + tl.arange(0, BLOCK_W)
     in_b = c < W
     base_b = b * H * W
+    out_idx = br * W + c
+    mk = tl.load(mask_ptr + out_idx, mask=in_b, other=False).to(tl.int1)
+    if not is_extended:
+        src_val = tl.load(src_ptr + out_idx, mask=in_b, other=0).to(tl.float32)
+        cand = in_b & mk & (src_val > global_threshold)
+        if tl.max(cand.to(tl.int32), axis=0) == 0:
+            tl.store(dst_ptr + out_idx, False, mask=in_b)
+            return
+    else:
+        src_val = tl.zeros((BLOCK_W,), dtype=tl.float32)
+        cand = in_b
     m_i = tl.zeros((BLOCK_W,), dtype=tl.int32)
     x = tl.zeros((BLOCK_W,), dtype=tl.float32)
     y = tl.zeros((BLOCK_W,), dtype=tl.float32)
     for dy in range(-ky, ky + 1):
         nr = r + dy
-        v_r = (nr >= 0) & (nr < H) & in_b
+        v_r = (nr >= 0) & (nr < H) & cand
         idx = base_b + nr * W + c
         m_i += tl.load(mh_ptr + idx, mask=v_r, other=0).to(tl.int32)
         x += tl.load(xh_ptr + idx, mask=v_r, other=0.0)
         y += tl.load(yh_ptr + idx, mask=v_r, other=0.0)
-    out_idx = br * W + c
-    mk = tl.load(mask_ptr + out_idx, mask=in_b, other=False).to(tl.int1)
     m = m_i.to(tl.float32)
     m1 = m - 1.0
     sqrt_2m1 = tl.sqrt(tl.maximum(2.0 * m1, 0.0))
@@ -136,7 +146,6 @@ def _batch_pass1_vert(
         disp_pass = (m_i >= min_count) & (x >= 0.0) & (a > c_val)
         out = tl.where(mk, disp_pass, True)
     else:
-        src_val = tl.load(src_ptr + out_idx, mask=in_b, other=0).to(tl.float32)
         b_val = m * src_val - x
         if mode == 0:
             d = nsig_s * tl.sqrt(tl.maximum(x * m, 0.0))
@@ -145,10 +154,9 @@ def _batch_pass1_vert(
         else:
             d = nsig_s * tl.sqrt(tl.maximum(g * x * m, 0.0))
         out = (
-            mk
+            cand
             & (m_i >= min_count)
             & (x >= 0.0)
-            & (src_val > global_threshold)
             & (a > c_val)
             & (b_val > d)
         )
@@ -278,7 +286,7 @@ def _triton_pass1_horiz(
     yh_ptr,
     H,
     W,
-    kx: tl.constexpr,
+    kx,
     BLOCK_W: tl.constexpr,
 ):
     r = tl.program_id(0)
@@ -288,7 +296,7 @@ def _triton_pass1_horiz(
     x = tl.zeros((BLOCK_W,), dtype=tl.float64)
     y = tl.zeros((BLOCK_W,), dtype=tl.float64)
     row_off = r * W
-    for dx in tl.static_range(-kx, kx + 1):
+    for dx in range(-kx, kx + 1):
         nc = c + dx
         v_c = (nc >= 0) & (nc < W)
         idx = row_off + nc
@@ -315,7 +323,7 @@ def _triton_pass1_vert(
     dst_ptr,
     H,
     W,
-    ky: tl.constexpr,
+    ky,
     min_count,
     nsig_b,
     nsig_s,
@@ -329,18 +337,24 @@ def _triton_pass1_vert(
     r = tl.program_id(0)
     c = tl.program_id(1) * BLOCK_W + tl.arange(0, BLOCK_W)
     in_b = c < W
+    out_idx = r * W + c
+    mk = tl.load(mask_ptr + out_idx, mask=in_b, other=False).to(tl.int1)
+    if not is_extended:
+        src_val = tl.load(src_ptr + out_idx, mask=in_b, other=0).to(tl.float64)
+        cand = in_b & mk & (src_val > global_threshold)
+        if tl.sum(cand.to(tl.int32), axis=0) == 0:
+            tl.store(dst_ptr + out_idx, False, mask=in_b)
+            return
     m_i = tl.zeros((BLOCK_W,), dtype=tl.int32)
     x = tl.zeros((BLOCK_W,), dtype=tl.float64)
     y = tl.zeros((BLOCK_W,), dtype=tl.float64)
-    for dy in tl.static_range(-ky, ky + 1):
+    for dy in range(-ky, ky + 1):
         nr = r + dy
         v_r = (nr >= 0) & (nr < H) & in_b
         idx = nr * W + c
         m_i += tl.load(mh_ptr + idx, mask=v_r, other=0)
         x += tl.load(xh_ptr + idx, mask=v_r, other=0.0)
         y += tl.load(yh_ptr + idx, mask=v_r, other=0.0)
-    out_idx = r * W + c
-    mk = tl.load(mask_ptr + out_idx, mask=in_b, other=False).to(tl.int1)
     m = m_i.to(tl.float64)
     m1 = m - 1.0
     sqrt_2m1 = tl.sqrt(tl.maximum(2.0 * m1, 0.0))
@@ -358,7 +372,6 @@ def _triton_pass1_vert(
         disp_pass = (m_i >= min_count) & (x >= 0.0) & (a > c_val)
         out = tl.where(mk, disp_pass, True)
     else:
-        src_val = tl.load(src_ptr + out_idx, mask=in_b, other=0).to(tl.float64)
         b = m * src_val - x
         if mode == 0:
             d = nsig_s * tl.sqrt(tl.maximum(x * m, 0.0))
@@ -378,12 +391,12 @@ def _triton_pass1_vert(
 
 
 @triton.jit
-def _triton_erode_vert(dst_ptr, ev_ptr, H, W, r_erode: tl.constexpr, BLOCK_W: tl.constexpr):
+def _triton_erode_vert(dst_ptr, ev_ptr, H, W, r_erode, BLOCK_W: tl.constexpr):
     r = tl.program_id(0)
     c = tl.program_id(1) * BLOCK_W + tl.arange(0, BLOCK_W)
     in_b = c < W
     acc = tl.full((BLOCK_W,), True, dtype=tl.int1)
-    for dy in tl.static_range(-r_erode, r_erode + 1):
+    for dy in range(-r_erode, r_erode + 1):
         nr = r + dy
         v_r = (nr >= 0) & (nr < H) & in_b
         val = tl.load(dst_ptr + nr * W + c, mask=v_r, other=True).to(tl.int1)
@@ -393,14 +406,14 @@ def _triton_erode_vert(dst_ptr, ev_ptr, H, W, r_erode: tl.constexpr, BLOCK_W: tl
 
 @triton.jit
 def _triton_erode_horiz_bg(
-    mask_ptr, ev_ptr, bg_mask_ptr, H, W, r_erode: tl.constexpr, BLOCK_W: tl.constexpr
+    mask_ptr, ev_ptr, bg_mask_ptr, H, W, r_erode, BLOCK_W: tl.constexpr
 ):
     r = tl.program_id(0)
     c = tl.program_id(1) * BLOCK_W + tl.arange(0, BLOCK_W)
     in_b = c < W
     row_off = r * W
     eroded = tl.full((BLOCK_W,), True, dtype=tl.int1)
-    for dx in tl.static_range(-r_erode, r_erode + 1):
+    for dx in range(-r_erode, r_erode + 1):
         nc = c + dx
         v_c = (nc >= 0) & (nc < W)
         val = tl.load(ev_ptr + row_off + nc, mask=v_c, other=True).to(tl.int1)
@@ -412,7 +425,7 @@ def _triton_erode_horiz_bg(
 
 @triton.jit
 def _triton_pass2_horiz(
-    src_ptr, bg_mask_ptr, m2h_ptr, x2h_ptr, H, W, kx2: tl.constexpr, BLOCK_W: tl.constexpr
+    src_ptr, bg_mask_ptr, m2h_ptr, x2h_ptr, H, W, kx2, BLOCK_W: tl.constexpr
 ):
     r = tl.program_id(0)
     c = tl.program_id(1) * BLOCK_W + tl.arange(0, BLOCK_W)
@@ -420,7 +433,7 @@ def _triton_pass2_horiz(
     m = tl.zeros((BLOCK_W,), dtype=tl.int32)
     x = tl.zeros((BLOCK_W,), dtype=tl.float64)
     row_off = r * W
-    for dx in tl.static_range(-kx2, kx2 + 1):
+    for dx in range(-kx2, kx2 + 1):
         nc = c + dx
         v_c = (nc >= 0) & (nc < W)
         idx = row_off + nc
@@ -445,7 +458,7 @@ def _triton_pass2_vert(
     out_ptr,
     H,
     W,
-    ky2: tl.constexpr,
+    ky2,
     nsig_s,
     global_threshold,
     gain_ptr,
@@ -456,18 +469,22 @@ def _triton_pass2_vert(
     r = tl.program_id(0)
     c = tl.program_id(1) * BLOCK_W + tl.arange(0, BLOCK_W)
     in_b = c < W
+    out_idx = r * W + c
+    mk = tl.load(mask_ptr + out_idx, mask=in_b, other=False).to(tl.int1)
+    bg = tl.load(bg_mask_ptr + out_idx, mask=in_b, other=False).to(tl.int1)
+    src_val = tl.load(src_ptr + out_idx, mask=in_b, other=0).to(tl.float64)
+    cand = in_b & mk & (~bg) & (src_val > global_threshold)
+    if tl.sum(cand.to(tl.int32), axis=0) == 0:
+        tl.store(out_ptr + out_idx, False, mask=in_b)
+        return
     m_i = tl.zeros((BLOCK_W,), dtype=tl.int32)
     x = tl.zeros((BLOCK_W,), dtype=tl.float64)
-    for dy in tl.static_range(-ky2, ky2 + 1):
+    for dy in range(-ky2, ky2 + 1):
         nr = r + dy
         v_r = (nr >= 0) & (nr < H) & in_b
         idx = nr * W + c
         m_i += tl.load(m2h_ptr + idx, mask=v_r, other=0)
         x += tl.load(x2h_ptr + idx, mask=v_r, other=0.0)
-    out_idx = r * W + c
-    mk = tl.load(mask_ptr + out_idx, mask=in_b, other=False).to(tl.int1)
-    bg = tl.load(bg_mask_ptr + out_idx, mask=in_b, other=False).to(tl.int1)
-    src_val = tl.load(src_ptr + out_idx, mask=in_b, other=0).to(tl.float64)
     m = m_i.to(tl.float64)
     mean = tl.where(m_i >= 2, x / tl.maximum(m, 1.0), 0.0)
     if mode == 0:
@@ -477,14 +494,7 @@ def _triton_pass2_vert(
     else:
         g = tl.load(gain_ptr + out_idx, mask=in_b, other=1.0).to(tl.float64)
         local_thresh = mean + nsig_s * tl.sqrt(tl.maximum(g * mean, 0.0))
-    final = (
-        mk
-        & (m_i >= 0)
-        & (x >= 0.0)
-        & (~bg)
-        & (src_val > global_threshold)
-        & (src_val >= local_thresh)
-    )
+    final = cand & (m_i >= 0) & (x >= 0.0) & (src_val >= local_thresh)
     tl.store(out_ptr + out_idx, final, mask=in_b)
 
 
@@ -1185,6 +1195,41 @@ class DispersionExtendedSpotFinderThresholdGPU(DispersionSpotFinderThresholdGPU)
         )
 
 
+_RADIAL_PANEL_CACHE: OrderedDict[tuple, tuple[torch.Tensor, torch.Tensor, float]] = OrderedDict()
+_MAX_RADIAL_PANEL_CACHE = 32
+
+
+@triton.jit
+def _radial_hist_kernel(
+    img_ptr,
+    mask_ptr,
+    bins_ptr,
+    hist_ptr,
+    counts_ptr,
+    B,
+    NP,
+    N_BINS: tl.constexpr,
+    N_VALS: tl.constexpr,
+    VAL_OFFSET: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    b = tl.program_id(0)
+    pid = tl.program_id(1)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    in_b = offs < NP
+    idx = b * NP + offs
+    mk = tl.load(mask_ptr + idx, mask=in_b, other=False).to(tl.int1)
+    active = in_b & mk
+    if tl.sum(active.to(tl.int32), axis=0) == 0:
+        return
+    rbin = tl.load(bins_ptr + offs, mask=active, other=0)
+    val = tl.load(img_ptr + idx, mask=active, other=0).to(tl.int32)
+    tl.atomic_add(counts_ptr + b * N_BINS + rbin, 1, mask=active)
+    v_clamped = tl.minimum(tl.maximum(val + VAL_OFFSET, 0), N_VALS - 1)
+    h_idx = (b * N_BINS + rbin) * N_VALS + v_clamped
+    tl.atomic_add(hist_ptr + h_idx, 1, mask=active)
+
+
 class RadialProfileSpotFinderThresholdGPU:
     """
     PyTorch GPU implementation of RadialProfileSpotFinderThresholdExt.
@@ -1243,25 +1288,55 @@ class RadialProfileSpotFinderThresholdGPU:
 
         self._panel_cache: dict[tuple, tuple[torch.Tensor, float]] = {}
 
+    def _get_panel_binning_ex(
+        self, imageset, i_panel: int, region_of_interest=None
+    ) -> tuple[torch.Tensor, torch.Tensor, float]:
+        beam = imageset.get_beam()
+        panel = imageset.get_detector()[i_panel]
+        s0 = beam.get_unit_s0()
+        roi_key = tuple(region_of_interest) if region_of_interest else None
+        key = (
+            i_panel,
+            tuple(panel.get_image_size()),
+            tuple(panel.get_pixel_size()),
+            tuple(panel.get_fast_axis()),
+            tuple(panel.get_slow_axis()),
+            tuple(panel.get_origin()),
+            float(panel.get_gain()),
+            tuple(s0),
+            int(self.n_bins),
+            roi_key,
+            self.device.type,
+            self.device.index or 0,
+        )
+        cached = _RADIAL_PANEL_CACHE.get(key)
+        if cached is not None:
+            _RADIAL_PANEL_CACHE.move_to_end(key)
+            return cached
+
+        two_theta = panel.get_two_theta_array(s0)
+        if region_of_interest:
+            x0, x1, y0, y1 = region_of_interest
+            two_theta = two_theta[y0:y1, x0:x1]
+        tt_t = flex_to_tensor(two_theta, device=self.device, dtype=torch.float64)
+        lookup = tt_t - tt_t.min()
+        multiplier = self.n_bins / float((lookup + 1e-10).max().item())
+        lookup = lookup * multiplier
+        bins = torch.floor(lookup).round().to(torch.int64)
+        bins_i64 = torch.clamp(bins, min=0, max=self.n_bins - 1).reshape(-1).contiguous()
+        bins_i32 = bins_i64.to(torch.int32).contiguous()
+        adu = 1.0 / panel.get_gain()
+        entry = (bins_i64, bins_i32, adu)
+        _RADIAL_PANEL_CACHE[key] = entry
+        while len(_RADIAL_PANEL_CACHE) > _MAX_RADIAL_PANEL_CACHE:
+            _RADIAL_PANEL_CACHE.popitem(last=False)
+        return entry
+
     def _get_panel_binning(self, imageset, i_panel: int, region_of_interest=None):
-        key = (id(imageset), i_panel, tuple(region_of_interest) if region_of_interest else None)
-        if key not in self._panel_cache:
-            beam = imageset.get_beam()
-            panel = imageset.get_detector()[i_panel]
-            s0 = beam.get_unit_s0()
-            two_theta = panel.get_two_theta_array(s0)
-            if region_of_interest:
-                x0, x1, y0, y1 = region_of_interest
-                two_theta = two_theta[y0:y1, x0:x1]
-            tt_t = flex_to_tensor(two_theta, device=self.device, dtype=torch.float64)
-            lookup = tt_t - tt_t.min()
-            multiplier = self.n_bins / float((lookup + 1e-10).max().item())
-            lookup = lookup * multiplier
-            bins = torch.floor(lookup).round().to(torch.int64)
-            bins = torch.clamp(bins, min=0, max=self.n_bins - 1)
-            adu = 1.0 / panel.get_gain()
-            self._panel_cache[key] = (bins.reshape(-1), adu)
-        return self._panel_cache[key]
+        bins_i64, _bins_i32, adu = self._get_panel_binning_ex(
+            imageset, i_panel, region_of_interest=region_of_interest
+        )
+        return bins_i64, adu
 
     def compute_threshold(
         self,
@@ -1296,54 +1371,96 @@ class RadialProfileSpotFinderThresholdGPU:
         imageset = imageset or self.imageset
         H, W = img_t.shape
         if self._kernel is not None:
-            padded = F.pad(img_t.unsqueeze(0).unsqueeze(0), (self._pad, self._pad, self._pad, self._pad), mode="replicate")
+            img_f64 = img_t if img_t.dtype == torch.float64 else img_t.to(torch.float64)
+            padded = F.pad(img_f64.unsqueeze(0).unsqueeze(0), (self._pad, self._pad, self._pad, self._pad), mode="replicate")
             work_img = F.conv2d(padded, self._kernel).squeeze(0).squeeze(0)
         else:
             work_img = img_t
 
-        full_bins, adu = self._get_panel_binning(imageset, i_panel, region_of_interest=region_of_interest)
+        full_bins, full_bins_i32, adu = self._get_panel_binning_ex(
+            imageset, i_panel, region_of_interest=region_of_interest
+        )
         mask_flat = mask_t.reshape(-1)
-        val_valid = work_img.reshape(-1)[mask_flat]
-        bin_valid = full_bins[mask_flat]
 
-        # Sort by (bin, value) on GPU
-        val_sorted, perm1 = torch.sort(val_valid)
-        bin_after_val = bin_valid[perm1]
-        bin_sorted, perm2 = torch.sort(bin_after_val, stable=True)
-        val_sorted = val_sorted[perm2]
+        # Fast path for integer unblurred images: single 32-bit packed sort instead of two 64-bit sorts
+        if (
+            self._kernel is None
+            and work_img.is_cuda
+            and self.n_bins <= 128
+            and work_img.dtype in (torch.int32, torch.int16, torch.int64)
+        ):
+            val_valid_i32 = work_img.reshape(-1)[mask_flat].to(torch.int32)
+            bin_valid_i32 = full_bins_i32[mask_flat]
+            counts = torch.bincount(bin_valid_i32, minlength=self.n_bins)
+            ends = torch.cumsum(counts, dim=0)
+            starts = ends - counts
+            valid_bins = counts > 2
+            n_f = counts.to(torch.float64)
+            packed = (bin_valid_i32 << 24) | ((val_valid_i32 + (1 << 22)) & 0xFFFFFF)
+            packed_sorted, _ = torch.sort(packed)
 
-        counts = torch.bincount(bin_sorted, minlength=self.n_bins)
-        ends = torch.cumsum(counts, dim=0)
-        starts = ends - counts
+            def _interp_quantile_packed(p: float) -> torch.Tensor:
+                q_idx = (n_f - 1.0) * p
+                idx_lo = torch.clamp(torch.floor(q_idx).to(torch.int64), min=0)
+                idx_hi = torch.clamp(idx_lo + 1, max=torch.clamp(counts - 1, min=0))
+                frac = q_idx - idx_lo.to(torch.float64)
+                safe_starts = torch.where(valid_bins, starts, torch.zeros_like(starts))
+                safe_lo = torch.where(valid_bins, safe_starts + idx_lo, torch.zeros_like(starts))
+                safe_hi = torch.where(valid_bins, safe_starts + idx_hi, torch.zeros_like(starts))
+                if packed_sorted.numel() == 0:
+                    return torch.zeros(self.n_bins, dtype=torch.float64, device=self.device)
+                v_lo = ((packed_sorted[safe_lo] & 0xFFFFFF) - (1 << 22)).to(torch.float64)
+                v_hi = ((packed_sorted[safe_hi] & 0xFFFFFF) - (1 << 22)).to(torch.float64)
+                res = v_lo * (1.0 - frac) + v_hi * frac
+                return torch.where(valid_bins, res, torch.zeros_like(res))
 
-        valid_bins = counts > 2
-        n_f = counts.to(torch.float64)
+            med_I = _interp_quantile_packed(0.5)
+            q1 = _interp_quantile_packed(0.25)
+            q3 = _interp_quantile_packed(0.75)
+        else:
+            if work_img.dtype != torch.float64:
+                work_img = work_img.to(torch.float64)
+            val_valid = work_img.reshape(-1)[mask_flat]
+            bin_valid = full_bins[mask_flat]
 
-        def _interp_quantile(p: float) -> torch.Tensor:
-            q_idx = (n_f - 1.0) * p
-            idx_lo = torch.clamp(torch.floor(q_idx).to(torch.int64), min=0)
-            idx_hi = torch.clamp(idx_lo + 1, max=torch.clamp(counts - 1, min=0))
-            frac = q_idx - idx_lo.to(torch.float64)
-            safe_starts = torch.where(valid_bins, starts, torch.zeros_like(starts))
-            safe_lo = torch.where(valid_bins, safe_starts + idx_lo, torch.zeros_like(starts))
-            safe_hi = torch.where(valid_bins, safe_starts + idx_hi, torch.zeros_like(starts))
-            if val_sorted.numel() == 0:
-                return torch.zeros(self.n_bins, dtype=torch.float64, device=self.device)
-            v_lo = val_sorted[safe_lo]
-            v_hi = val_sorted[safe_hi]
-            res = v_lo * (1.0 - frac) + v_hi * frac
-            return torch.where(valid_bins, res, torch.zeros_like(res))
+            # Sort by (bin, value) on GPU
+            val_sorted, perm1 = torch.sort(val_valid)
+            bin_after_val = bin_valid[perm1]
+            bin_sorted, perm2 = torch.sort(bin_after_val, stable=True)
+            val_sorted = val_sorted[perm2]
 
-        med_I = _interp_quantile(0.5)
-        q1 = _interp_quantile(0.25)
-        q3 = _interp_quantile(0.75)
+            counts = torch.bincount(bin_sorted, minlength=self.n_bins)
+            ends = torch.cumsum(counts, dim=0)
+            starts = ends - counts
+
+            valid_bins = counts > 2
+            n_f = counts.to(torch.float64)
+
+            def _interp_quantile(p: float) -> torch.Tensor:
+                q_idx = (n_f - 1.0) * p
+                idx_lo = torch.clamp(torch.floor(q_idx).to(torch.int64), min=0)
+                idx_hi = torch.clamp(idx_lo + 1, max=torch.clamp(counts - 1, min=0))
+                frac = q_idx - idx_lo.to(torch.float64)
+                safe_starts = torch.where(valid_bins, starts, torch.zeros_like(starts))
+                safe_lo = torch.where(valid_bins, safe_starts + idx_lo, torch.zeros_like(starts))
+                safe_hi = torch.where(valid_bins, safe_starts + idx_hi, torch.zeros_like(starts))
+                if val_sorted.numel() == 0:
+                    return torch.zeros(self.n_bins, dtype=torch.float64, device=self.device)
+                v_lo = val_sorted[safe_lo]
+                v_hi = val_sorted[safe_hi]
+                res = v_lo * (1.0 - frac) + v_hi * frac
+                return torch.where(valid_bins, res, torch.zeros_like(res))
+
+            med_I = _interp_quantile(0.5)
+            q1 = _interp_quantile(0.25)
+            q3 = _interp_quantile(0.75)
+
         iqr = q3 - q1
-
         add_level = self.n_iqr * iqr
         add_level = torch.where(add_level <= adu, torch.full_like(add_level, 2.0 * adu), add_level)
         thresh_bins = med_I + add_level
 
-        thresh_img = thresh_bins[full_bins].reshape(H, W)
+        thresh_img = thresh_bins[full_bins_i32].reshape(H, W)
         result = (work_img > thresh_img) & mask_t
         return result
 
@@ -1356,10 +1473,82 @@ class RadialProfileSpotFinderThresholdGPU:
         i_panel: int = 0,
         region_of_interest=None,
     ) -> torch.Tensor:
+        imageset = imageset or self.imageset
+        if (
+            self._kernel is None
+            and img_vol.is_cuda
+            and img_vol.is_contiguous()
+            and mask_vol.is_contiguous()
+            and img_vol.dtype in (torch.int32, torch.int16, torch.int64)
+        ):
+            B, H, W = img_vol.shape
+            NP = H * W
+            _bins_i64, bins_i32, adu = self._get_panel_binning_ex(
+                imageset, i_panel, region_of_interest=region_of_interest
+            )
+            N_VALS = 4096
+            VAL_OFFSET = 16
+            hist = torch.zeros((B, self.n_bins, N_VALS), dtype=torch.int32, device=self.device)
+            counts = torch.zeros((B, self.n_bins), dtype=torch.int32, device=self.device)
+            grid = (B, triton.cdiv(NP, 1024))
+            _radial_hist_kernel[grid](
+                img_vol,
+                mask_vol,
+                bins_i32,
+                hist,
+                counts,
+                B,
+                NP,
+                self.n_bins,
+                N_VALS,
+                VAL_OFFSET,
+                1024,
+            )
+            cdf = torch.cumsum(hist, dim=2)
+            valid_bins = counts > 2
+            n_f = counts.to(torch.float64)
+
+            def _hist_quantile(p: float) -> tuple[torch.Tensor, torch.Tensor]:
+                q_idx = (n_f - 1.0) * p
+                idx_lo = torch.clamp(torch.floor(q_idx).to(torch.int32), min=0)
+                idx_hi = torch.clamp(idx_lo + 1, max=torch.clamp(counts - 1, min=0))
+                frac = q_idx - idx_lo.to(torch.float64)
+                queries = torch.stack([idx_lo + 1, idx_hi + 1], dim=-1)
+                v_idx = torch.searchsorted(cdf, queries, right=False)
+                overflow = valid_bins & ((v_idx[..., 0] <= 0) | (v_idx[..., 1] >= N_VALS - 1))
+                vals = (v_idx - VAL_OFFSET).to(torch.float64)
+                res = vals[..., 0] * (1.0 - frac) + vals[..., 1] * frac
+                return torch.where(valid_bins, res, torch.zeros_like(res)), overflow
+
+            med_I, ov_med = _hist_quantile(0.5)
+            q1, ov_q1 = _hist_quantile(0.25)
+            q3, ov_q3 = _hist_quantile(0.75)
+            frame_overflow = (ov_med | ov_q1 | ov_q3).any(dim=1)
+
+            iqr = q3 - q1
+            add_level = self.n_iqr * iqr
+            add_level = torch.where(
+                add_level <= adu, torch.full_like(add_level, 2.0 * adu), add_level
+            )
+            thresh_bins = med_I + add_level  # [B, n_bins]
+            thresh_vol = thresh_bins[:, bins_i32].reshape(B, H, W)
+            out_vol = (img_vol > thresh_vol) & mask_vol
+
+            if frame_overflow.any():
+                for b in torch.nonzero(frame_overflow, as_tuple=False).flatten().tolist():
+                    out_vol[b] = self.compute_threshold_tensor(
+                        img_vol[b],
+                        mask_vol[b],
+                        imageset=imageset,
+                        i_panel=i_panel,
+                        region_of_interest=region_of_interest,
+                    )
+            return out_vol
+
         out_vol = torch.empty_like(mask_vol, dtype=torch.bool)
         for b in range(img_vol.shape[0]):
             out_vol[b] = self.compute_threshold_tensor(
-                img_vol[b].to(torch.float64),
+                img_vol[b],
                 mask_vol[b],
                 imageset=imageset,
                 i_panel=i_panel,
