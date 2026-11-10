@@ -26,7 +26,9 @@ cd "$ROOT"
 
 # --- Locate the DIALS Python environment ---------------------------------------
 if [[ -z "${PYTHON:-}" ]]; then
-    for cand in libtbx.python python3 python; do
+    # python3 first: in CMake-built DIALS a leftover libtbx.python dispatcher from
+    # an older SCons build can put a stale cctbx (and its Boost) on sys.path.
+    for cand in python3 dials.python libtbx.python python; do
         if command -v "$cand" >/dev/null 2>&1 && "$cand" -c 'import dials' >/dev/null 2>&1; then
             PYTHON="$(command -v "$cand")"
             break
