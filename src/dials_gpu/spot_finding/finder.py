@@ -1415,7 +1415,17 @@ class ExtractSpotsGPU:
                 if rej:
                     out_vol[i].zero_()
 
-        frame_counts = out_vol.sum(dim=(1, 2)).cpu().tolist()
+        # Count strong pixels per frame before torch.nonzero, so max_strong is
+        # checked before a huge nonzero. Sum the bool volume as uint8 into int32
+        # (a plain .sum() first casts the whole volume to int64), and copy into
+        # pinned memory waiting only on the compute stream: a blocking .cpu() to
+        # pageable memory stalls behind the next slab's H2D copy on copy_stream,
+        # which serialises the load/compute pipeline (~1.3 s on 720 Pilatus 6M frames).
+        counts_dev = out_vol.view(torch.uint8).view(B, -1).sum(1, dtype=torch.int32)
+        counts_host = torch.empty(B, dtype=torch.int32, pin_memory=True)
+        counts_host.copy_(counts_dev, non_blocking=True)
+        torch.cuda.current_stream(self.device).synchronize()
+        frame_counts = counts_host.tolist()
 
         max_strong = (
             int(math.ceil(self.max_strong_pixel_fraction * (H * W)))

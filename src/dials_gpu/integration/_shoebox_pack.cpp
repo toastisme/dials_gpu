@@ -4293,7 +4293,20 @@ boost::python::tuple parallel_predict_scan_varying(
     vec3<double> s0 = beam.get_s0();
     mat3<double> r_fixed = goniometer.get_fixed_rotation();
     mat3<double> r_setting = goniometer.get_setting_rotation();
-    ScanVaryingRayPredictor predict_rays(s0, m2, array_range[0], scan.get_oscillation(), dmin);
+    // Scan accessors must not be called from the worker threads: Scan::get_oscillation()
+    // copies a scitbx::af::shared out of the scan's properties table, and scitbx's
+    // non-atomic reference counting then races (heap-use-after-free, found with ASan).
+    // Read the values once here and reproduce dxtbx's conversions exactly.
+    const vec2<double> osc = scan.get_oscillation();
+    const int image0 = scan.get_image_range()[0];
+    auto angle_from_array_index = [osc, image0](int array_index) {
+        double index = static_cast<double>(array_index) + 1;  // Scan::get_angle_from_array_index
+        return osc[0] + (index - image0) * osc[1];
+    };
+    auto array_index_from_angle = [osc, image0](double angle) {
+        return (image0 + (angle - osc[0]) / osc[1]) - 1;  // Scan::get_array_index_from_angle
+    };
+    ScanVaryingRayPredictor predict_rays(s0, m2, array_range[0], osc, dmin);
 
     cctbx::sgtbx::space_group sg_base = space_group_type.group();
     std::vector<ThreadPredVecs> frame_preds(static_cast<std::size_t>(n_frames));
@@ -4303,8 +4316,8 @@ boost::python::tuple parallel_predict_scan_varying(
         if (i < 0) i = 0;
         if (i >= static_cast<int>(A.size()) - 1) i = static_cast<int>(A.size()) - 2;
 
-        double phi_beg = scan.get_angle_from_array_index(frame);
-        double phi_end = scan.get_angle_from_array_index(frame + 1);
+        double phi_beg = angle_from_array_index(frame);
+        double phi_end = angle_from_array_index(frame + 1);
         mat3<double> r_beg = axis_and_angle_as_matrix(m2, phi_beg);
         mat3<double> r_end = axis_and_angle_as_matrix(m2, phi_end);
         mat3<double> A1 = r_setting * r_beg * r_fixed * A[i];
@@ -4331,7 +4344,7 @@ boost::python::tuple parallel_predict_scan_varying(
                             std::size_t panel_idx = impact->first;
                             vec2<double> mm = impact->second;
                             vec2<double> px = detector[panel_idx].millimeter_to_pixel(mm);
-                            double f_obs = scan.get_array_index_from_angle(ray->angle);
+                            double f_obs = array_index_from_angle(ray->angle);
                             out.hkl.push_back(h);
                             out.enter.push_back(ray->entering);
                             out.s1.push_back(ray->s1);

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import concurrent.futures
 import copy
 import logging
 import sys
@@ -105,46 +104,38 @@ def index(experiments, reflections, params):
             known_crystal_models=known_crystal_models,
         )
     else:
+        # Index each imageset in turn, in this process. DIALS uses a forked
+        # ProcessPoolExecutor here, but a forked child cannot use the CUDA context
+        # already initialised in the parent ("Cannot re-initialize CUDA in forked
+        # subprocess"). All imagesets share one GPU, so separate processes would
+        # gain little and would each pay CUDA start-up. indexing.nproc is unused.
         indexed_experiments = ExperimentList()
-
-        with concurrent.futures.ProcessPoolExecutor(
-            max_workers=params.indexing.nproc
-        ) as pool:
-            futures = {}
-            for iset_id, imgset in enumerate(experiments.imagesets()):
-                refl = reflections.select(reflections["imageset_id"] == iset_id)
-                i_expts = experiments.where(imageset=imgset)
-                elist = ExperimentList([experiments[i] for i in i_expts])
-                known_crystal_models_this = None
-                if known_crystal_models:
-                    known_crystal_models_this = [
-                        known_crystal_models[i] for i in i_expts
-                    ]
-                refl["imageset_id"] = flex.int(len(refl), 0)
-                futures[
-                    pool.submit(
-                        _index_experiments,
-                        elist,
-                        refl,
-                        copy.deepcopy(params),
-                        known_crystal_models=known_crystal_models_this,
-                        log_text=f"Indexing imageset id {iset_id} ({iset_id + 1}/{len(experiments.imagesets())})",
-                    )
-                ] = iset_id
-
-            tables_list = []
-            for future in concurrent.futures.as_completed(futures):
-                try:
-                    iset_id = futures[future]
-                    idx_expts, idx_refl = future.result()
-                except DialsIndexError as e:
-                    logger.warning(str(e))
-                else:
-                    if idx_expts is None:
-                        continue
-                    idx_refl["imageset_id"] = flex.int(idx_refl.size(), iset_id)
-                    tables_list.append(idx_refl)
-                    indexed_experiments.extend(idx_expts)
+        tables_list = []
+        imagesets = experiments.imagesets()
+        for iset_id, imgset in enumerate(imagesets):
+            refl = reflections.select(reflections["imageset_id"] == iset_id)
+            i_expts = experiments.where(imageset=imgset)
+            elist = ExperimentList([experiments[i] for i in i_expts])
+            known_crystal_models_this = None
+            if known_crystal_models:
+                known_crystal_models_this = [known_crystal_models[i] for i in i_expts]
+            refl["imageset_id"] = flex.int(len(refl), 0)
+            try:
+                idx_expts, idx_refl = _index_experiments(
+                    elist,
+                    refl,
+                    copy.deepcopy(params),
+                    known_crystal_models=known_crystal_models_this,
+                    log_text=f"Indexing imageset id {iset_id} ({iset_id + 1}/{len(imagesets)})",
+                )
+            except DialsIndexError as e:
+                logger.warning(str(e))
+                continue
+            if idx_expts is None:
+                continue
+            idx_refl["imageset_id"] = flex.int(idx_refl.size(), iset_id)
+            tables_list.append(idx_refl)
+            indexed_experiments.extend(idx_expts)
         indexed_reflections = flex.reflection_table.concat(tables_list)
 
     return indexed_experiments, indexed_reflections

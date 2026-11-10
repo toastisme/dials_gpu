@@ -1,0 +1,25 @@
+{
+  "defaults": {
+    "timeout": 3600
+  },
+  "datasets": [
+    {
+      "name": "i19_2sweeps",
+      "images": [
+        "/home/davidm/diffraction/test_data/i19/301_Nidppe_f3_phi0/301_NiD_00001_w00017.nxs",
+        "/home/davidm/diffraction/test_data/i19/301_Nidppe_f3_phi0/301_NiD_00001_w00019.nxs"
+      ],
+      "index": ["space_group=P21/n", "unit_cell=11.39,13.30,15.82,90,99.02,90", "joint_indexing=False"]
+    },
+    {
+      "name": "c2sum_90img",
+      "images": ["/home/davidm/diffraction/test_data/C2sum_1/C2sum_1_00[0-8]?.cbf.gz"],
+      "index": "space_group=C2",
+      "timeout": 1800
+    },
+    {
+      "name": "single_image",
+      "images": ["../test_data/C2sum_1_0001.cbf.gz"]
+    }
+  ]
+}

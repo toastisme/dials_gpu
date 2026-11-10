@@ -48,6 +48,9 @@ def _get_triton_batch_scratch(
             "dst": torch.empty((B, H, W), dtype=torch.bool, device=device),
             "ev": torch.empty((B, H, W), dtype=torch.bool, device=device),
             "bg_mask": torch.empty((B, H, W), dtype=torch.bool, device=device),
+            "cand_flag": torch.empty(
+                (B * H, triton.cdiv(W, 256)), dtype=torch.uint8, device=device
+            ),
         }
         _TRITON_BATCH_SCRATCH_CACHE[key] = bufs
     return bufs
@@ -182,10 +185,20 @@ def _batch_erode_vert(dst_ptr, ev_ptr, H, W, r_erode, BLOCK_W: tl.constexpr):
 
 @triton.jit
 def _batch_erode_horiz_bg(
-    mask_ptr, ev_ptr, bg_mask_ptr, H, W, r_erode, BLOCK_W: tl.constexpr
+    mask_ptr,
+    ev_ptr,
+    bg_mask_ptr,
+    src_ptr,
+    cand_flag_ptr,
+    H,
+    W,
+    r_erode,
+    global_threshold,
+    BLOCK_W: tl.constexpr,
 ):
     br = tl.program_id(0)
-    c = tl.program_id(1) * BLOCK_W + tl.arange(0, BLOCK_W)
+    cb = tl.program_id(1)
+    c = cb * BLOCK_W + tl.arange(0, BLOCK_W)
     in_b = c < W
     row_off = br * W
     eroded = tl.full((BLOCK_W,), True, dtype=tl.int1)
@@ -197,14 +210,45 @@ def _batch_erode_horiz_bg(
     mk = tl.load(mask_ptr + row_off + c, mask=in_b, other=False).to(tl.int1)
     bg = mk & (~eroded)
     tl.store(bg_mask_ptr + row_off + c, bg, mask=in_b)
+    # Pass-2 candidates (same definition as in _batch_pass2_vert). One flag per
+    # (row, column block) lets _batch_pass2_horiz skip blocks no candidate needs.
+    src_val = tl.load(src_ptr + row_off + c, mask=in_b, other=0).to(tl.float32)
+    cand = in_b & mk & (~bg) & (src_val > global_threshold)
+    has_cand = tl.max(cand.to(tl.int32), axis=0)
+    tl.store(cand_flag_ptr + br * tl.num_programs(1) + cb, has_cand.to(tl.uint8))
 
 
 @triton.jit
 def _batch_pass2_horiz(
-    src_ptr, bg_mask_ptr, m2h_ptr, x2h_ptr, H, W, kx2, BLOCK_W: tl.constexpr
+    src_ptr,
+    bg_mask_ptr,
+    m2h_ptr,
+    x2h_ptr,
+    cand_flag_ptr,
+    H,
+    W,
+    kx2,
+    ky2,
+    BLOCK_W: tl.constexpr,
 ):
     br = tl.program_id(0)
-    c = tl.program_id(1) * BLOCK_W + tl.arange(0, BLOCK_W)
+    cb = tl.program_id(1)
+    n_cb = tl.num_programs(1)
+    b = br // H
+    r = br - b * H
+    # _batch_pass2_vert reads these sums only at candidate pixels in this column
+    # block, from rows within +-ky2. If no such row has a candidate, nothing will
+    # read this block, so skip it (stale values are never read: the vertical pass
+    # masks its loads by candidate). Dense candidates (low thresholds) still get
+    # the separable O(kx + ky) cost per pixel.
+    needed = 0
+    for dy in range(-ky2, ky2 + 1):
+        nr = r + dy
+        if (nr >= 0) & (nr < H):
+            needed = needed | tl.load(cand_flag_ptr + (br + dy) * n_cb + cb).to(tl.int32)
+    if needed == 0:
+        return
+    c = cb * BLOCK_W + tl.arange(0, BLOCK_W)
     in_b = c < W
     row_off = br * W
     m = tl.zeros((BLOCK_W,), dtype=tl.int32)
@@ -983,9 +1027,29 @@ def dispersion_extended_threshold_batch_gpu(
     )
     r_erode = erosion_distance - 1
     _batch_erode_vert[grid](bufs["dst"], bufs["ev"], H, W, r_erode, 256)
-    _batch_erode_horiz_bg[grid](mask, bufs["ev"], bufs["bg_mask"], H, W, r_erode, 256)
+    _batch_erode_horiz_bg[grid](
+        mask,
+        bufs["ev"],
+        bufs["bg_mask"],
+        src,
+        bufs["cand_flag"],
+        H,
+        W,
+        r_erode,
+        float(global_threshold),
+        256,
+    )
     _batch_pass2_horiz[grid](
-        src, bufs["bg_mask"], bufs["mh"], bufs["xh"], H, W, kx + 2, 256
+        src,
+        bufs["bg_mask"],
+        bufs["mh"],
+        bufs["xh"],
+        bufs["cand_flag"],
+        H,
+        W,
+        kx + 2,
+        ky + 2,
+        256,
     )
     _batch_pass2_vert[grid](
         src,
