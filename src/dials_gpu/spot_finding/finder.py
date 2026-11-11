@@ -326,9 +326,134 @@ def _hdf5_pieces(layout, z0: int, B: int):
 
 
 def _map_invalid_pixels(frame_i32: np.ndarray, top: int | None) -> None:
-    if top is not None:
+    """Map `top - 1` to -1 and `top - 2` to -2, as dxtbx does, in place."""
+    if top is None:
+        return
+    if top <= 2**16:
+        # Values never exceed top - 1 here, so subtracting `top` from the two highest
+        # values is the mapping: one compare and a masked subtract, no fancy indexing.
+        np.subtract(frame_i32, top, out=frame_i32, where=frame_i32 >= top - 2)
+    elif frame_i32.max() >= top - 2:  # 32-bit: these values are rare, check first
         frame_i32[frame_i32 == top - 1] = -1
         frame_i32[frame_i32 == top - 2] = -2
+
+
+def map_invalid_pixels_gpu(vol: torch.Tensor, top: int | None) -> None:
+    """GPU version of `_map_invalid_pixels` for an int32 tensor, in place. Works a frame at
+    a time so the temporaries stay small."""
+    if top is None:
+        return
+    for f in vol if vol.dim() == 3 else (vol,):
+        torch.where(f >= top - 2, (f - (top - 1)) - 1, f, out=f)
+
+
+def _hdf5_slice(imageset, slice_start: int, slice_len: int | None):
+    """`(path, z0, B, n_total)` for a contiguous slice of a single-panel HDF5 sequence of at
+    most 64 frames, or None."""
+    if h5py is None or not isinstance(imageset, ImageSequence):
+        return None
+    if len(imageset.get_detector()) != 1:
+        return None
+    try:
+        path = imageset.get_path(0)
+    except Exception:
+        return None
+    if not path or not path.endswith((".nxs", ".h5", ".hdf5")):
+        return None
+    all_indices = tuple(imageset.indices())
+    if slice_len is None:
+        indices = all_indices[slice_start:]
+    else:
+        indices = all_indices[slice_start : slice_start + slice_len]
+    B = len(indices)
+    if B == 0 or B > 64:
+        return None
+    z0 = int(indices[0])
+    if indices != tuple(range(z0, z0 + B)):
+        return None
+    return path, z0, B, len(all_indices)
+
+
+def _hdf5_get_chunks(path: str, layout, z0: int, B: int):
+    """
+    `(chunks, pieces)` for frames [z0, z0 + B): `chunks` is the list of compressed
+    bitshuffle-LZ4 frames (from the host cache or read directly), or None when the data
+    are stored any other way, in which case `pieces` (see `_hdf5_pieces`) is set for
+    h5py reads. Raises if the frames cannot be located.
+    """
+    H, W, dtype, _, _ = layout
+    comp_key = (path, z0, B)
+    bshuf_fn = _get_bshuf_decompress()
+    comp_entry = _HDF5_COMPRESSED_CACHE.get(comp_key)
+    if comp_entry is not None and bshuf_fn is not None:
+        _HDF5_COMPRESSED_CACHE.move_to_end(comp_key)
+        return comp_entry[0], None
+    pieces = _hdf5_pieces(layout, z0, B)
+    if pieces is None:
+        raise ValueError("frames not found")
+    if bshuf_fn is not None and all(
+        d.chunks == (1, H, W)
+        and d.id.get_create_plist().get_nfilters() == 1
+        and d.id.get_create_plist().get_filter(0)[0] == 32008
+        for _, d, _, _ in pieces
+    ):
+        chunks = []
+        for _, d, s0, n in pieces:
+            did = d.id
+            chunks.extend(did.read_direct_chunk((s0 + i, 0, 0))[1] for i in range(n))
+        if len(_HDF5_COMPRESSED_CACHE) >= 100:
+            _HDF5_COMPRESSED_CACHE.popitem(last=False)
+        _HDF5_COMPRESSED_CACHE[comp_key] = (chunks, H, W, dtype)
+        return chunks, None
+    return None, pieces
+
+
+def _bshuf_decompress_one(chunk: bytes, dst_ptr: int, n_elems: int, elem_size: int) -> None:
+    _, block_size = struct.unpack(">QI", chunk[:12])
+    in_ptr = ctypes.cast(ctypes.c_char_p(chunk), ctypes.c_void_p).value + 12
+    res = _get_bshuf_decompress()(
+        in_ptr, dst_ptr, n_elems, elem_size, block_size // elem_size
+    )
+    if res < 0:
+        raise RuntimeError(f"bshuf_decompress_lz4 failed with code {res}")
+
+
+def try_read_hdf5_raw_frames(imageset, slice_start: int, slice_len: int, dst: torch.Tensor):
+    """
+    Decompress frames of a bitshuffle-LZ4 HDF5 sequence into `dst` *without* converting
+    them: `dst` is a flat pinned tensor whose storage receives `B * H * W` values of the
+    file's own 2- or 4-byte integer type. Returns `(dtype, invalid_top)` (the caller widens
+    to int32 and applies `map_invalid_pixels_gpu`), or None if the data are not stored as
+    one bitshuffle-LZ4 chunk per frame, in which case nothing was written.
+    Used by the spot-finding pipeline to move the conversion off the CPU: for 16-bit
+    data this also halves the host-to-device transfer.
+    """
+    sl = _hdf5_slice(imageset, slice_start, slice_len)
+    if sl is None:
+        return None
+    path, z0, B, _ = sl
+    layout = _hdf5_frame_layout(path)
+    if layout is None:
+        return None
+    H, W, dtype, top, _ = layout
+    if dtype.itemsize not in (2, 4) or dst.numel() * dst.element_size() < B * H * W * dtype.itemsize:
+        return None
+    try:
+        chunks, _ = _hdf5_get_chunks(path, layout, z0, B)
+    except Exception:
+        return None
+    if chunks is None:
+        return None
+    n_elems = H * W
+    elem_size = dtype.itemsize
+    base = dst.data_ptr()
+    list(
+        _get_bshuf_pool().map(
+            lambda i: _bshuf_decompress_one(chunks[i], base + i * n_elems * elem_size, n_elems, elem_size),
+            range(B),
+        )
+    )
+    return dtype, top
 
 
 def _try_load_hdf5_raw_volume_gpu(
@@ -349,30 +474,12 @@ def _try_load_hdf5_raw_volume_gpu(
       DECTRIS master files with `data_NNNNNN` links. Other compressions fall back to
       h5py slice reads.
     """
-    if h5py is None or not isinstance(imageset, ImageSequence):
+    sl = _hdf5_slice(imageset, slice_start, slice_len)
+    if sl is None:
         return None
-    if len(imageset.get_detector()) != 1:
-        return None
-    try:
-        path = imageset.get_path(0)
-    except Exception:
-        return None
-    if not path or not path.endswith((".nxs", ".h5", ".hdf5")):
-        return None
+    path, z0, B, n_total = sl
 
-    all_indices = tuple(imageset.indices())
-    if slice_len is None:
-        indices = all_indices[slice_start:]
-    else:
-        indices = all_indices[slice_start : slice_start + slice_len]
-    B = len(indices)
-    if B == 0 or B > 64:
-        return None
-    z0 = int(indices[0])
-    if indices != tuple(range(z0, z0 + B)):
-        return None
-
-    use_vram_cache = len(all_indices) <= 64
+    use_vram_cache = n_total <= 64
     dev_key = (device.type, device.index if device.index is not None else 0)
     gpu_key = (path, z0, B, dev_key)
     if use_vram_cache and gpu_key in _HDF5_GPU_VOLUME_CACHE:
@@ -385,33 +492,10 @@ def _try_load_hdf5_raw_volume_gpu(
     H, W, dtype, top, _ = layout
 
     comp_key = (path, z0, B)
-    comp_entry = _HDF5_COMPRESSED_CACHE.get(comp_key)
-    bshuf_fn = _get_bshuf_decompress()
-    chunks = None
-    pieces = None
-    if comp_entry is not None and bshuf_fn is not None:
-        _HDF5_COMPRESSED_CACHE.move_to_end(comp_key)
-        chunks = comp_entry[0]
-    else:
-        try:
-            pieces = _hdf5_pieces(layout, z0, B)
-            if pieces is None:
-                return None
-            if bshuf_fn is not None and all(
-                d.chunks == (1, H, W)
-                and d.id.get_create_plist().get_nfilters() == 1
-                and d.id.get_create_plist().get_filter(0)[0] == 32008
-                for _, d, _, _ in pieces
-            ):
-                chunks = []
-                for _, d, s, n in pieces:
-                    did = d.id
-                    chunks.extend(did.read_direct_chunk((s + i, 0, 0))[1] for i in range(n))
-                if len(_HDF5_COMPRESSED_CACHE) >= 100:
-                    _HDF5_COMPRESSED_CACHE.popitem(last=False)
-                _HDF5_COMPRESSED_CACHE[comp_key] = (chunks, H, W, dtype)
-        except Exception:
-            return None
+    try:
+        chunks, pieces = _hdf5_get_chunks(path, layout, z0, B)
+    except Exception:
+        return None
 
     # Pick the int32 destination: the caller's pinned buffer, a reusable pinned buffer,
     # or a fresh array.
@@ -450,18 +534,13 @@ def _try_load_hdf5_raw_volume_gpu(
             out_base = out_np.ctypes.data
 
             def _decomp_one(i: int):
-                raw_bytes = chunks[i]
-                _, block_size = struct.unpack(">QI", raw_bytes[:12])
-                in_ptr = ctypes.cast(ctypes.c_char_p(raw_bytes), ctypes.c_void_p).value + 12
                 if direct:
                     dst_ptr = out_base + i * n_elems * 4
                     tmp = None
                 else:
                     tmp = np.empty(n_elems, dtype=dtype)
                     dst_ptr = tmp.ctypes.data
-                res = bshuf_fn(in_ptr, dst_ptr, n_elems, elem_size, block_size // elem_size)
-                if res < 0:
-                    raise RuntimeError(f"bshuf_decompress_lz4 failed with code {res}")
+                _bshuf_decompress_one(chunks[i], dst_ptr, n_elems, elem_size)
                 frame = out_np[i]
                 if tmp is not None:
                     np.copyto(frame.reshape(-1), tmp, casting="unsafe")
@@ -1401,10 +1480,58 @@ class ExtractSpotsGPU:
 
         cbf_fn = _get_cbf_batch_reader() if not is_hdf5 else None
         n_threads = min(20, max(2, CPU_COUNT))
+        # Device staging for 16-bit frames: 8 frames, shared by both slots (all its uses are
+        # ordered on copy_stream), allocated on first use.
+        stage_frames = 8
+        raw16_gpu = [None]
+
+        def _stage_raw_hdf5(slot: int, s: int, B: int) -> bool:
+            """Decompress without conversion, copy at the file's bit depth, and widen to
+            int32 and flag invalid pixels on the GPU (cheap there, and on the CPU these
+            passes cost several times the decompression on large detectors)."""
+            flat = pinned_bufs[slot].view(-1)
+            raw = try_read_hdf5_raw_frames(imageset, s, B, flat)
+            if raw is None:
+                return False
+            dtype, top = raw
+            n = B * n_elems
+            dst = gpu_bufs[slot][:B]
+            with torch.cuda.stream(copy_stream):
+                if dtype.itemsize == 2:
+                    if raw16_gpu[0] is None:
+                        raw16_gpu[0] = torch.empty(
+                            (stage_frames, n_elems), dtype=torch.int16, device=self.device
+                        )
+                    host16 = flat.view(torch.int16)[:n].view(B, n_elems)
+                    dst_flat = dst.view(B, n_elems)
+                    for b0 in range(0, B, stage_frames):
+                        nb = min(stage_frames, B - b0)
+                        g16 = raw16_gpu[0][:nb]
+                        g16.copy_(host16[b0 : b0 + nb], non_blocking=True)
+                        for k in range(nb):
+                            f = dst_flat[b0 + k]
+                            f.copy_(g16[k])  # sign-extends
+                            if dtype.kind != "u":
+                                map_invalid_pixels_gpu(f, top)
+                            elif top == 2**16:
+                                # After sign extension 65535 and 65534 are already -1 and
+                                # -2; only the other values >= 32768 need restoring.
+                                torch.where(f < -2, f + 65536, f, out=f)
+                            else:
+                                f.bitwise_and_(0xFFFF)
+                                map_invalid_pixels_gpu(f, top)
+                else:
+                    # int32, or uint32 reinterpreted as int32 like dxtbx's astype
+                    dst.copy_(pinned_bufs[slot][:B], non_blocking=True)
+                    map_invalid_pixels_gpu(dst, top)
+                h2d_events[slot].record(copy_stream)
+            return True
 
         def _load_and_stage(slot: int, s: int, B: int):
             compute_done_events[slot].synchronize()
             loaded = False
+            if is_hdf5 and _stage_raw_hdf5(slot, s, B):
+                return B
             if is_hdf5:
                 res_t = _try_load_hdf5_raw_volume_gpu(
                     imageset,
