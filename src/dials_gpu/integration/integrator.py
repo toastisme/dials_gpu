@@ -834,20 +834,30 @@ def _try_run_slabbed_volume_integration(
             return _read_cbf_batch_fast(
                 cbf_ext, cbf_paths[idx0:idx1], int(dst_slice.ctypes.data), H * W
             )
-        elif is_hdf5:
-            sub_iset = imageset[idx0:idx1]
-            vol_t = _try_load_hdf5_raw_volume_gpu(sub_iset, torch.device("cpu"))
-            if vol_t is None or vol_t.dtype != torch.int32:
+        if is_hdf5:
+            # The fast HDF5 loader reads at most 64 frames per call, but a slab read
+            # (slab_step plus the overlap of reflections spanning the slab edge) is
+            # usually longer, so read in pieces. Failing here would abandon the slab
+            # pass after fit_profiles() had already deferred modelling to it, leaving
+            # an empty profile model and no profile-fitted reflections.
+            for p0 in range(idx0, idx1, 64):
+                p1 = min(p0 + 64, idx1)
+                vol_t = _try_load_hdf5_raw_volume_gpu(
+                    imageset[p0:p1], torch.device("cpu")
+                )
+                if vol_t is None or vol_t.dtype != torch.int32:
+                    break
+                np.copyto(dst_slice[p0 - idx0 : p1 - idx0], vol_t.numpy())
+            else:
+                return True
+            # Fast loader declined (e.g. unsupported layout or dtype): use dxtbx.
+            idx0 = p0
+        for k in range(idx0, idx1):
+            arr = flumpy.to_numpy(imageset.get_raw_data(k)[0])
+            if arr.dtype != np.int32:
                 return False
-            np.copyto(dst_slice, vol_t.numpy())
-            return True
-        else:
-            for k in range(count):
-                arr = flumpy.to_numpy(imageset.get_raw_data(idx0 + k)[0])
-                if arr.dtype != np.int32:
-                    return False
-                np.copyto(dst_slice[k], arr)
-            return True
+            np.copyto(dst_slice[k - (f_start - frame0)], arr)
+        return True
 
     read_time = 0.0
     extract_time = 0.0
@@ -971,6 +981,13 @@ def _try_run_slabbed_volume_integration(
                 if n_new > 0:
                     ok = _read_chunk_into(new_f0, slab_f1, slab_buf[n_ov : n_ov + n_new])
                     if not ok:
+                        if single_pass_ctx is not None:
+                            # fit_profiles() deferred modelling to this pass, so the
+                            # non-slab fallback would fit with an empty profile model.
+                            raise RuntimeError(
+                                f"dials_gpu: could not read frames {new_f0}-{slab_f1} "
+                                f"of {path0} for single-pass profile modelling"
+                            )
                         return None
             read_time += time_fn() - st_r
 

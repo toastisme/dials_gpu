@@ -446,19 +446,21 @@ How to read it:
 - **Integration closeness is best judged against `dials` with `nproc=1`.** With `nproc>1`, DIALS splits the sweep into jobs and treats reflections near job boundaries differently, so its own `nproc=20` and `nproc=1` results differ (`r = 0.9987` for summation intensities on `C2sum_1`); `dials_gpu` reproduces `nproc=1`. With `--cpu-integrate-nproc1` the report compares against `nproc=1` and shows the `nproc=N` comparison and DIALS's own `nproc=N` vs `nproc=1` difference for reference; without it, a low correlation against `nproc=N` alone is not evidence of a `dials_gpu` problem.
 - **Dynamic masks are flagged** in the report, since they disable the fast integration path.
 
-Three-way reference result for `C2sum_1` (720 images; 2026-11-10; i9-13900H, 20 CPUs; RTX 2000 Ada Laptop GPU 8 GB; DIALS `3.dev.1573`; mxi 1.2.0 with CUDA, without FFTW; space group C2 with the known cell; `max_refine=5` for `dials` and `dials_gpu`; `--cpu-integrate-nproc1`). `dials` and mxi read the NXmx conversion above; **`dials_gpu` figures are from the original CBF images** (the run below), because `dials_gpu.integrate` currently produces no profile-fitted reflections on this NXmx file (summation intensities are correct) and its scaling then fails. The images and geometry are identical, but `dials_gpu`'s times therefore include CBF decompression instead of HDF5 reading:
+Three-way reference result for `C2sum_1` (720 images; 2026-11-10; i9-13900H, 20 CPUs; RTX 2000 Ada Laptop GPU 8 GB; DIALS `3.dev.1573`; torch `2.12.0+cu130`; mxi 1.2.0 with CUDA, without FFTW; space group C2 with the known cell; `max_refine=5` for `dials` and `dials_gpu`; `--cpu-integrate-nproc1`). All three read the NXmx conversion above:
 
 | Stage | `dials` | `dials_gpu` warm (first call) | mxi CPU | mxi GPU | `dials_gpu` speed-up | mxi speed-up (best) |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Spot finding | `26.28 s` | **`2.88 s`** (`4.06 s`) | `13.24 s` (`13.28 s`) | `6.74 s` (`6.86 s`) | `9.1×` | `3.9×` |
-| Indexing | `22.23 s` | `6.00 s` (`5.88 s`) | **`5.28 s`** (`5.33 s`) | – | `3.7×` | `4.2×` |
-| Refinement, static | `4.60 s` | `1.25 s` (`1.32 s`) | **`1.20 s`** (`1.27 s`) | – | `3.7×` | `3.8×` |
-| Refinement, scan-varying | `25.08 s` | `3.60 s` (`3.54 s`) | **`2.12 s`** (`2.17 s`) | – | `7.0×` | `11.8×` |
-| Integration (`dials` `nproc=1`) | `195.48 s` | `6.55 s` (`6.31 s`) | `7.32 s` (`7.51 s`) | **`5.92 s`** (`6.25 s`) | `29.8×` | `33.0×` |
-| Integration (`dials` `nproc=20`) | `44.64 s` | `6.55 s` (`6.31 s`) | `7.32 s` (`7.51 s`) | **`5.92 s`** (`6.25 s`) | `6.8×` | `7.5×` |
-| Scaling | `15.80 s` | `1.33 s` (`1.46 s`) | **`1.04 s`** (`1.12 s`) | – | `11.9×` | `15.2×` |
+| Spot finding | `22.66 s` | **`2.86 s`** (`4.01 s`) | `11.65 s` (`11.69 s`) | `6.75 s` (`6.94 s`) | `7.9×` | `3.4×` |
+| Indexing | `20.59 s` | `5.96 s` (`6.08 s`) | **`5.21 s`** (`5.23 s`) | – | `3.5×` | `4.0×` |
+| Refinement, static | `4.16 s` | `1.23 s` (`1.28 s`) | **`1.08 s`** (`1.12 s`) | – | `3.4×` | `3.8×` |
+| Refinement, scan-varying | `22.78 s` | `3.61 s` (`3.55 s`) | **`1.92 s`** (`1.97 s`) | – | `6.3×` | `11.9×` |
+| Integration (`dials` `nproc=1`) | `196.89 s` | `7.00 s` (`8.41 s`) | `6.60 s` (`6.71 s`) | **`5.92 s`** (`6.15 s`) | `28.1×` | `33.3×` |
+| Integration (`dials` `nproc=20`) | `40.18 s` | `7.00 s` (`8.41 s`) | `6.60 s` (`6.71 s`) | **`5.92 s`** (`6.15 s`) | `5.7×` | `6.8×` |
+| Scaling | `14.54 s` | `1.38 s` (`1.47 s`) | **`0.97 s`** (`1.02 s`) | – | `10.5×` | `15.0×` |
 
-mxi times are its `--timing` totals, with the command's wall-clock time in brackets. Closeness to `dials`: `dials_gpu` (on CBF) is identical at every stage (integration `r = 1.00000` against `dials` `nproc=1`, identical merging statistics). mxi finds the same 112,023 spots (`dials` finds 18 more, see §7b), agrees on the cell to 0.05% after refinement (it indexes in the primitive setting), with RMSDs 0.264 / 0.239 px, 0.105° vs 0.236 / 0.231 px, 0.102°, and integrated intensities `r = 0.9997` (summation and profile fitting) against `dials` `nproc=1`; its scaled data differ more (CC½ `0.957` vs `0.999`, ⟨I/σ⟩ `3.0` vs `16.8`, R_merge `0.296` vs `0.066`, from 155k vs 325k observations), which has not been investigated.
+mxi times are its `--timing` totals, with the command's wall-clock time in brackets. Closeness to `dials`: `dials_gpu` agrees at every stage (all spots matched with zero centroid difference, cell within 0.001%, identical refined RMSDs, integration `r = 1.00000` for summation and profile fitting against `dials` `nproc=1`, scaled `r = 0.99999`, CC½ `0.9991` vs `0.9990`, R_merge `0.0658` and ⟨I/σ⟩ `16.81` for both), and its results on the NXmx file match its results on the original CBF images (below). mxi finds the same spots (`dials` finds 18 more, see §7b), agrees on the cell to 0.05% after refinement (it indexes in the primitive setting), with RMSDs 0.264 / 0.239 px, 0.105° vs 0.236 / 0.231 px, 0.102°, and integrated intensities `r = 0.9997` (summation and profile fitting) against `dials` `nproc=1`; its scaled data differ more (CC½ `0.957` vs `0.999`, ⟨I/σ⟩ `3.0` vs `16.8`, R_merge `0.296` vs `0.066`, from 155k vs 325k observations), which has not been investigated.
+
+(Before 2026-11-10, `dials_gpu.integrate` produced no profile-fitted reflections on HDF5/NeXus sweeps longer than 64 frames, such as this file: the slabbed integration pass could not read more than 64 HDF5 frames at once and silently fell back to a path that fitted against an empty profile model. Summation was unaffected. Short sweeps such as the 25-image i19 wedges never used that pass.)
 
 Reference result for `C2sum_1`, `dials` vs `dials_gpu` on the CBF images: the output of the second command above, run before mxi support was added (2026-11-10; i9-13900H, 20 CPUs; RTX 2000 Ada Laptop GPU 8 GB; DIALS `3.dev.1573`; torch `2.12.0+cu130`; `C2sum_1` 720 images imported with `dynamic_shadowing=False`):
 

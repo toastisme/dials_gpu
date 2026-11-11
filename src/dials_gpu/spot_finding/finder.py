@@ -153,6 +153,184 @@ def _get_bshuf_pool() -> ThreadPoolExecutor:
     return _BSHUF_POOL
 
 
+_HDF5_LAYOUT_CACHE: OrderedDict[str, tuple | None] = OrderedDict()
+_HDF5_OPEN_FILES: OrderedDict[str, "h5py.File"] = OrderedDict()
+
+
+def _hdf5_resolve_path(master_path: str, file_name: str) -> str:
+    if file_name == ".":
+        return master_path
+    if os.path.isabs(file_name):
+        return file_name
+    return os.path.join(os.path.dirname(os.path.abspath(master_path)), file_name)
+
+
+def _hdf5_open(file_path: str):
+    """Keep a few image files open: a sweep is read in many small batches."""
+    fh = _HDF5_OPEN_FILES.get(file_path)
+    if fh is not None and fh.id.valid:
+        _HDF5_OPEN_FILES.move_to_end(file_path)
+        return fh
+    # dxtbx opens NXmx files with swmr=True, and HDF5 refuses to open a file that is
+    # already open in this process with a different SWMR flag, so match it.
+    try:
+        fh = h5py.File(file_path, "r", swmr=True)
+    except Exception:
+        fh = h5py.File(file_path, "r")
+    _HDF5_OPEN_FILES[file_path] = fh
+    while len(_HDF5_OPEN_FILES) > 8:
+        _, old = _HDF5_OPEN_FILES.popitem(last=False)
+        try:
+            old.close()
+        except Exception:
+            pass
+    return fh
+
+
+def _hdf5_bit_depth(f) -> int | None:
+    """The bit depth dxtbx uses to flag invalid pixels (see FormatNXmx and
+    FormatNXmxEigerFilewriter.get_raw_data)."""
+    det = "/entry/instrument/detector"
+    names = ["bit_depth_readout"]
+    if f"{det}/detectorSpecific/eiger_fw_version" in f:
+        names.insert(0, "bit_depth_image")
+    for name in names:
+        try:
+            return int(f[f"{det}/{name}"][()])
+        except Exception:
+            continue
+    return None
+
+
+def _hdf5_frame_layout(path: str):
+    """
+    Describe where each frame of an NXmx file is stored, as
+    `(H, W, dtype, invalid_top, segments)`, with `segments` a list of
+    `(first_frame, n_frames, file_path, dataset_name, first_source_frame)`.
+    Handles a plain `/entry/data/data`, a virtual `/entry/data/data` with any number of
+    sources (in the same or in external files), and DECTRIS filewriter master files whose
+    `/entry/data/data_NNNNNN` entries link to the data files. Returns None for anything
+    else. `invalid_top` is 2**bit_depth for 8/16/32-bit data with a bit depth recorded:
+    dxtbx maps `invalid_top - 1` to -1 and `invalid_top - 2` to -2, so the fast path
+    must too.
+    """
+    if path in _HDF5_LAYOUT_CACHE:
+        _HDF5_LAYOUT_CACHE.move_to_end(path)
+        return _HDF5_LAYOUT_CACHE[path]
+    layout = None
+    try:
+        f = _hdf5_open(path)
+        bit_depth = _hdf5_bit_depth(f)
+        segments = []
+        if "/entry/data/data" in f:
+            dset = f["/entry/data/data"]
+            if dset.ndim != 3:
+                raise ValueError
+            n, H, W = dset.shape
+            if not dset.is_virtual:
+                segments.append((0, n, path, dset.name, 0))
+            else:
+                for v in dset.virtual_sources():
+                    if "%" in v.file_name:
+                        raise ValueError  # printf-style source names
+                    v_start, _, v_count, v_block = v.vspace.get_regular_hyperslab()
+                    if v.src_space.get_select_type() == h5py.h5s.SEL_ALL:
+                        # The whole source dataset (its dataspace extent is not stored)
+                        s_start, s_count, s_block = (0, 0, 0), (1, 1, 1), v_block
+                    else:
+                        s_start, _, s_count, s_block = v.src_space.get_regular_hyperslab()
+                    if (
+                        tuple(v_count) != (1, 1, 1)
+                        or tuple(s_count) != (1, 1, 1)
+                        or tuple(v_block) != tuple(s_block)
+                        or tuple(v_start[1:]) != (0, 0)
+                        or tuple(s_start[1:]) != (0, 0)
+                        or tuple(v_block[1:]) != (H, W)
+                    ):
+                        raise ValueError
+                    segments.append(
+                        (
+                            int(v_start[0]),
+                            int(v_block[0]),
+                            _hdf5_resolve_path(path, v.file_name),
+                            v.dset_name,
+                            int(s_start[0]),
+                        )
+                    )
+            dtype = dset.dtype
+        else:
+            grp = f["/entry/data"]
+            names = sorted(
+                k for k in grp if k.startswith("data_") and k[5:].isdigit() and len(k) == 11
+            )
+            if not names:
+                raise ValueError
+            dtype = None
+            H = W = None
+            z = 0
+            for k in names:
+                link = grp.get(k, getlink=True)
+                if isinstance(link, h5py.ExternalLink):
+                    fpath = _hdf5_resolve_path(path, link.filename)
+                    dname = link.path
+                elif isinstance(link, h5py.HardLink):
+                    fpath, dname = path, grp[k].name
+                else:
+                    raise ValueError
+                # Only shapes are needed here: use a short-lived handle rather than the
+                # open-file cache, which would evict the master file.
+                if fpath == path:
+                    shape, dt = f[dname].shape, f[dname].dtype
+                else:
+                    with h5py.File(fpath, "r", swmr=True) as df:
+                        shape, dt = df[dname].shape, df[dname].dtype
+                if len(shape) != 3 or (H is not None and shape[1:] != (H, W)):
+                    raise ValueError
+                if dtype is not None and dt != dtype:
+                    raise ValueError
+                _, H, W = shape
+                dtype = dt
+                segments.append((z, shape[0], fpath, dname, 0))
+                z += shape[0]
+        if dtype not in (np.uint32, np.int32, np.uint16, np.int16):
+            raise ValueError
+        segments.sort()
+        top = 2**31 if bit_depth == 32 else (2**bit_depth if bit_depth in (8, 16) else None)
+        layout = (int(H), int(W), np.dtype(dtype), top, segments)
+    except Exception:
+        layout = None
+    _HDF5_LAYOUT_CACHE[path] = layout
+    while len(_HDF5_LAYOUT_CACHE) > 128:
+        _HDF5_LAYOUT_CACHE.popitem(last=False)
+    return layout
+
+
+def _hdf5_pieces(layout, z0: int, B: int):
+    """Split frames [z0, z0 + B) into `(out_offset, dset, src_frame, n)` reads, or None
+    if some frame is not covered."""
+    _, _, _, _, segments = layout
+    pieces = []
+    z = z0
+    end = z0 + B
+    for v0, n, fpath, dname, s0 in segments:
+        if z >= end:
+            break
+        if v0 + n <= z:
+            continue
+        if v0 > z:
+            return None
+        take = min(end, v0 + n) - z
+        pieces.append((z - z0, _hdf5_open(fpath)[dname], s0 + (z - v0), take))
+        z += take
+    return pieces if z == end else None
+
+
+def _map_invalid_pixels(frame_i32: np.ndarray, top: int | None) -> None:
+    if top is not None:
+        frame_i32[frame_i32 == top - 1] = -1
+        frame_i32[frame_i32 == top - 2] = -2
+
+
 def _try_load_hdf5_raw_volume_gpu(
     imageset,
     device: torch.device,
@@ -161,11 +339,15 @@ def _try_load_hdf5_raw_volume_gpu(
     pinned_out: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """
-    Fast path for single-panel HDF5/NeXus ImageSequences:
-    - Tier-1 LRU cache: keeps up to 8 uncompressed (B, H, W) int32 volumes on GPU VRAM
-      for zero-overhead RL parameter sweeps.
+    Fast path for single-panel HDF5/NeXus ImageSequences, returning frames as an int32
+    `(B, H, W)` tensor with the same values dxtbx's `get_raw_data` gives:
+    - Tier-1 LRU cache: keeps up to 8 decoded volumes on GPU VRAM for short sweeps
+      (zero-overhead RL parameter sweeps).
     - Tier-2 LRU cache: keeps up to 100 compressed bitshuffle-LZ4 chunk lists in host RAM.
-    - Direct HDF5 chunk read + multithreaded bshuf_decompress_lz4 into contiguous memory.
+    - Direct HDF5 chunk read + multithreaded bshuf_decompress_lz4 into contiguous memory,
+      for a plain or virtual `/entry/data/data` (single or multiple source files) and for
+      DECTRIS master files with `data_NNNNNN` links. Other compressions fall back to
+      h5py slice reads.
     """
     if h5py is None or not isinstance(imageset, ImageSequence):
         return None
@@ -197,89 +379,46 @@ def _try_load_hdf5_raw_volume_gpu(
         _HDF5_GPU_VOLUME_CACHE.move_to_end(gpu_key)
         return _HDF5_GPU_VOLUME_CACHE[gpu_key]
 
+    layout = _hdf5_frame_layout(path)
+    if layout is None:
+        return None
+    H, W, dtype, top, _ = layout
+
     comp_key = (path, z0, B)
     comp_entry = _HDF5_COMPRESSED_CACHE.get(comp_key)
     bshuf_fn = _get_bshuf_decompress()
-
+    chunks = None
+    pieces = None
     if comp_entry is not None and bshuf_fn is not None:
         _HDF5_COMPRESSED_CACHE.move_to_end(comp_key)
-        chunks, H, W, dtype = comp_entry
+        chunks = comp_entry[0]
     else:
         try:
-            with h5py.File(path, "r") as f:
-                if "/entry/data/data" not in f:
-                    return None
-                dset = f["/entry/data/data"]
-                if dset.ndim != 3:
-                    return None
-                _, H, W = dset.shape
-                dtype = dset.dtype
-                if dtype not in (np.uint32, np.int32, np.uint16, np.int16):
-                    return None
-
-                src_dset = None
-                src_z0 = z0
-                if dset.is_virtual:
-                    vs = dset.virtual_sources()
-                    if len(vs) == 1:
-                        v = vs[0]
-                        v_start, v_stride, _, v_block = v.vspace.get_regular_hyperslab()
-                        s_start, s_stride, _, s_block = v.src_space.get_regular_hyperslab()
-                        if (
-                            v_start == (0, 0, 0)
-                            and v_stride == (1, 1, 1)
-                            and s_stride == (1, 1, 1)
-                            and v_block == s_block
-                            and v.file_name == "."
-                            and v.dset_name in f
-                        ):
-                            src_dset = f[v.dset_name]
-                            src_z0 = int(s_start[0]) + z0
-                else:
-                    src_dset = dset
-                    src_z0 = z0
-
-                chunks = None
-                if src_dset is not None and bshuf_fn is not None and src_dset.chunks == (1, H, W):
-                    dcpl = src_dset.id.get_create_plist()
-                    if dcpl.get_nfilters() == 1 and dcpl.get_filter(0)[0] == 32008:
-                        dset_id = src_dset.id
-                        chunks = [
-                            dset_id.read_direct_chunk((src_z0 + i, 0, 0))[1]
-                            for i in range(B)
-                        ]
-                        if len(_HDF5_COMPRESSED_CACHE) >= 100:
-                            _HDF5_COMPRESSED_CACHE.popitem(last=False)
-                        _HDF5_COMPRESSED_CACHE[comp_key] = (chunks, H, W, dtype)
-
-                if chunks is None:
-                    arr = dset[z0 : z0 + B]
-                    if arr.dtype == np.uint32:
-                        arr = arr.view(np.int32)
-                    elif arr.dtype == np.uint16:
-                        arr = arr.astype(np.int32)
-                    if pinned_out is not None:
-                        pinned_out[:B].copy_(torch.from_numpy(np.ascontiguousarray(arr)))
-                        return pinned_out[:B]
-                    vol_t = torch.from_numpy(np.ascontiguousarray(arr)).to(
-                        device=device, non_blocking=True
-                    )
-                    if use_vram_cache and device.type == "cuda":
-                        if len(_HDF5_GPU_VOLUME_CACHE) >= 8:
-                            _HDF5_GPU_VOLUME_CACHE.popitem(last=False)
-                        _HDF5_GPU_VOLUME_CACHE[gpu_key] = vol_t
-                    return vol_t
+            pieces = _hdf5_pieces(layout, z0, B)
+            if pieces is None:
+                return None
+            if bshuf_fn is not None and all(
+                d.chunks == (1, H, W)
+                and d.id.get_create_plist().get_nfilters() == 1
+                and d.id.get_create_plist().get_filter(0)[0] == 32008
+                for _, d, _, _ in pieces
+            ):
+                chunks = []
+                for _, d, s, n in pieces:
+                    did = d.id
+                    chunks.extend(did.read_direct_chunk((s + i, 0, 0))[1] for i in range(n))
+                if len(_HDF5_COMPRESSED_CACHE) >= 100:
+                    _HDF5_COMPRESSED_CACHE.popitem(last=False)
+                _HDF5_COMPRESSED_CACHE[comp_key] = (chunks, H, W, dtype)
         except Exception:
             return None
 
-    # Decompress bitshuffle-LZ4 chunks in parallel using thread pool
-    elem_size = int(np.dtype(dtype).itemsize)
-    n_elems = H * W
-    out_dtype = np.int32 if dtype == np.uint32 else dtype
-    pin_key = (B, H, W, out_dtype)
-    if pinned_out is not None and out_dtype == np.int32:
-        pinned_t = pinned_out[:B]
-        out_np = pinned_t.numpy()
+    # Pick the int32 destination: the caller's pinned buffer, a reusable pinned buffer,
+    # or a fresh array.
+    pin_key = (B, H, W, np.int32)
+    pinned_t = None
+    if pinned_out is not None:
+        out_np = pinned_out[:B].numpy()
     else:
         pinned_t = _PINNED_HOST_VOL_CACHE.get(pin_key)
         if pinned_t is not None and _PINNED_HOST_VOL_TAG.get(pin_key) == comp_key:
@@ -291,7 +430,7 @@ def _try_load_hdf5_raw_volume_gpu(
                     _HDF5_GPU_VOLUME_CACHE.popitem(last=False)
                 _HDF5_GPU_VOLUME_CACHE[gpu_key] = vol_t
             return vol_t
-        if pinned_t is None and out_dtype == np.int32:
+        if pinned_t is None:
             if len(_PINNED_HOST_VOL_CACHE) >= 2:
                 _PINNED_HOST_VOL_CACHE.clear()
                 _PINNED_HOST_VOL_TAG.clear()
@@ -299,40 +438,59 @@ def _try_load_hdf5_raw_volume_gpu(
                 (B, H, W), dtype=torch.int32, pin_memory=torch.cuda.is_available()
             )
             _PINNED_HOST_VOL_CACHE[pin_key] = pinned_t
+        # The buffer is about to be overwritten: it no longer holds any cached frames.
+        _PINNED_HOST_VOL_TAG.pop(pin_key, None)
+        out_np = pinned_t.numpy()
 
-        if pinned_t is not None:
-            out_np = pinned_t.numpy()
+    try:
+        if chunks is not None:
+            elem_size = int(dtype.itemsize)
+            n_elems = H * W
+            direct = elem_size == 4  # int32 / uint32 decompress straight into int32
+            out_base = out_np.ctypes.data
+
+            def _decomp_one(i: int):
+                raw_bytes = chunks[i]
+                _, block_size = struct.unpack(">QI", raw_bytes[:12])
+                in_ptr = ctypes.cast(ctypes.c_char_p(raw_bytes), ctypes.c_void_p).value + 12
+                if direct:
+                    dst_ptr = out_base + i * n_elems * 4
+                    tmp = None
+                else:
+                    tmp = np.empty(n_elems, dtype=dtype)
+                    dst_ptr = tmp.ctypes.data
+                res = bshuf_fn(in_ptr, dst_ptr, n_elems, elem_size, block_size // elem_size)
+                if res < 0:
+                    raise RuntimeError(f"bshuf_decompress_lz4 failed with code {res}")
+                frame = out_np[i]
+                if tmp is not None:
+                    np.copyto(frame.reshape(-1), tmp, casting="unsafe")
+                _map_invalid_pixels(frame, top)
+
+            list(_get_bshuf_pool().map(_decomp_one, range(B)))
         else:
-            out_np = np.empty((B, H, W), dtype=out_dtype)
-
-    out_base = out_np.ctypes.data
-    frame_nbytes = n_elems * elem_size
-
-    def _decomp_one(i: int):
-        raw_bytes = chunks[i]
-        _, block_size = struct.unpack(">QI", raw_bytes[:12])
-        in_ptr = ctypes.cast(ctypes.c_char_p(raw_bytes), ctypes.c_void_p).value + 12
-        out_ptr = out_base + i * frame_nbytes
-        res = bshuf_fn(in_ptr, out_ptr, n_elems, elem_size, block_size // elem_size)
-        if res < 0:
-            raise RuntimeError(f"bshuf_decompress_lz4 failed with code {res}")
-
-    list(_get_bshuf_pool().map(_decomp_one, range(B)))
+            for off, d, s, n in pieces:
+                arr = d[s : s + n]
+                dst = out_np[off : off + n]
+                if arr.dtype == np.uint32:
+                    np.copyto(dst, arr.view(np.int32))
+                else:
+                    np.copyto(dst, arr, casting="unsafe")
+                for k in range(n):
+                    _map_invalid_pixels(dst[k], top)
+    except Exception:
+        return None
 
     if pinned_out is not None:
-        if out_dtype != np.int32:
-            pinned_out[:B].copy_(torch.from_numpy(out_np.astype(np.int32)))
         return pinned_out[:B]
 
-    if pinned_t is not None:
+    if device.type == "cpu":
+        # Only the CPU result aliases the reusable buffer; tag it so a repeat call for
+        # the same frames can return it without decoding again.
         _PINNED_HOST_VOL_TAG[pin_key] = comp_key
-        if device.type == "cpu":
-            return pinned_t
-        vol_t = pinned_t.to(device=device, non_blocking=True)
-    else:
-        if out_np.dtype == np.uint16:
-            out_np = out_np.astype(np.int32)
-        vol_t = torch.from_numpy(out_np).to(device=device, non_blocking=True)
+        return pinned_t
+    vol_t = pinned_t.to(device=device, non_blocking=True)
+    _PINNED_HOST_VOL_TAG[pin_key] = comp_key
     if use_vram_cache and device.type == "cuda":
         if len(_HDF5_GPU_VOLUME_CACHE) >= 8:
             _HDF5_GPU_VOLUME_CACHE.popitem(last=False)
