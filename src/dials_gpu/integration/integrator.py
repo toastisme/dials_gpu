@@ -840,14 +840,17 @@ def _try_run_slabbed_volume_integration(
             # usually longer, so read in pieces. Failing here would abandon the slab
             # pass after fit_profiles() had already deferred modelling to it, leaving
             # an empty profile model and no profile-fitted reflections.
+            # Decode straight into dst_slice (contiguous int32 frames): no intermediate
+            # pinned buffer to allocate and no second copy of every frame.
             for p0 in range(idx0, idx1, 64):
                 p1 = min(p0 + 64, idx1)
                 vol_t = _try_load_hdf5_raw_volume_gpu(
-                    imageset[p0:p1], torch.device("cpu")
+                    imageset[p0:p1],
+                    torch.device("cpu"),
+                    pinned_out=torch.from_numpy(dst_slice[p0 - idx0 : p1 - idx0]),
                 )
                 if vol_t is None or vol_t.dtype != torch.int32:
                     break
-                np.copyto(dst_slice[p0 - idx0 : p1 - idx0], vol_t.numpy())
             else:
                 return True
             # Fast loader declined (e.g. unsupported layout or dtype): use dxtbx.

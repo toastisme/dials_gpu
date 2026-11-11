@@ -384,10 +384,28 @@ def run_mxi(expt: Path, outdir: Path, cfg: dict, timeout: float) -> dict:
     deadline = time.monotonic() + timeout
     state = {"stages": {}, "mxi_version": cfg["mxi"].get("version")}
     shutil.copy(expt, outdir / "imported.expt")
+    # Same files as the dials workers: worker_results.json (rewritten after every change)
+    # and worker.log (every command, its full output for each repeat, and a summary line).
+    state_path = outdir / "worker_results.json"
+    worker_log = outdir / "worker.log"
+    worker_log.write_text("")
+    t_start = time.perf_counter()
+
+    def save():
+        state["worker_wall_s"] = time.perf_counter() - t_start
+        state_path.write_text(json.dumps(state, indent=1))
+
+    def wlog(text):
+        with open(worker_log, "a") as f:
+            f.write(text if text.endswith("\n") else text + "\n")
+
+    save()
 
     def run(key, cmd, cwd=outdir):
         """Run cmd --mxi-repeats times; record internal totals and wall times, or the failure."""
         rec = {"status": OK, "times": [], "wall": [], "command": " ".join(shlex.quote(c) for c in cmd)}
+        state["stages"][key] = {**rec, "status": "RUNNING"}
+        save()
         for rep in range(cfg["mxi_repeats"]):
             left = deadline - time.monotonic()
             if left <= 0:
@@ -406,24 +424,34 @@ def run_mxi(expt: Path, outdir: Path, cfg: dict, timeout: float) -> dict:
                 rec.update(status=FAILED, times=[], error=f"could not run mxi: {e}")
                 break
             wall = time.perf_counter() - t0
+            output = log_path.read_text(errors="replace")
+            wlog(f"### [mxi] {key} repeat {rep + 1}/{cfg['mxi_repeats']} (cwd {cwd})\n$ {rec['command']}")
+            wlog(output)
+            wlog(f"### exit code {proc.returncode}, wall {wall:.3f} s\n")
             if proc.returncode != 0:
                 rc = proc.returncode
                 rec.update(status=CRASHED if rc < 0 else FAILED, times=[],
                            error=f"exit code {rc}" + (f" ({signal.Signals(-rc).name})" if rc < 0 else "")
                            + f" after {wall:.1f} s", log_tail=_tail(log_path))
                 break
-            m = _MXI_TOTAL.findall(log_path.read_text(errors="replace"))
+            m = _MXI_TOTAL.findall(output)
             rec["times"].append(float(m[-1]) if m else wall)
             rec["wall"].append(wall)
             rec["time_source"] = "mxi --timing total" if m else "wall clock (no --timing total found)"
         state["stages"][key] = rec
+        save()
         msg = "  ".join(f"{t:.3f} s" for t in rec["times"]) if rec["status"] == OK else rec.get("error")
-        print(f"[mxi] {key:<17} {rec['status']:<7} {msg}", flush=True)
+        line = f"[mxi] {key:<17} {rec['status']:<7} {msg}"
+        if rec["status"] == OK and rec.get("time_source", "").startswith("wall"):
+            line += "  (wall clock: no --timing total in mxi output)"
+        wlog(line)
+        print(line, flush=True)
         return rec["status"] == OK
 
     def skip(keys, why="earlier stage did not succeed"):
         for k in keys:
             state["stages"].setdefault(k, {"status": SKIPPED, "times": [], "error": why})
+        save()
 
     def checked(key):
         """After a chained stage: check its outputs hold real content (INVALID if not)."""
@@ -433,6 +461,8 @@ def run_mxi(expt: Path, outdir: Path, cfg: dict, timeout: float) -> dict:
         if not ok:
             state["stages"][key].update(status=INVALID, invalid_times=state["stages"][key]["times"],
                                         times=[], error=why)
+            save()
+            wlog(f"[mxi] {key:<17} INVALID {why}")
             print(f"[mxi] {key:<17} INVALID {why}", flush=True)
         return ok
 
@@ -456,6 +486,7 @@ def run_mxi(expt: Path, outdir: Path, cfg: dict, timeout: float) -> dict:
             ok, why = validate("find_spots", gpu_dir)
             if not ok:
                 state["stages"]["find_spots_gpu"].update(status=INVALID, times=[], error=why)
+                save()
     else:
         skip(["find_spots_gpu"], "mxi build has no GPU")
 
@@ -487,6 +518,7 @@ def run_mxi(expt: Path, outdir: Path, cfg: dict, timeout: float) -> dict:
             ok, why = validate("integrate", gpu_dir)
             if not ok:
                 state["stages"]["integrate_gpu"].update(status=INVALID, times=[], error=why)
+                save()
     else:
         skip(["integrate_gpu"], "mxi build has no GPU")
     if not checked("integrate"):
@@ -948,7 +980,7 @@ def main(argv=None) -> int:
                 continue
             d = workdir / name / impl
             if impl == "mxi":
-                print(f"--- mxi (outputs and logs: {d})", flush=True)
+                print(f"--- mxi (log: {d / 'worker.log'})", flush=True)
                 ds["results"][impl] = run_mxi(expt, d, cfg, opts.timeout)
                 keys = [k for k, _, _ in STAGES] + list(MXI_GPU_STAGES)
             else:

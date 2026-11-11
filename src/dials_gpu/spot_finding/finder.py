@@ -149,7 +149,10 @@ def _get_bshuf_decompress():
 def _get_bshuf_pool() -> ThreadPoolExecutor:
     global _BSHUF_POOL
     if _BSHUF_POOL is None:
-        _BSHUF_POOL = ThreadPoolExecutor(max_workers=min(20, max(2, CPU_COUNT)))
+        # One thread per core: decoding (decompress, widen 16-bit data to int32, map
+        # invalid pixels) is CPU-bound and dominates integration's read time for large
+        # 16-bit detectors, so a lower cap leaves cores idle on big machines.
+        _BSHUF_POOL = ThreadPoolExecutor(max_workers=max(2, CPU_COUNT))
     return _BSHUF_POOL
 
 
