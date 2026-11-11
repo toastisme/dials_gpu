@@ -17,6 +17,7 @@ import dials.algorithms.integration.processor as _dials_processor
 from dials_gpu.integration import _shoebox_pack_ext
 from dials_gpu.spot_finding.finder import (
     _HDF5_GPU_VOLUME_CACHE,
+    _get_bshuf_pool,
     _get_cbf_batch_reader,
     _try_load_hdf5_raw_volume_gpu,
 )
@@ -688,6 +689,24 @@ def _try_get_hdf5_volume_and_mask_cpu(imageset, lookup_mask, cache_host_vol: boo
     return vol_np, static_mask, tr_min, tr_max, H, W
 
 
+def _shift_frames_down(buf, offset, n):
+    """buf[:n] = buf[offset : offset + n] for a (frames, H, W) array, one frame per task
+    on the decode thread pool (numpy releases the GIL while copying). On a large detector
+    the slab overlap is gigabytes per slab, and a single-threaded copy dominated the read
+    time. When the ranges overlap (offset < n), copy in blocks of `offset` frames, lowest
+    first: each block's sources lie above everything written so far."""
+    if n <= 0 or offset <= 0:
+        return
+    pool = _get_bshuf_pool()
+
+    def _copy(i):
+        np.copyto(buf[i], buf[i + offset])
+
+    step = n if offset >= n else offset
+    for b0 in range(0, n, step):
+        list(pool.map(_copy, range(b0, min(b0 + step, n))))
+
+
 def _try_run_slabbed_volume_integration(
     task_self, imageset, frame0, frame1, time_fn, slab_chunk_cache=None
 ):
@@ -978,7 +997,7 @@ def _try_run_slabbed_volume_integration(
                 n_ov = max(0, prev_f1 - z0_start)
                 if n_ov > 0:
                     ov_offset = z0_start - prev_f0
-                    slab_buf[:n_ov] = slab_buf[ov_offset : ov_offset + n_ov]
+                    _shift_frames_down(slab_buf, ov_offset, n_ov)
                 new_f0 = max(z0_start, prev_f1)
                 n_new = slab_f1 - new_f0
                 if n_new > 0:
