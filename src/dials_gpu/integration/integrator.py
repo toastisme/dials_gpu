@@ -841,7 +841,7 @@ def _try_run_slabbed_volume_integration(
         max_norm_dz = int(dz_arr[norm_mask].max()) if np.any(norm_mask) else 1
         overlap = max(0, max_norm_dz - 1)
         max_buf_frames = min(n_frames, slab_step + overlap)
-        slab_buf = np.empty((max_buf_frames, H, W), dtype=np.int32)
+        slab_buf = None  # allocated once the slab layout is known, below
 
     def _read_chunk_into(f_start, f_end, dst_slice):
         count = f_end - f_start
@@ -885,7 +885,6 @@ def _try_run_slabbed_volume_integration(
     extract_time = 0.0
     process_time = 0.0
 
-    prev_f0 = frame0
     prev_f1 = frame0
 
     use_circular_slabs = False
@@ -926,7 +925,25 @@ def _try_run_slabbed_volume_integration(
             slab_specs = temp_specs
             if full_vol is None and max_req_buf > max_buf_frames:
                 max_buf_frames = max_req_buf
-                slab_buf = np.empty((max_buf_frames, H, W), dtype=np.int32)
+
+    # The slab buffer holds frames [buf_f0, buf_f0 + max_buf_frames). Consecutive slabs
+    # overlap by up to ~slab_step frames, so with no spare room every slab would have to
+    # move its overlap to the front of the buffer first: gigabytes per slab on a large
+    # detector, which dominated the read time. With room for a few more slabs, frames stay
+    # where they were decoded and the buffer is compacted only when the next slab no
+    # longer fits.
+    buf_f0 = frame0
+    if full_vol is None:
+        frame_bytes = H * W * 4
+        try:
+            import psutil
+
+            budget = int(psutil.virtual_memory().available * 0.25)
+        except Exception:
+            budget = int(2 * 1024**3)
+        spare = min(4 * slab_step, max(0, budget // frame_bytes - max_buf_frames))
+        max_buf_frames = min(n_frames, max_buf_frames + spare)
+        slab_buf = np.empty((max_buf_frames, H, W), dtype=np.int32)
 
     if not use_circular_slabs:
         for z0_start in range(frame0, frame1, slab_step):
@@ -994,14 +1011,19 @@ def _try_run_slabbed_volume_integration(
                 new_f0 = max(z0_start, prev_f1)
                 n_new = slab_f1 - new_f0
             else:
-                n_ov = max(0, prev_f1 - z0_start)
-                if n_ov > 0:
-                    ov_offset = z0_start - prev_f0
-                    _shift_frames_down(slab_buf, ov_offset, n_ov)
+                if slab_f1 - buf_f0 > max_buf_frames:
+                    # Compact: move the frames this slab shares with the last one
+                    # ([z0_start, prev_f1)) to the front of the buffer.
+                    _shift_frames_down(
+                        slab_buf, z0_start - buf_f0, max(0, prev_f1 - z0_start)
+                    )
+                    buf_f0 = z0_start
                 new_f0 = max(z0_start, prev_f1)
                 n_new = slab_f1 - new_f0
                 if n_new > 0:
-                    ok = _read_chunk_into(new_f0, slab_f1, slab_buf[n_ov : n_ov + n_new])
+                    ok = _read_chunk_into(
+                        new_f0, slab_f1, slab_buf[new_f0 - buf_f0 : slab_f1 - buf_f0]
+                    )
                     if not ok:
                         if single_pass_ctx is not None:
                             # fit_profiles() deferred modelling to this pass, so the
@@ -1018,7 +1040,7 @@ def _try_run_slabbed_volume_integration(
                 if full_vol is not None:
                     new_view = full_vol[new_f0 - frame0 : slab_f1 - frame0]
                 else:
-                    new_view = slab_buf[n_ov : n_ov + n_new]
+                    new_view = slab_buf[new_f0 - buf_f0 : slab_f1 - buf_f0]
                 rej_new = np.ascontiguousarray(
                     rejected_arr[new_f0 - frame0 : slab_f1 - frame0]
                 )
@@ -1037,7 +1059,6 @@ def _try_run_slabbed_volume_integration(
                 )
                 extract_time += time_fn() - st_e
 
-            prev_f0 = z0_start
             prev_f1 = slab_f1
 
             if has_norm:
@@ -1060,11 +1081,10 @@ def _try_run_slabbed_volume_integration(
                 st_e = time_fn()
                 n_sub = len(sub_refl)
                 valid_flags = np.empty(n_sub, dtype=np.uint8)
-                slab_len = slab_f1 - z0_start
                 if full_vol is not None:
                     slab_view = full_vol[z0_start - frame0 : slab_f1 - frame0]
                 else:
-                    slab_view = slab_buf[:slab_len]
+                    slab_view = slab_buf[z0_start - buf_f0 : slab_f1 - buf_f0]
                 rej_view = np.ascontiguousarray(
                     rejected_arr[z0_start - frame0 : slab_f1 - frame0]
                 )
