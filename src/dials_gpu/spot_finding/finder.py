@@ -12,6 +12,7 @@ from multiprocessing import shared_memory
 import os
 import pickle
 import struct
+import threading
 import libtbx
 from libtbx.introspection import number_of_processors
 import numpy as np
@@ -377,6 +378,64 @@ def _hdf5_slice(imageset, slice_start: int, slice_len: int | None):
     return path, z0, B, len(all_indices)
 
 
+_RAW_FDS: OrderedDict[str, int] = OrderedDict()
+_RAW_FDS_LOCK = threading.Lock()
+
+
+def _raw_fd(file_path: str) -> int:
+    """A cached read-only OS file descriptor for os.pread of raw chunk bytes."""
+    with _RAW_FDS_LOCK:
+        fd = _RAW_FDS.get(file_path)
+        if fd is not None:
+            _RAW_FDS.move_to_end(file_path)
+            return fd
+        fd = os.open(file_path, os.O_RDONLY)
+        _RAW_FDS[file_path] = fd
+        while len(_RAW_FDS) > 16:
+            _, old = _RAW_FDS.popitem(last=False)
+            try:
+                os.close(old)
+            except OSError:
+                pass
+        return fd
+
+
+def _hdf5_read_chunks_parallel(pieces) -> list[bytes] | None:
+    """
+    Read the compressed chunks of `pieces` (one chunk per frame) concurrently: look up
+    each chunk's file offset and size through HDF5, then os.pread them on the decode
+    thread pool (pread releases the GIL; h5py serialises all its calls). On network
+    filesystems the serial read_direct_chunk loop left the decode threads idle while one
+    thread waited on each chunk in turn. Returns None if any chunk cannot be located this
+    way (e.g. a partial filter mask), so the caller can use read_direct_chunk instead.
+    """
+    try:
+        locs = []
+        for _, d, s0, n in pieces:
+            fpath = d.file.filename
+            did = d.id
+            for i in range(n):
+                info = did.get_chunk_info_by_coord((s0 + i, 0, 0))
+                if info.byte_offset is None or info.filter_mask != 0 or not info.size:
+                    return None
+                locs.append((fpath, int(info.byte_offset), int(info.size)))
+
+        def _read(loc):
+            fpath, off, size = loc
+            fd = _raw_fd(fpath)
+            buf = os.pread(fd, size, off)
+            while len(buf) < size:  # short read (rare; e.g. signals on NFS)
+                more = os.pread(fd, size - len(buf), off + len(buf))
+                if not more:
+                    raise OSError(f"short read of chunk at {off} in {fpath}")
+                buf += more
+            return buf
+
+        return list(_get_bshuf_pool().map(_read, locs))
+    except Exception:
+        return None
+
+
 def _hdf5_get_chunks(path: str, layout, z0: int, B: int):
     """
     `(chunks, pieces)` for frames [z0, z0 + B): `chunks` is the list of compressed
@@ -400,10 +459,12 @@ def _hdf5_get_chunks(path: str, layout, z0: int, B: int):
         and d.id.get_create_plist().get_filter(0)[0] == 32008
         for _, d, _, _ in pieces
     ):
-        chunks = []
-        for _, d, s0, n in pieces:
-            did = d.id
-            chunks.extend(did.read_direct_chunk((s0 + i, 0, 0))[1] for i in range(n))
+        chunks = _hdf5_read_chunks_parallel(pieces)
+        if chunks is None:
+            chunks = []
+            for _, d, s0, n in pieces:
+                did = d.id
+                chunks.extend(did.read_direct_chunk((s0 + i, 0, 0))[1] for i in range(n))
         if len(_HDF5_COMPRESSED_CACHE) >= 100:
             _HDF5_COMPRESSED_CACHE.popitem(last=False)
         _HDF5_COMPRESSED_CACHE[comp_key] = (chunks, H, W, dtype)
