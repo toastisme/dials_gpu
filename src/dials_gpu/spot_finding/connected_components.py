@@ -610,19 +610,29 @@ def extract_spots_from_labeller_gpu(
     intensity_sum_variance = sum_w
 
     # Peak coordinates for PeakCentroidDistanceFilter
-    # Matches compiled dials_array_family_flex_ext.so Shoebox::peak_coordinates()
-    # which uses af::max_index(data) -> first pixel in (z, y, x) order with data == max_value.
+    # Matches dials_array_family_flex_ext.so Shoebox::peak_coordinates()
+    # which selects the maximum-valued pixel nearest the centroid (breaking
+    # distance ties by earliest pixel in (z, y, x) order).
     max_w = torch.full((K,), -float("inf"), dtype=torch.float64, device=device).scatter_reduce_(
         0, v_labels, w, reduce="amax", include_self=False
     )
     is_max = w == max_w[v_labels]
+    dx_c = px - cx[v_labels]
+    dy_c = py - cy[v_labels]
+    dz_c = pz - cz[v_labels]
+    d2_c = dx_c * dx_c + dy_c * dy_c + dz_c * dz_c
+    cand_d2 = torch.where(is_max, d2_c, torch.full_like(d2_c, float("inf")))
+    min_d2 = torch.full((K,), float("inf"), dtype=torch.float64, device=device).scatter_reduce_(
+        0, v_labels, cand_d2, reduce="amin", include_self=False
+    )
+    is_best = is_max & (d2_c == min_d2[v_labels])
     pix_idx = torch.arange(v_coords.shape[0], dtype=torch.int64, device=device)
-    cand_pix_idx = torch.where(is_max, pix_idx, torch.full_like(pix_idx, v_coords.shape[0] + 1))
+    cand_pix_idx = torch.where(is_best, pix_idx, torch.full_like(pix_idx, v_coords.shape[0] + 1))
     best_pix_idx = torch.full((K,), v_coords.shape[0] + 1, dtype=torch.int64, device=device).scatter_reduce_(
         0, v_labels, cand_pix_idx, reduce="amin", include_self=False
     )
     peak_coords = torch.stack([px[best_pix_idx], py[best_pix_idx], pz[best_pix_idx]], dim=1)
-    del px, py, pz, max_w, is_max, pix_idx, cand_pix_idx, best_pix_idx
+    del px, py, pz, max_w, is_max, dx_c, dy_c, dz_c, d2_c, cand_d2, min_d2, is_best, pix_idx, cand_pix_idx, best_pix_idx
 
     panel_tensor = torch.full((K,), panel_id, dtype=torch.int64, device=device)
 

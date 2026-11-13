@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import pickle
+import struct
 
 import dxtbx.flumpy as flumpy
 import libtbx
@@ -710,6 +711,29 @@ def _shift_frames_down(buf, offset, n):
         list(pool.map(_copy, range(b0, min(b0 + step, n))))
 
 
+def _is_supported_batch_file(path0: str, H: int, W: int) -> bool:
+    if path0.endswith((".cbf", ".cbf.gz")):
+        return True
+    if _get_cbf_batch_reader() is None:
+        return False
+    try:
+        with open(path0, "rb") as fp:
+            hdr = fp.read(4096)
+        if len(hdr) != 4096 or hdr[:4] != b"II*\x00":
+            return False
+        rw, rh, rd = struct.unpack("<III", hdr[1104:1116])
+        rn, ro, ror, rv = struct.unpack("<IIII", hdr[1136:1152])
+        return (
+            rw == rh
+            and rd in (2, 16)
+            and rw == W
+            and rh == H
+            and (rn, ro, ror, rv) == (1, 0, 0, 0)
+        )
+    except Exception:
+        return False
+
+
 def _try_run_slabbed_volume_integration(
     task_self, imageset, frame0, frame1, time_fn, slab_chunk_cache=None
 ):
@@ -738,8 +762,11 @@ def _try_run_slabbed_volume_integration(
         return None
     if not path0 or n_frames <= 64 or (frame1 - frame0) != n_frames:
         return None
+    panel0_size = detector[0].get_image_size()
     is_hdf5 = path0.endswith((".nxs", ".h5", ".hdf5"))
-    is_cbf = path0.endswith((".cbf", ".cbf.gz"))
+    is_cbf = (not is_hdf5) and _is_supported_batch_file(
+        path0, int(panel0_size[1]), int(panel0_size[0])
+    )
     if not (is_hdf5 or is_cbf):
         return None
 
@@ -748,7 +775,7 @@ def _try_run_slabbed_volume_integration(
     if is_cbf:
         try:
             cbf_paths = [imageset.get_path(i) for i in range(n_frames)]
-            if not all(p and p.endswith((".cbf", ".cbf.gz")) for p in cbf_paths):
+            if not all(cbf_paths):
                 cbf_ext = None
         except Exception:
             cbf_ext = None
@@ -1330,6 +1357,15 @@ def _try_run_slabbed_volume_integration(
                     W,
                     int(valid_flags.ctypes.data),
                 )
+                if (
+                    abs(float(detector[0].get_pedestal())) > 1e-7
+                    or abs(float(detector[0].get_gain()) - 1.0) > 1e-7
+                ):
+                    _shoebox_pack_ext.apply_pedestal_gain_shoeboxes(
+                        sub_refl["shoebox"],
+                        float(detector[0].get_pedestal()),
+                        float(detector[0].get_gain()),
+                    )
                 extract_time += time_fn() - st_e
 
                 st_p = time_fn()
@@ -1408,6 +1444,15 @@ def _try_run_slabbed_volume_integration(
                 extract_time += time_fn() - st_e
 
             st_p = time_fn()
+            if (
+                abs(float(detector[0].get_pedestal())) > 1e-7
+                or abs(float(detector[0].get_gain()) - 1.0) > 1e-7
+            ):
+                _shoebox_pack_ext.apply_pedestal_gain_shoeboxes(
+                    wide_refl["shoebox"],
+                    float(detector[0].get_pedestal()),
+                    float(detector[0].get_gain()),
+                )
             n_wide = len(wide_refl)
             n_w_valid = int(np.count_nonzero(wide_valid_flags))
             if n_w_valid == n_wide and n_wide > 0:
@@ -1523,10 +1568,16 @@ class IntegratorGPU(Integrator):
                 ):
                     path0 = imageset.get_path(0)
                     n_frames = len(imageset)
+                    panel0_sz = detector[0].get_image_size()
                     if (
                         path0
                         and n_frames > 64
-                        and path0.endswith((".nxs", ".h5", ".hdf5", ".cbf", ".cbf.gz"))
+                        and (
+                            path0.endswith((".nxs", ".h5", ".hdf5"))
+                            or _is_supported_batch_file(
+                                path0, int(panel0_sz[1]), int(panel0_sz[0])
+                            )
+                        )
                     ):
                         selection = self.reflections.get_flags(
                             self.reflections.flags.reference_spot

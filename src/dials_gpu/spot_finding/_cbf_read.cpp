@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <cmath>
 #include <unistd.h>
 #include <vector>
 #include <thread>
@@ -186,6 +187,50 @@ extern "C" int read_cbf_batch_omp(
                 total_read = fread(decomp_buf.data(), 1, fsize, fp);
                 fclose(fp);
             } else {
+                FILE* fp = fopen(p, "rb");
+                if (!fp) { err.fetch_or(1, std::memory_order_relaxed); continue; }
+                uint8_t hdr[4096];
+                if (fread(hdr, 1, 4096, fp) != 4096) {
+                    fclose(fp);
+                    err.fetch_or(8, std::memory_order_relaxed);
+                    continue;
+                }
+                uint32_t r_width = 0, r_height = 0, r_depth = 0;
+                uint32_t r_nimg = 0, r_orig = 0, r_orient = 0, r_view = 0;
+                int32_t r_bias_raw = 0;
+                memcpy(&r_width, hdr + 1104, 4);
+                memcpy(&r_height, hdr + 1108, 4);
+                memcpy(&r_depth, hdr + 1112, 4);
+                memcpy(&r_nimg, hdr + 1136, 4);
+                memcpy(&r_orig, hdr + 1140, 4);
+                memcpy(&r_orient, hdr + 1144, 4);
+                memcpy(&r_view, hdr + 1148, 4);
+                memcpy(&r_bias_raw, hdr + 1804, 4);
+                if (hdr[0] == 'I' && hdr[1] == 'I' && hdr[2] == 42 && hdr[3] == 0 &&
+                    r_width == r_height && (r_depth == 2 || r_depth == 16) &&
+                    static_cast<int64_t>(r_width) * static_cast<int64_t>(r_height) == n_elems &&
+                    r_nimg == 1 && r_orig == 0 && r_orient == 0 && r_view == 0) {
+                    size_t raw_bytes = static_cast<size_t>(n_elems) * 2;
+                    if (decomp_buf.size() < raw_bytes) {
+                        decomp_buf.resize(raw_bytes);
+                    }
+                    size_t nr = fread(decomp_buf.data(), 1, raw_bytes, fp);
+                    fclose(fp);
+                    if (nr != raw_bytes) {
+                        err.fetch_or(2, std::memory_order_relaxed);
+                        continue;
+                    }
+                    int32_t bias = static_cast<int32_t>(
+                        std::llround(static_cast<double>(r_bias_raw) * 1.0e-3)
+                    );
+                    const uint16_t* src16 = reinterpret_cast<const uint16_t*>(decomp_buf.data());
+                    int32_t* dst32 = out_vol + static_cast<int64_t>(i) * n_elems;
+                    for (int64_t k = 0; k < n_elems; ++k) {
+                        dst32[k] = static_cast<int32_t>(src16[k]) - bias;
+                    }
+                    continue;
+                }
+                fclose(fp);
                 err.fetch_or(8, std::memory_order_relaxed);
                 continue;
             }

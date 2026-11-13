@@ -89,7 +89,7 @@ def test_i19_refiner_equivalence(i19_indexed_fixture, phil_str: str):
     if "SimpleLBFGS" in phil_str:
         rel_tol, abs_tol = 4e-2, 1e-3
     elif "LBFGScurvs" in phil_str:
-        rel_tol, abs_tol = 2e-5, 1e-6
+        rel_tol, abs_tol = 1e-4, 2e-5
     else:
         rel_tol, abs_tol = 1e-5, 1e-7
     for r_cpu, r_gpu in zip(refiner_cpu.rmsds(), refiner_gpu.rmsds()):

@@ -1,6 +1,6 @@
 output {
-  experiments = "/tmp/pytest-of-davidm/pytest-72/test_end_to_end_scale_i19_mode0/integrated.expt"
-  reflections = "/tmp/pytest-of-davidm/pytest-72/test_end_to_end_scale_i19_mode0/integrated.refl"
+  experiments = "/tmp/pytest-of-davidm/pytest-17/test_end_to_end_scale_i19_mode0/integrated.expt"
+  reflections = "/tmp/pytest-of-davidm/pytest-17/test_end_to_end_scale_i19_mode0/integrated.refl"
 }
 integration {
   profile {
@@ -8,6 +8,6 @@ integration {
   }
 }
 input {
-  experiments = /tmp/pytest-of-davidm/pytest-72/test_end_to_end_scale_i19_mode0/indexed.expt
-  reflections = /tmp/pytest-of-davidm/pytest-72/test_end_to_end_scale_i19_mode0/indexed.refl
+  experiments = /tmp/pytest-of-davidm/pytest-17/test_end_to_end_scale_i19_mode0/indexed.expt
+  reflections = /tmp/pytest-of-davidm/pytest-17/test_end_to_end_scale_i19_mode0/indexed.refl
 }

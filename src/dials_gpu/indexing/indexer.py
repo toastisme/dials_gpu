@@ -404,6 +404,8 @@ class LatticeSearchGPU(LatticeSearch, IndexerGPU):
                         False,
                     )
         base_refl = self.reflections.select(sel)
+        if "shoebox" in base_refl:
+            del base_refl["shoebox"]
 
         threshold = self.params.basis_vector_combinations.sys_absent_threshold
         do_non_prim = bool(

@@ -2253,6 +2253,28 @@ void parallel_deallocate_shoeboxes(
     });
 }
 
+void apply_pedestal_gain_shoeboxes(
+    dials::af::ref<Shoebox<ProfileFloatType>> shoeboxes,
+    double ped,
+    double gain)
+{
+    bool has_ped = (std::abs(ped) > 1e-7);
+    bool has_gain = (gain > 0.0 && std::abs(gain - 1.0) > 1e-7);
+    if (!has_ped && !has_gain) return;
+    std::int64_t n = static_cast<std::int64_t>(shoeboxes.size());
+    parallel_for(n, [&](std::int64_t r) {
+        auto& sb = shoeboxes[r];
+        float* d_ptr = sb.data.begin();
+        std::size_t sz = sb.data.size();
+        for (std::size_t i = 0; i < sz; ++i) {
+            double dv = static_cast<double>(d_ptr[i]);
+            if (has_ped) dv -= ped;
+            if (has_gain) dv /= gain;
+            d_ptr[i] = static_cast<float>(dv);
+        }
+    });
+}
+
 void parallel_check_overloads_single_panel(
     dials::af::ref<Shoebox<ProfileFloatType>> shoeboxes,
     dials::af::ref<std::size_t> flags,
@@ -3847,6 +3869,11 @@ struct ParallelGaussianRS : public dials::algorithms::GaussianRSProfileModeller 
 
         std::vector<PanelTransformInfo> panel_infos = extract_panel_transform_infos(detector);
         const PanelTransformInfo& pinfo0 = panel_infos[0];
+        double panel_gain = detector[0].get_gain();
+        double panel_ped = detector[0].get_pedestal();
+        bool has_ped = (std::abs(panel_ped) > 1e-7);
+        bool has_gain = (panel_gain > 0.0 && std::abs(panel_gain - 1.0) > 1e-7);
+        bool has_ped_or_gain = (has_ped || has_gain);
         double px_size_x = pinfo0.px_x;
         double px_size_y = pinfo0.px_y;
         double px_size_x2 = px_size_x * px_size_x;
@@ -4004,7 +4031,15 @@ struct ParallelGaussianRS : public dials::algorithms::GaussianRSProfileModeller 
                                         vol_raw, row_base + static_cast<std::size_t>(ix),
                                         vol_dtype_code, vol_invalid_top
                                     );
-                                    float fv = static_cast<float>(pv);
+                                    float fv;
+                                    if (__builtin_expect(has_ped_or_gain, 0)) {
+                                        double dv = static_cast<double>(pv);
+                                        if (has_ped) dv -= panel_ped;
+                                        if (has_gain) dv /= panel_gain;
+                                        fv = static_cast<float>(dv);
+                                    } else {
+                                        fv = static_cast<float>(pv);
+                                    }
                                     d_ptr[out_idx] = fv;
                                     bool valid = (!f_rej) && (sm_row[ix] != 0) && (pv >= tr_min) && (pv <= tr_max);
                                     if (fv > sat_f) {
@@ -5543,6 +5578,7 @@ BOOST_PYTHON_MODULE(_shoebox_pack_ext)
     def("parallel_pre_background_mask_flags", &dials_gpu::parallel_pre_background_mask_flags);
     def("parallel_post_mask_counts", &dials_gpu::parallel_post_mask_counts);
     def("parallel_deallocate_shoeboxes", &dials_gpu::parallel_deallocate_shoeboxes);
+    def("apply_pedestal_gain_shoeboxes", &dials_gpu::apply_pedestal_gain_shoeboxes);
     def("parallel_check_overloads_single_panel", &dials_gpu::parallel_check_overloads_single_panel);
     def("parallel_fit_multi", &dials_gpu::parallel_fit_multi);
     def("parallel_model_multi", &dials_gpu::parallel_model_multi);

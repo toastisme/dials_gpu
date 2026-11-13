@@ -1139,23 +1139,49 @@ class ExtractPixelsFromImageGPU:
                 self._full_static_mask_tensors.append(sm)
                 self._trusted_ranges.append(panel.get_trusted_range())
 
-            gain_img = self.imageset.get_gain(0)
-            if gain_img:
-                self._gain_tensors = [
-                    flex_to_tensor(gain_img[i], device=self.device, dtype=torch.float64)
-                    for i in range(len(self._detector))
-                ]
+            if self.imageset.external_lookup.gain.data.empty():
+                panel_gains = [float(p.get_gain()) for p in self._detector]
+                if all(g > 0.0 for g in panel_gains) and any(
+                    abs(g - 1.0) > 1e-7 for g in panel_gains
+                ):
+                    self._gain_tensors = [
+                        torch.tensor(g, device=self.device, dtype=torch.float64)
+                        for g in panel_gains
+                    ]
+                else:
+                    self._gain_tensors = None
             else:
-                self._gain_tensors = None
+                gain_img = self.imageset.get_gain(0)
+                if gain_img:
+                    self._gain_tensors = [
+                        flex_to_tensor(
+                            gain_img[i], device=self.device, dtype=torch.float64
+                        )
+                        for i in range(len(self._detector))
+                    ]
+                else:
+                    self._gain_tensors = None
 
-            ped_img = self.imageset.get_pedestal(0)
-            if ped_img:
-                self._pedestal_tensors = [
-                    flex_to_tensor(ped_img[i], device=self.device, dtype=torch.float64)
-                    for i in range(len(self._detector))
-                ]
+            if self.imageset.external_lookup.pedestal.data.empty():
+                panel_peds = [float(p.get_pedestal()) for p in self._detector]
+                if any(abs(p) > 1e-7 for p in panel_peds):
+                    self._pedestal_tensors = [
+                        torch.tensor(p, device=self.device, dtype=torch.float64)
+                        for p in panel_peds
+                    ]
+                else:
+                    self._pedestal_tensors = None
             else:
-                self._pedestal_tensors = None
+                ped_img = self.imageset.get_pedestal(0)
+                if ped_img:
+                    self._pedestal_tensors = [
+                        flex_to_tensor(
+                            ped_img[i], device=self.device, dtype=torch.float64
+                        )
+                        for i in range(len(self._detector))
+                    ]
+                else:
+                    self._pedestal_tensors = None
 
     def process_raw_tensors(
         self,
@@ -2013,13 +2039,17 @@ class ExtractSpotsGPU:
         else:
             work_vol = vol_t.to(torch.float32)
             if function._pedestal_tensors is not None:
-                work_vol = work_vol - function._pedestal_tensors[0].to(
-                    torch.float32
-                ).unsqueeze(0)
+                p_t = function._pedestal_tensors[0]
+                if p_t.ndim == 0:
+                    work_vol = work_vol - float(p_t.item())
+                else:
+                    work_vol = work_vol - p_t.to(torch.float32).unsqueeze(0)
             if function._gain_tensors is not None:
-                work_vol = work_vol / function._gain_tensors[0].to(
-                    torch.float32
-                ).unsqueeze(0)
+                g_t = function._gain_tensors[0]
+                if g_t.ndim == 0:
+                    work_vol = work_vol * float(1.0 / g_t.item())
+                else:
+                    work_vol = work_vol / g_t.to(torch.float32).unsqueeze(0)
 
         if self.region_of_interest is not None:
             x0, x1, y0, y1 = self.region_of_interest
@@ -2086,7 +2116,16 @@ class ExtractSpotsGPU:
 
         if sum(frame_counts) > 0:
             zyx = torch.nonzero(out_vol, as_tuple=False)
-            vals = work_vol[out_vol].to(torch.float64)
+            if function._pedestal_tensors is None and function._gain_tensors is None:
+                vals = work_vol[out_vol].to(torch.float64)
+            else:
+                vals = vol_t[out_vol].to(torch.float64)
+                if function._pedestal_tensors is not None:
+                    p_t = function._pedestal_tensors[0]
+                    vals = vals - (p_t if p_t.ndim == 0 else p_t[zyx[:, 1], zyx[:, 2]])
+                if function._gain_tensors is not None:
+                    g_t = function._gain_tensors[0]
+                    vals = vals / (g_t if g_t.ndim == 0 else g_t[zyx[:, 1], zyx[:, 2]])
             if first_frame != 0:
                 zyx[:, 0] += first_frame
             coords = zyx
