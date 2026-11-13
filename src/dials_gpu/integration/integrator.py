@@ -17,9 +17,12 @@ import dials.algorithms.integration.processor as _dials_processor
 from dials_gpu.integration import _shoebox_pack_ext
 from dials_gpu.spot_finding.finder import (
     _HDF5_GPU_VOLUME_CACHE,
+    _dtype_to_bshuf_code,
     _get_bshuf_pool,
     _get_cbf_batch_reader,
+    _hdf5_frame_layout,
     _try_load_hdf5_raw_volume_gpu,
+    _try_read_hdf5_slab_frames_into,
 )
 from dials_gpu.spot_finding.threshold import get_default_device
 from dials.algorithms.integration.integrator import (
@@ -812,6 +815,26 @@ def _try_run_slabbed_volume_integration(
         id(getattr(task_self.executor, "profile_fitter", None))
     )
 
+    vol_dtype = np.int32
+    vol_dtype_code = 4
+    vol_invalid_top = 0
+    if is_hdf5:
+        try:
+            h5_layout = _hdf5_frame_layout(path0)
+            if (
+                h5_layout is not None
+                and h5_layout[0] == H
+                and h5_layout[1] == W
+            ):
+                dc = _dtype_to_bshuf_code(h5_layout[2])
+                if dc > 0:
+                    vol_dtype = h5_layout[2]
+                    vol_dtype_code = dc
+                    vol_invalid_top = int(h5_layout[3] or 0)
+        except Exception:
+            pass
+    elem_bytes = int(np.dtype(vol_dtype).itemsize)
+
     try:
         import psutil
 
@@ -823,18 +846,19 @@ def _try_run_slabbed_volume_integration(
     can_cache_full_sweep = (
         single_pass_ctx is None
         and slab_chunk_cache is not None
-        and (n_frames * H * W * 4) <= max_cache_bytes
+        and (n_frames * H * W * elem_bytes) <= max_cache_bytes
     )
     full_vol = None
     loaded_state = None
     if can_cache_full_sweep:
-        cache_entry = slab_chunk_cache.get((path0, frame0, frame1))
+        cache_key = (path0, frame0, frame1, vol_dtype_code)
+        cache_entry = slab_chunk_cache.get(cache_key)
         if cache_entry is not None:
             full_vol, loaded_state = cache_entry
         else:
-            full_vol = np.empty((n_frames, H, W), dtype=np.int32)
+            full_vol = np.empty((n_frames, H, W), dtype=vol_dtype)
             loaded_state = [0]
-            slab_chunk_cache[(path0, frame0, frame1)] = (full_vol, loaded_state)
+            slab_chunk_cache[cache_key] = (full_vol, loaded_state)
         slab_buf = None
         max_buf_frames = n_frames
     else:
@@ -854,13 +878,16 @@ def _try_run_slabbed_volume_integration(
                 cbf_ext, cbf_paths[idx0:idx1], int(dst_slice.ctypes.data), H * W
             )
         if is_hdf5:
-            # The fast HDF5 loader reads at most 64 frames per call, but a slab read
-            # (slab_step plus the overlap of reflections spanning the slab edge) is
-            # usually longer, so read in pieces. Failing here would abandon the slab
-            # pass after fit_profiles() had already deferred modelling to it, leaving
-            # an empty profile model and no profile-fitted reflections.
-            # Decode straight into dst_slice (contiguous int32 frames): no intermediate
-            # pinned buffer to allocate and no second copy of every frame.
+            if _try_read_hdf5_slab_frames_into(
+                path0,
+                idx0,
+                idx1 - idx0,
+                dst_slice,
+                cache_compressed=(n_frames <= 100),
+            ):
+                return True
+            if dst_slice.dtype != np.int32:
+                return False
             for p0 in range(idx0, idx1, 64):
                 p1 = min(p0 + 64, idx1)
                 vol_t = _try_load_hdf5_raw_volume_gpu(
@@ -874,6 +901,8 @@ def _try_run_slabbed_volume_integration(
                 return True
             # Fast loader declined (e.g. unsupported layout or dtype): use dxtbx.
             idx0 = p0
+        if dst_slice.dtype != np.int32:
+            return False
         for k in range(idx0, idx1):
             arr = flumpy.to_numpy(imageset.get_raw_data(k)[0])
             if arr.dtype != np.int32:
@@ -934,7 +963,7 @@ def _try_run_slabbed_volume_integration(
     # longer fits.
     buf_f0 = frame0
     if full_vol is None:
-        frame_bytes = H * W * 4
+        frame_bytes = H * W * elem_bytes
         try:
             import psutil
 
@@ -943,7 +972,7 @@ def _try_run_slabbed_volume_integration(
             budget = int(2 * 1024**3)
         spare = min(4 * slab_step, max(0, budget // frame_bytes - max_buf_frames))
         max_buf_frames = min(n_frames, max_buf_frames + spare)
-        slab_buf = np.empty((max_buf_frames, H, W), dtype=np.int32)
+        slab_buf = np.empty((max_buf_frames, H, W), dtype=vol_dtype)
 
     if not use_circular_slabs:
         for z0_start in range(frame0, frame1, slab_step):
@@ -987,6 +1016,159 @@ def _try_run_slabbed_volume_integration(
         "partiality",
     }
 
+    use_fused_slab_cpp = False
+    fused_fitter = None
+    fused_cols = None
+    fused_base_params = None
+    fused_mode = 1
+    try:
+        if (
+            not task_self.params.shoebox.flatten
+            and (type(task_self.executor) is IntegratorExecutorGPU or is_single_fold_modeller)
+            and len(task_self.experiments) == 1
+        ):
+            expt = task_self.experiments[0]
+            prof = expt.profile
+            panel0 = detector[0]
+            strat = panel0.get_px_mm_strategy()
+            strat_name = strat.name()
+            if (
+                expt.goniometer is not None
+                and expt.scan is not None
+                and not expt.scan.is_still()
+                and expt.scan.has_property("oscillation")
+                and not expt.scan.has_property("time_of_flight")
+                and strat_name in ("SimplePxMmStrategy", "ParallaxCorrectedPxMmStrategy")
+                and tuple(panel0.get_raw_image_offset()) == (0, 0)
+                and hasattr(prof, "_n_sigma")
+                and hasattr(prof, "_sigma_b")
+                and hasattr(prof, "_sigma_m")
+                and isinstance(prof._sigma_b, (int, float))
+                and isinstance(prof._sigma_m, (int, float))
+            ):
+                bg_fn = getattr(flex.reflection_table, "background_algorithm", None)
+                bg_inst = bg_fn(task_self.experiments) if bg_fn is not None else None
+                if isinstance(bg_inst, AutoBackgroundGPU):
+                    bg_inst = bg_inst._impl
+                cent_fn = getattr(flex.reflection_table, "centroid_algorithm", None)
+                cent_cls = cent_fn.func if isinstance(cent_fn, functools.partial) else cent_fn
+                if (
+                    isinstance(bg_inst, GLMBackgroundGPU)
+                    and bg_inst._model_alg in ("constant3d", "constant2d")
+                    and (cent_cls is SimpleCentroidGPU or cent_fn is None)
+                ):
+                    fitter_ok = False
+                    if is_single_fold_modeller:
+                        if "profile.index" not in refls:
+                            pf = task_self.executor.profile_fitter
+                            fused_fitter = pf.modellers[0] if hasattr(pf, "modellers") else pf
+                            if len(fused_fitter) == 1:
+                                fused_mode = 0
+                                fitter_ok = True
+                    else:
+                        fused_fitter = task_self.executor.profile_fitter
+                        if fused_fitter is None or len(fused_fitter) == 1:
+                            if single_pass_ctx is not None:
+                                fused_mode = 3 if use_circular_slabs else 2
+                            else:
+                                fused_mode = 1
+                            fitter_ok = True
+                    if fitter_ok:
+                        if "partiality" not in refls:
+                            refls["partiality"] = flex.double(n_total, 0.0)
+                        for dcol in (
+                            "background.mean",
+                            "intensity.sum.value",
+                            "intensity.sum.variance",
+                            "background.sum.value",
+                            "background.sum.variance",
+                            "intensity.prf.value",
+                            "intensity.prf.variance",
+                            "profile.correlation",
+                        ):
+                            if dcol not in refls:
+                                refls[dcol] = flex.double(n_total, 0.0)
+                        for vcol in (
+                            "xyzobs.px.value",
+                            "xyzobs.px.variance",
+                            "xyzobs.mm.value",
+                            "xyzobs.mm.variance",
+                        ):
+                            if vcol not in refls:
+                                refls[vcol] = flex.vec3_double(n_total, (0.0, 0.0, 0.0))
+                        for icol in (
+                            "num_pixels.valid",
+                            "num_pixels.background",
+                            "num_pixels.background_used",
+                            "num_pixels.foreground",
+                        ):
+                            if icol not in refls:
+                                refls[icol] = flex.int(n_total, 0)
+                        fused_cols = (
+                            refls["panel"],
+                            refls["bbox"],
+                            refls["s1"],
+                            refls["xyzcal.px"],
+                            refls["xyzcal.mm"],
+                            refls["partiality"],
+                            refls["flags"],
+                            refls["background.mean"],
+                            refls["intensity.sum.value"],
+                            refls["intensity.sum.variance"],
+                            refls["background.sum.value"],
+                            refls["background.sum.variance"],
+                            refls["xyzobs.px.value"],
+                            refls["xyzobs.px.variance"],
+                            refls["xyzobs.mm.value"],
+                            refls["xyzobs.mm.variance"],
+                            refls["num_pixels.valid"],
+                            refls["num_pixels.background"],
+                            refls["num_pixels.background_used"],
+                            refls["num_pixels.foreground"],
+                            refls["intensity.prf.value"],
+                            refls["intensity.prf.variance"],
+                            refls["profile.correlation"],
+                        )
+                        sat = float(panel0.get_trusted_range()[1])
+                        delta_b = float(prof._n_sigma * prof._sigma_b)
+                        valid_fg_thr = float(
+                            getattr(task_self.executor, "valid_foreground_threshold", 0.75)
+                        )
+                        bg_alg_code = 0 if bg_inst._model_alg == "constant3d" else 1
+                        px2mm_mode = 1 if strat_name == "ParallaxCorrectedPxMmStrategy" else 0
+                        mu = float(strat.mu()) if px2mm_mode == 1 else 0.0
+                        t0 = float(strat.t0()) if px2mm_mode == 1 else 0.0
+                        fused_base_params = (
+                            expt.beam,
+                            expt.detector,
+                            expt.goniometer,
+                            expt.scan,
+                            int(static_mask_np.ctypes.data),
+                            tr_min,
+                            tr_max,
+                            H,
+                            W,
+                            vol_dtype_code,
+                            vol_invalid_top,
+                            sat,
+                            delta_b,
+                            valid_fg_thr,
+                            bg_alg_code,
+                            int(bg_inst._min_pixels),
+                            float(bg_inst._tuning_constant),
+                            int(bg_inst._max_iter),
+                            px2mm_mode,
+                            mu,
+                            t0,
+                            fused_mode,
+                            int(single_pass_ctx["cache_id"] or 0)
+                            if single_pass_ctx is not None
+                            else 0,
+                        )
+                        use_fused_slab_cpp = True
+    except Exception:
+        use_fused_slab_cpp = False
+
     try:
         for z0_start, req_f1, slab_sel, circ_range in slab_specs:
             has_norm = bool(np.any(slab_sel))
@@ -1005,7 +1187,7 @@ def _try_run_slabbed_volume_integration(
                         full_vol[cur_loaded_f - frame0 : slab_f1 - frame0],
                     )
                     if not ok:
-                        slab_chunk_cache.pop((path0, frame0, frame1), None)
+                        slab_chunk_cache.pop((path0, frame0, frame1, vol_dtype_code), None)
                         return None
                     loaded_state[0] = slab_f1 - frame0
                 new_f0 = max(z0_start, prev_f1)
@@ -1044,11 +1226,13 @@ def _try_run_slabbed_volume_integration(
                 rej_new = np.ascontiguousarray(
                     rejected_arr[new_f0 - frame0 : slab_f1 - frame0]
                 )
-                _shoebox_pack_ext.extract_wide_shoeboxes_slice_from_volume(
+                _shoebox_pack_ext.extract_wide_shoeboxes_slice_from_volume_typed(
                     wide_refl["shoebox"],
                     int(new_view.ctypes.data),
                     int(static_mask_np.ctypes.data),
                     int(rej_new.ctypes.data),
+                    vol_dtype_code,
+                    vol_invalid_top,
                     tr_min,
                     tr_max,
                     new_f0,
@@ -1064,6 +1248,56 @@ def _try_run_slabbed_volume_integration(
             if has_norm:
                 slab_ind_np = np.nonzero(slab_sel)[0]
                 slab_ind = flex.size_t(np.ascontiguousarray(slab_ind_np, dtype=np.uintp))
+                if full_vol is not None:
+                    slab_view = full_vol[z0_start - frame0 : slab_f1 - frame0]
+                else:
+                    slab_view = slab_buf[z0_start - buf_f0 : slab_f1 - buf_f0]
+                rej_view = np.ascontiguousarray(
+                    rejected_arr[z0_start - frame0 : slab_f1 - frame0]
+                )
+
+                if use_fused_slab_cpp:
+                    st_p = time_fn()
+                    prof_b = int(circ_range[0]) if circ_range is not None else 0
+                    prof_e = int(circ_range[1]) if circ_range is not None else 0
+                    bp = fused_base_params
+                    call_params = (
+                        bp[0],
+                        bp[1],
+                        bp[2],
+                        bp[3],
+                        int(slab_view.ctypes.data),
+                        bp[4],
+                        int(rej_view.ctypes.data),
+                        bp[5],
+                        bp[6],
+                        z0_start,
+                        slab_f1,
+                        bp[7],
+                        bp[8],
+                        bp[9],
+                        bp[10],
+                        bp[11],
+                        bp[12],
+                        bp[13],
+                        bp[14],
+                        bp[15],
+                        bp[16],
+                        bp[17],
+                        bp[18],
+                        bp[19],
+                        bp[20],
+                        bp[21],
+                        bp[22],
+                        prof_b,
+                        prof_e,
+                    )
+                    _shoebox_pack_ext.integrate_slab_from_volume_fast(
+                        fused_fitter, slab_ind, fused_cols, call_params
+                    )
+                    process_time += time_fn() - st_p
+                    continue
+
                 if use_slim_sub_refl:
                     sub_refl = flex.reflection_table()
                     for col in slim_input_cols:
@@ -1081,18 +1315,13 @@ def _try_run_slabbed_volume_integration(
                 st_e = time_fn()
                 n_sub = len(sub_refl)
                 valid_flags = np.empty(n_sub, dtype=np.uint8)
-                if full_vol is not None:
-                    slab_view = full_vol[z0_start - frame0 : slab_f1 - frame0]
-                else:
-                    slab_view = slab_buf[z0_start - buf_f0 : slab_f1 - buf_f0]
-                rej_view = np.ascontiguousarray(
-                    rejected_arr[z0_start - frame0 : slab_f1 - frame0]
-                )
-                n_valid = _shoebox_pack_ext.extract_shoeboxes_from_volume(
+                n_valid = _shoebox_pack_ext.extract_shoeboxes_from_volume_typed(
                     sub_refl["shoebox"],
                     int(slab_view.ctypes.data),
                     int(static_mask_np.ctypes.data),
                     int(rej_view.ctypes.data),
+                    vol_dtype_code,
+                    vol_invalid_top,
                     tr_min,
                     tr_max,
                     z0_start,
@@ -1146,12 +1375,12 @@ def _try_run_slabbed_volume_integration(
                             full_vol[cur_loaded_f - frame0 : frame1 - frame0],
                         )
                         if not ok:
-                            slab_chunk_cache.pop((path0, frame0, frame1), None)
+                            slab_chunk_cache.pop((path0, frame0, frame1, vol_dtype_code), None)
                             return None
                         loaded_state[0] = frame1 - frame0
                     rem_buf = full_vol[prev_f1 - frame0 : frame1 - frame0]
                 else:
-                    rem_buf = slab_buf[:n_rem] if n_rem <= max_buf_frames else np.empty((n_rem, H, W), dtype=np.int32)
+                    rem_buf = slab_buf[:n_rem] if n_rem <= max_buf_frames else np.empty((n_rem, H, W), dtype=vol_dtype)
                     ok = _read_chunk_into(prev_f1, frame1, rem_buf)
                     if not ok:
                         return None
@@ -1161,11 +1390,13 @@ def _try_run_slabbed_volume_integration(
                 rej_rem = np.ascontiguousarray(
                     rejected_arr[prev_f1 - frame0 : frame1 - frame0]
                 )
-                _shoebox_pack_ext.extract_wide_shoeboxes_slice_from_volume(
+                _shoebox_pack_ext.extract_wide_shoeboxes_slice_from_volume_typed(
                     wide_refl["shoebox"],
                     int(rem_buf.ctypes.data),
                     int(static_mask_np.ctypes.data),
                     int(rej_rem.ctypes.data),
+                    vol_dtype_code,
+                    vol_invalid_top,
                     tr_min,
                     tr_max,
                     prev_f1,
@@ -1196,7 +1427,14 @@ def _try_run_slabbed_volume_integration(
             _shoebox_pack_ext.parallel_deallocate_shoeboxes(wide_refl["shoebox"])
             del wide_refl["shoebox"]
             if not is_single_fold_modeller:
-                refls.set_selected(wide_ind, wide_refl)
+                if use_slim_sub_refl:
+                    for col in wide_refl.keys():
+                        if col not in slim_readonly_cols:
+                            if col not in refls:
+                                refls[col] = type(wide_refl[col])(n_total)
+                            refls[col].set_selected(wide_ind, wide_refl[col])
+                else:
+                    refls.set_selected(wide_ind, wide_refl)
             process_time += time_fn() - st_p
 
         if single_pass_ctx is not None:

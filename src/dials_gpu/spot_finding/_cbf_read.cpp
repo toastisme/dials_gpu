@@ -2,9 +2,12 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <unistd.h>
 #include <vector>
 #include <thread>
 #include <atomic>
+#include <mutex>
+#include <algorithm>
 #include <libdeflate.h>
 #include <zlib.h>
 
@@ -202,6 +205,249 @@ extern "C" int read_cbf_batch_omp(
     std::vector<std::thread> threads;
     threads.reserve(actual_threads - 1);
     for (int t = 0; t < actual_threads - 1; ++t) {
+        threads.emplace_back(worker);
+    }
+    worker();
+    for (auto& th : threads) {
+        th.join();
+    }
+    return err.load(std::memory_order_relaxed);
+}
+
+typedef int64_t (*bshuf_fn_t)(
+    const void* in, void* out, size_t size, size_t elem_size, size_t block_size
+);
+
+static inline uint32_t read_be32(const uint8_t* p) {
+    return (static_cast<uint32_t>(p[0]) << 24) |
+           (static_cast<uint32_t>(p[1]) << 16) |
+           (static_cast<uint32_t>(p[2]) << 8) |
+           static_cast<uint32_t>(p[3]);
+}
+
+static inline int decode_bshuf_frame_tiled_i32(
+    bshuf_fn_t bshuf_fn,
+    const uint8_t* cptr,
+    size_t clen,
+    size_t n_elems,
+    int dtype_code, // 1=uint16, 2=int16, 3=uint32, 4=int32
+    int64_t invalid_top,
+    int32_t* dst_frame,
+    std::vector<uint8_t>& tile_buf
+) {
+    if (!cptr || clen < 12) return -1;
+    size_t elem_size = (dtype_code <= 2) ? 2 : 4;
+    uint32_t block_bytes = read_be32(cptr + 8);
+    size_t block_elems = block_bytes / elem_size;
+    if (block_elems == 0) block_elems = 4096;
+    size_t tile_blocks = std::max<size_t>(1, (65536 + block_elems - 1) / block_elems);
+    size_t tile_elems = tile_blocks * block_elems;
+    if (elem_size == 2 && tile_buf.size() < tile_elems * 2) {
+        tile_buf.resize(tile_elems * 2);
+    }
+
+    const uint8_t* in_cur = cptr + 12;
+    size_t done = 0;
+    while (done < n_elems) {
+        size_t rem = n_elems - done;
+        size_t cur = (rem > tile_elems + block_elems) ? tile_elems : rem;
+        int32_t* dst_tile = dst_frame + done;
+        if (elem_size == 4) {
+            int64_t consumed = bshuf_fn(in_cur, dst_tile, cur, 4, block_elems);
+            if (consumed < 0) return -2;
+            in_cur += consumed;
+            if (invalid_top > 0) {
+                int32_t top_m1 = static_cast<int32_t>(invalid_top - 1);
+                int32_t top_m2 = static_cast<int32_t>(invalid_top - 2);
+                for (size_t k = 0; k < cur; ++k) {
+                    int32_t v = dst_tile[k];
+                    if (__builtin_expect(v >= top_m2, 0)) {
+                        if (v == top_m1) dst_tile[k] = -1;
+                        else if (v == top_m2) dst_tile[k] = -2;
+                    }
+                }
+            }
+        } else {
+            int64_t consumed = bshuf_fn(in_cur, tile_buf.data(), cur, 2, block_elems);
+            if (consumed < 0) return -2;
+            in_cur += consumed;
+            if (dtype_code == 1) {
+                const uint16_t* s = reinterpret_cast<const uint16_t*>(tile_buf.data());
+                if (invalid_top > 0 && invalid_top <= 65536) {
+                    int32_t top_i = static_cast<int32_t>(invalid_top);
+                    int32_t top_m2 = top_i - 2;
+                    for (size_t k = 0; k < cur; ++k) {
+                        int32_t v = static_cast<int32_t>(s[k]);
+                        dst_tile[k] = (v >= top_m2) ? (v - top_i) : v;
+                    }
+                } else {
+                    for (size_t k = 0; k < cur; ++k) {
+                        dst_tile[k] = static_cast<int32_t>(s[k]);
+                    }
+                }
+            } else {
+                const int16_t* s = reinterpret_cast<const int16_t*>(tile_buf.data());
+                if (invalid_top > 0 && invalid_top <= 65536) {
+                    int32_t top_i = static_cast<int32_t>(invalid_top);
+                    int32_t top_m2 = top_i - 2;
+                    for (size_t k = 0; k < cur; ++k) {
+                        int32_t v = static_cast<int32_t>(s[k]);
+                        dst_tile[k] = (v >= top_m2) ? (v - top_i) : v;
+                    }
+                } else {
+                    for (size_t k = 0; k < cur; ++k) {
+                        dst_tile[k] = static_cast<int32_t>(s[k]);
+                    }
+                }
+            }
+        }
+        done += cur;
+    }
+    return 0;
+}
+
+static std::mutex g_bshuf_scratch_mtx;
+static std::vector<std::vector<uint8_t>> g_bshuf_comp_bufs(64);
+static std::vector<std::vector<uint8_t>> g_bshuf_tile_bufs(64);
+
+extern "C" int bshuf_decode_batch_i32(
+    bshuf_fn_t bshuf_fn,
+    const uint8_t** chunk_ptrs,
+    const size_t* chunk_lens,
+    int n_frames,
+    size_t n_elems,
+    int dtype_code, // 1=uint16, 2=int16, 3=uint32, 4=int32
+    int64_t invalid_top,
+    int32_t* out_vol,
+    int n_threads
+) {
+    if (n_frames <= 0) return 0;
+    std::lock_guard<std::mutex> lock(g_bshuf_scratch_mtx);
+    int actual_threads = std::min(n_frames, std::min(32, std::max(1, n_threads)));
+    std::atomic<int> next_idx{0};
+    std::atomic<int> err{0};
+
+    auto worker = [&](int tid) {
+        auto& tile_buf = g_bshuf_tile_bufs[tid];
+        while (true) {
+            int i = next_idx.fetch_add(1, std::memory_order_relaxed);
+            if (i >= n_frames) break;
+            if (err.load(std::memory_order_relaxed) != 0) continue;
+            int rc = decode_bshuf_frame_tiled_i32(
+                bshuf_fn,
+                chunk_ptrs[i],
+                chunk_lens[i],
+                n_elems,
+                dtype_code,
+                invalid_top,
+                out_vol + static_cast<size_t>(i) * n_elems,
+                tile_buf
+            );
+            if (rc != 0) err.fetch_or(2, std::memory_order_relaxed);
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(actual_threads - 1);
+    for (int t = 1; t < actual_threads; ++t) {
+        threads.emplace_back(worker, t);
+    }
+    worker(0);
+    for (auto& th : threads) {
+        th.join();
+    }
+    return err.load(std::memory_order_relaxed);
+}
+
+extern "C" int bshuf_pread_direct_batch(
+    bshuf_fn_t bshuf_fn,
+    const int* fds,
+    const int64_t* offsets,
+    const size_t* sizes,
+    int n_frames,
+    size_t n_elems,
+    size_t elem_size,
+    uint8_t* out_vol,
+    int n_threads
+) {
+    if (n_frames <= 0) return 0;
+    std::lock_guard<std::mutex> lock(g_bshuf_scratch_mtx);
+    int actual_threads = std::min(n_frames, std::min(32, std::max(1, n_threads)));
+    std::atomic<int> next_idx{0};
+    std::atomic<int> err{0};
+
+    auto worker = [&](int tid) {
+        auto& comp_buf = g_bshuf_comp_bufs[tid];
+        while (true) {
+            int i = next_idx.fetch_add(1, std::memory_order_relaxed);
+            if (i >= n_frames) break;
+            if (err.load(std::memory_order_relaxed) != 0) continue;
+            size_t sz = sizes[i];
+            if (sz < 12) { err.fetch_or(1, std::memory_order_relaxed); continue; }
+            if (comp_buf.size() < sz) comp_buf.resize(sz + 65536);
+            int fd = fds[i];
+            int64_t off = offsets[i];
+            size_t got = 0;
+            while (got < sz) {
+                ssize_t r = pread(fd, comp_buf.data() + got, sz - got, off + static_cast<int64_t>(got));
+                if (r <= 0) { err.fetch_or(4, std::memory_order_relaxed); break; }
+                got += static_cast<size_t>(r);
+            }
+            if (got < sz) continue;
+            uint32_t block_bytes = read_be32(comp_buf.data() + 8);
+            size_t block_elems = block_bytes / elem_size;
+            uint8_t* dst = out_vol + static_cast<size_t>(i) * n_elems * elem_size;
+            int64_t res = bshuf_fn(comp_buf.data() + 12, dst, n_elems, elem_size, block_elems);
+            if (res < 0) err.fetch_or(2, std::memory_order_relaxed);
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(actual_threads - 1);
+    for (int t = 1; t < actual_threads; ++t) {
+        threads.emplace_back(worker, t);
+    }
+    worker(0);
+    for (auto& th : threads) {
+        th.join();
+    }
+    return err.load(std::memory_order_relaxed);
+}
+
+extern "C" int bshuf_decode_direct_batch(
+    bshuf_fn_t bshuf_fn,
+    const uint8_t** chunk_ptrs,
+    const size_t* chunk_lens,
+    int n_frames,
+    size_t n_elems,
+    size_t elem_size,
+    uint8_t* out_vol,
+    int n_threads
+) {
+    if (n_frames <= 0) return 0;
+    int actual_threads = std::min(n_frames, std::min(32, std::max(1, n_threads)));
+    std::atomic<int> next_idx{0};
+    std::atomic<int> err{0};
+
+    auto worker = [&]() {
+        while (true) {
+            int i = next_idx.fetch_add(1, std::memory_order_relaxed);
+            if (i >= n_frames) break;
+            if (err.load(std::memory_order_relaxed) != 0) continue;
+            const uint8_t* cptr = chunk_ptrs[i];
+            size_t clen = chunk_lens[i];
+            if (!cptr || clen < 12) { err.fetch_or(1, std::memory_order_relaxed); continue; }
+            uint32_t block_bytes = read_be32(cptr + 8);
+            size_t block_elems = block_bytes / elem_size;
+            uint8_t* dst = out_vol + static_cast<size_t>(i) * n_elems * elem_size;
+            int64_t res = bshuf_fn(cptr + 12, dst, n_elems, elem_size, block_elems);
+            if (res < 0) err.fetch_or(2, std::memory_order_relaxed);
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(actual_threads - 1);
+    for (int t = 1; t < actual_threads; ++t) {
         threads.emplace_back(worker);
     }
     worker();

@@ -75,6 +75,7 @@ ext_logger = logging.getLogger("dials.extensions.dispersion_spotfinder_threshold
 
 
 _BSHUF_LIB = None
+_BSHUF_BATCH_EXT = None
 _CBF_READ_FN = None
 _BSHUF_POOL: ThreadPoolExecutor | None = None
 _HDF5_GPU_VOLUME_CACHE: OrderedDict[tuple, torch.Tensor] = OrderedDict()
@@ -145,6 +146,78 @@ def _get_bshuf_decompress():
         return _BSHUF_LIB
     except Exception:
         return None
+
+
+def _get_bshuf_batch_ext():
+    global _BSHUF_BATCH_EXT
+    if _BSHUF_BATCH_EXT is not None:
+        return _BSHUF_BATCH_EXT
+    bshuf_fn = _get_bshuf_decompress()
+    if bshuf_fn is None:
+        return None
+    try:
+        so_path = os.path.join(os.path.dirname(__file__), "_cbf_read_ext.so")
+        if not os.path.exists(so_path):
+            return None
+        lib = ctypes.CDLL(so_path)
+        fn_i32 = lib.bshuf_decode_batch_i32
+        fn_i32.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_int,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_int64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        fn_i32.restype = ctypes.c_int
+
+        fn_pread = lib.bshuf_pread_direct_batch
+        fn_pread.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_int,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        fn_pread.restype = ctypes.c_int
+
+        fn_direct = lib.bshuf_decode_direct_batch
+        fn_direct.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_int,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        fn_direct.restype = ctypes.c_int
+
+        bshuf_ptr = ctypes.cast(bshuf_fn, ctypes.c_void_p).value
+        _BSHUF_BATCH_EXT = (bshuf_ptr, fn_i32, fn_pread, fn_direct)
+        return _BSHUF_BATCH_EXT
+    except Exception:
+        return None
+
+
+def _dtype_to_bshuf_code(dtype: np.dtype) -> int:
+    if dtype == np.uint16:
+        return 1
+    if dtype == np.int16:
+        return 2
+    if dtype == np.uint32:
+        return 3
+    if dtype == np.int32:
+        return 4
+    return 0
 
 
 def _get_bshuf_pool() -> ThreadPoolExecutor:
@@ -511,6 +584,25 @@ def try_read_hdf5_raw_frames(imageset, slice_start: int, slice_len: int, dst: to
     n_elems = H * W
     elem_size = dtype.itemsize
     base = dst.data_ptr()
+    batch_ext = _get_bshuf_batch_ext()
+    if batch_ext is not None:
+        bshuf_ptr, _, _, fn_direct = batch_ext
+        c_ptrs = (ctypes.c_void_p * B)(
+            *(ctypes.cast(ctypes.c_char_p(c), ctypes.c_void_p).value for c in chunks)
+        )
+        c_lens = (ctypes.c_size_t * B)(*(len(c) for c in chunks))
+        rc = fn_direct(
+            bshuf_ptr,
+            c_ptrs,
+            c_lens,
+            B,
+            n_elems,
+            elem_size,
+            base,
+            max(2, min(32, CPU_COUNT)),
+        )
+        if rc == 0:
+            return dtype, top
     list(
         _get_bshuf_pool().map(
             lambda i: _bshuf_decompress_one(chunks[i], base + i * n_elems * elem_size, n_elems, elem_size),
@@ -518,6 +610,175 @@ def try_read_hdf5_raw_frames(imageset, slice_start: int, slice_len: int, dst: to
         )
     )
     return dtype, top
+
+
+def _try_read_hdf5_slab_frames_into(
+    path: str,
+    z0: int,
+    count: int,
+    dst_slice: np.ndarray,
+    cache_compressed: bool = False,
+) -> bool:
+    """
+    Fast batch HDF5 frame reader for slabbed volume integration.
+    When `dst_slice.dtype == layout_dtype` (e.g. uint16 for 16-bit Eiger/Pilatus HDF5) and
+    `not cache_compressed`, uses `bshuf_pread_direct_batch` in C++ to `pread` and decompress
+    bitshuffle-LZ4 chunks directly into `dst_slice` without Python chunk allocations or
+    full-frame int32 widening passes. Also supports int32 `dst_slice` via `bshuf_decode_batch_i32`.
+    """
+    if count <= 0:
+        return True
+    layout = _hdf5_frame_layout(path)
+    if layout is None:
+        return False
+    H, W, dtype, top, segments = layout
+    if dst_slice.shape != (count, H, W):
+        return False
+    n_elems = H * W
+    elem_size = int(dtype.itemsize)
+    dtype_code = _dtype_to_bshuf_code(dtype)
+    if dtype_code == 0:
+        return False
+    batch_ext = _get_bshuf_batch_ext()
+    n_thr = max(2, min(32, CPU_COUNT))
+
+    # Fast path 1: C++ pread + direct bshuf into native-dtype dst_slice (no int32 widening)
+    if (
+        not cache_compressed
+        and dst_slice.dtype == dtype
+        and batch_ext is not None
+    ):
+        bshuf_ptr, _, fn_pread, _ = batch_ext
+        try:
+            for p0 in range(0, count, 64):
+                B = min(64, count - p0)
+                cur_z0 = z0 + p0
+                cur_end = cur_z0 + B
+                fds = (ctypes.c_int * B)()
+                offs = (ctypes.c_int64 * B)()
+                szs = (ctypes.c_size_t * B)()
+                k = 0
+                z_cursor = cur_z0
+                for v0, seg_n, fpath, dname, s0 in segments:
+                    if z_cursor >= cur_end:
+                        break
+                    if v0 + seg_n <= z_cursor:
+                        continue
+                    if v0 > z_cursor:
+                        raise ValueError("gap in segments")
+                    take = min(cur_end, v0 + seg_n) - z_cursor
+                    dset = _hdf5_open(fpath)[dname]
+                    if (
+                        dset.chunks != (1, H, W)
+                        or dset.id.get_create_plist().get_nfilters() != 1
+                        or dset.id.get_create_plist().get_filter(0)[0] != 32008
+                    ):
+                        raise ValueError("not bshuf")
+                    fd = _raw_fd(fpath)
+                    did = dset.id
+                    src_start = s0 + (z_cursor - v0)
+                    for i in range(take):
+                        info = did.get_chunk_info_by_coord((src_start + i, 0, 0))
+                        if info.byte_offset is None or info.filter_mask != 0 or not info.size:
+                            raise ValueError("chunk info unavailable")
+                        fds[k] = fd
+                        offs[k] = int(info.byte_offset)
+                        szs[k] = int(info.size)
+                        k += 1
+                    z_cursor += take
+                if k != B:
+                    raise ValueError("incomplete chunk list")
+                out_ptr = dst_slice[p0 : p0 + B].ctypes.data
+                rc = fn_pread(
+                    bshuf_ptr, fds, offs, szs, B, n_elems, elem_size, out_ptr, n_thr
+                )
+                if rc != 0:
+                    raise RuntimeError(f"bshuf_pread_direct_batch failed ({rc})")
+            return True
+        except Exception:
+            pass
+
+    # Fast path 2: read in 64-frame batches via _hdf5_get_chunks
+    try:
+        for p0 in range(0, count, 64):
+            B = min(64, count - p0)
+            chunks, pieces = _hdf5_get_chunks(path, layout, z0 + p0, B)
+            sub_dst = dst_slice[p0 : p0 + B]
+            if chunks is not None:
+                if dst_slice.dtype == dtype and batch_ext is not None:
+                    bshuf_ptr, _, _, fn_direct = batch_ext
+                    c_ptrs = (ctypes.c_void_p * B)(
+                        *(ctypes.cast(ctypes.c_char_p(c), ctypes.c_void_p).value for c in chunks)
+                    )
+                    c_lens = (ctypes.c_size_t * B)(*(len(c) for c in chunks))
+                    rc = fn_direct(
+                        bshuf_ptr,
+                        c_ptrs,
+                        c_lens,
+                        B,
+                        n_elems,
+                        elem_size,
+                        sub_dst.ctypes.data,
+                        n_thr,
+                    )
+                    if rc == 0:
+                        continue
+                if dst_slice.dtype == np.int32 and batch_ext is not None:
+                    bshuf_ptr, fn_i32, _, _ = batch_ext
+                    c_ptrs = (ctypes.c_void_p * B)(
+                        *(ctypes.cast(ctypes.c_char_p(c), ctypes.c_void_p).value for c in chunks)
+                    )
+                    c_lens = (ctypes.c_size_t * B)(*(len(c) for c in chunks))
+                    rc = fn_i32(
+                        bshuf_ptr,
+                        c_ptrs,
+                        c_lens,
+                        B,
+                        n_elems,
+                        dtype_code,
+                        int(top or 0),
+                        sub_dst.ctypes.data,
+                        n_thr,
+                    )
+                    if rc == 0:
+                        continue
+                if dst_slice.dtype != np.int32:
+                    return False
+                direct = elem_size == 4
+                out_base = sub_dst.ctypes.data
+
+                def _decomp_one(i: int):
+                    if direct:
+                        dst_ptr = out_base + i * n_elems * 4
+                        tmp = None
+                    else:
+                        tmp = np.empty(n_elems, dtype=dtype)
+                        dst_ptr = tmp.ctypes.data
+                    _bshuf_decompress_one(chunks[i], dst_ptr, n_elems, elem_size)
+                    frame = sub_dst[i]
+                    if tmp is not None:
+                        np.copyto(frame.reshape(-1), tmp, casting="unsafe")
+                    _map_invalid_pixels(frame, top)
+
+                list(_get_bshuf_pool().map(_decomp_one, range(B)))
+            else:
+                for off, d, s, n in pieces:
+                    arr = d[s : s + n]
+                    dst = sub_dst[off : off + n]
+                    if dst_slice.dtype == dtype:
+                        np.copyto(dst, arr)
+                    elif dst_slice.dtype == np.int32:
+                        if arr.dtype == np.uint32:
+                            np.copyto(dst, arr.view(np.int32))
+                        else:
+                            np.copyto(dst, arr, casting="unsafe")
+                        for k in range(n):
+                            _map_invalid_pixels(dst[k], top)
+                    else:
+                        return False
+        return True
+    except Exception:
+        return False
 
 
 def _try_load_hdf5_raw_volume_gpu(
@@ -594,23 +855,46 @@ def _try_load_hdf5_raw_volume_gpu(
         if chunks is not None:
             elem_size = int(dtype.itemsize)
             n_elems = H * W
-            direct = elem_size == 4  # int32 / uint32 decompress straight into int32
-            out_base = out_np.ctypes.data
+            dtype_code = _dtype_to_bshuf_code(dtype)
+            batch_ext = _get_bshuf_batch_ext() if dtype_code != 0 else None
+            decoded_fast = False
+            if batch_ext is not None:
+                bshuf_ptr, fn_i32, _, _ = batch_ext
+                c_ptrs = (ctypes.c_void_p * B)(
+                    *(ctypes.cast(ctypes.c_char_p(c), ctypes.c_void_p).value for c in chunks)
+                )
+                c_lens = (ctypes.c_size_t * B)(*(len(c) for c in chunks))
+                rc = fn_i32(
+                    bshuf_ptr,
+                    c_ptrs,
+                    c_lens,
+                    B,
+                    n_elems,
+                    dtype_code,
+                    int(top or 0),
+                    out_np.ctypes.data,
+                    max(2, min(32, CPU_COUNT)),
+                )
+                if rc == 0:
+                    decoded_fast = True
+            if not decoded_fast:
+                direct = elem_size == 4  # int32 / uint32 decompress straight into int32
+                out_base = out_np.ctypes.data
 
-            def _decomp_one(i: int):
-                if direct:
-                    dst_ptr = out_base + i * n_elems * 4
-                    tmp = None
-                else:
-                    tmp = np.empty(n_elems, dtype=dtype)
-                    dst_ptr = tmp.ctypes.data
-                _bshuf_decompress_one(chunks[i], dst_ptr, n_elems, elem_size)
-                frame = out_np[i]
-                if tmp is not None:
-                    np.copyto(frame.reshape(-1), tmp, casting="unsafe")
-                _map_invalid_pixels(frame, top)
+                def _decomp_one(i: int):
+                    if direct:
+                        dst_ptr = out_base + i * n_elems * 4
+                        tmp = None
+                    else:
+                        tmp = np.empty(n_elems, dtype=dtype)
+                        dst_ptr = tmp.ctypes.data
+                    _bshuf_decompress_one(chunks[i], dst_ptr, n_elems, elem_size)
+                    frame = out_np[i]
+                    if tmp is not None:
+                        np.copyto(frame.reshape(-1), tmp, casting="unsafe")
+                    _map_invalid_pixels(frame, top)
 
-            list(_get_bshuf_pool().map(_decomp_one, range(B)))
+                list(_get_bshuf_pool().map(_decomp_one, range(B)))
         else:
             for off, d, s, n in pieces:
                 arr = d[s : s + n]

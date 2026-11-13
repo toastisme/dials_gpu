@@ -27,10 +27,12 @@ namespace dials_gpu {
 using dials::model::Shoebox;
 using dials::ProfileFloatType;
 
+constexpr int MAX_WORKER_THREADS = 64;
+
 inline int num_worker_threads() {
     int hw = static_cast<int>(std::thread::hardware_concurrency());
     if (hw <= 0) hw = 8;
-    return std::min(hw, 20);
+    return std::min(hw, MAX_WORKER_THREADS);
 }
 
 template <typename Func>
@@ -1602,12 +1604,46 @@ boost::python::tuple compute_summation_fast(
     return boost::python::make_tuple(intensity_val, intensity_var, background_val, background_var);
 }
 
-// 5. Fast parallel shoebox extraction directly from a 3D (B, H, W) int32 raw volume
-std::size_t extract_shoeboxes_from_volume(
+// 5. Fast parallel shoebox extraction directly from a 3D (B, H, W) raw volume
+inline int32_t read_raw_pixel_i32(
+    const void* row_ptr, int x, int dtype_code, int32_t invalid_top
+) {
+    if (dtype_code == 4) {
+        int32_t v = static_cast<const int32_t*>(row_ptr)[x];
+        if (__builtin_expect(invalid_top > 0 && v >= invalid_top - 2, 0)) {
+            if (v == invalid_top - 1) return -1;
+            if (v == invalid_top - 2) return -2;
+        }
+        return v;
+    } else if (dtype_code == 1) {
+        int32_t v = static_cast<int32_t>(static_cast<const uint16_t*>(row_ptr)[x]);
+        if (__builtin_expect(invalid_top > 0 && v >= invalid_top - 2, 0)) {
+            return v - invalid_top;
+        }
+        return v;
+    } else if (dtype_code == 2) {
+        int32_t v = static_cast<int32_t>(static_cast<const int16_t*>(row_ptr)[x]);
+        if (__builtin_expect(invalid_top > 0 && v >= invalid_top - 2, 0)) {
+            return v - invalid_top;
+        }
+        return v;
+    } else {
+        int32_t v = static_cast<int32_t>(static_cast<const uint32_t*>(row_ptr)[x]);
+        if (__builtin_expect(invalid_top > 0 && v >= invalid_top - 2, 0)) {
+            if (v == invalid_top - 1) return -1;
+            if (v == invalid_top - 2) return -2;
+        }
+        return v;
+    }
+}
+
+std::size_t extract_shoeboxes_from_volume_typed(
     dials::af::ref<Shoebox<ProfileFloatType>> self,
     std::size_t vol_addr,
     std::size_t static_mask_addr,
     std::size_t rejected_addr,
+    int dtype_code,
+    int invalid_top,
     int tr_min,
     int tr_max,
     int frame0,
@@ -1616,14 +1652,17 @@ std::size_t extract_shoeboxes_from_volume(
     std::size_t W,
     std::size_t valid_flags_addr)
 {
-    const int32_t* vol = reinterpret_cast<const int32_t*>(vol_addr);
+    const uint8_t* vol_bytes = reinterpret_cast<const uint8_t*>(vol_addr);
     const uint8_t* static_mask = reinterpret_cast<const uint8_t*>(static_mask_addr);
     const uint8_t* rejected = reinterpret_cast<const uint8_t*>(rejected_addr);
     uint8_t* valid_flags = reinterpret_cast<uint8_t*>(valid_flags_addr);
     std::int64_t n = static_cast<std::int64_t>(self.size());
     int yi = static_cast<int>(H);
     int xi = static_cast<int>(W);
-    std::size_t stride_f = H * W;
+    std::size_t elem_size = (dtype_code <= 2) ? 2 : 4;
+    std::size_t row_bytes = W * elem_size;
+    std::size_t stride_f_bytes = H * row_bytes;
+    int32_t inv_top_i32 = static_cast<int32_t>(invalid_top);
 
     parallel_for(n, [&](std::int64_t r) {
         auto& sbox = self[r];
@@ -1672,20 +1711,21 @@ std::size_t extract_shoeboxes_from_volume(
             for (int z = 0; z < zs; ++z) {
                 int vf = (z0 + z) - frame0;
                 bool is_rej = (rejected[vf] != 0);
-                const int32_t* vol_f = vol + static_cast<std::size_t>(vf) * stride_f;
+                const uint8_t* vol_f = vol_bytes + static_cast<std::size_t>(vf) * stride_f_bytes;
                 for (int y = yb; y < ye; ++y) {
-                    const int32_t* vol_row = vol_f + static_cast<std::size_t>(y + y0) * W;
+                    const void* vol_row = vol_f + static_cast<std::size_t>(y + y0) * row_bytes;
                     const uint8_t* sm_row = static_mask + static_cast<std::size_t>(y + y0) * W;
                     float* sd_row = sdata + static_cast<std::size_t>(y) * s_stride_y;
                     uint8_t* smk_row = smask + static_cast<std::size_t>(y) * s_stride_y;
                     if (is_rej) {
                         for (int x = xb; x < xe; ++x) {
-                            sd_row[x] += static_cast<float>(vol_row[x + x0]);
+                            int32_t raw_val = read_raw_pixel_i32(vol_row, x + x0, dtype_code, inv_top_i32);
+                            sd_row[x] += static_cast<float>(raw_val);
                             smk_row[x] = 0;
                         }
                     } else {
                         for (int x = xb; x < xe; ++x) {
-                            int32_t raw_val = vol_row[x + x0];
+                            int32_t raw_val = read_raw_pixel_i32(vol_row, x + x0, dtype_code, inv_top_i32);
                             sd_row[x] += static_cast<float>(raw_val);
                             bool sv = (smk_row[x] & dials::model::Valid) != 0;
                             bool mv = (sm_row[x + x0] != 0) && (raw_val >= tr_min) && (raw_val <= tr_max);
@@ -1698,22 +1738,23 @@ std::size_t extract_shoeboxes_from_volume(
             for (int z = 0; z < zs; ++z) {
                 int vf = (z0 + z) - frame0;
                 bool is_rej = (rejected[vf] != 0);
-                const int32_t* vol_f = vol + static_cast<std::size_t>(vf) * stride_f;
+                const uint8_t* vol_f = vol_bytes + static_cast<std::size_t>(vf) * stride_f_bytes;
                 float* sd_z = sdata + static_cast<std::size_t>(z) * s_stride_z;
                 uint8_t* smk_z = smask + static_cast<std::size_t>(z) * s_stride_z;
                 for (int y = yb; y < ye; ++y) {
-                    const int32_t* vol_row = vol_f + static_cast<std::size_t>(y + y0) * W;
+                    const void* vol_row = vol_f + static_cast<std::size_t>(y + y0) * row_bytes;
                     const uint8_t* sm_row = static_mask + static_cast<std::size_t>(y + y0) * W;
                     float* sd_row = sd_z + static_cast<std::size_t>(y) * s_stride_y;
                     uint8_t* smk_row = smk_z + static_cast<std::size_t>(y) * s_stride_y;
                     if (is_rej) {
                         for (int x = xb; x < xe; ++x) {
-                            sd_row[x] = static_cast<float>(vol_row[x + x0]);
+                            int32_t raw_val = read_raw_pixel_i32(vol_row, x + x0, dtype_code, inv_top_i32);
+                            sd_row[x] = static_cast<float>(raw_val);
                             smk_row[x] = 0;
                         }
                     } else {
                         for (int x = xb; x < xe; ++x) {
-                            int32_t raw_val = vol_row[x + x0];
+                            int32_t raw_val = read_raw_pixel_i32(vol_row, x + x0, dtype_code, inv_top_i32);
                             sd_row[x] = static_cast<float>(raw_val);
                             bool mv = (sm_row[x + x0] != 0) && (raw_val >= tr_min) && (raw_val <= tr_max);
                             smk_row[x] = mv ? dials::model::Valid : 0;
@@ -1731,11 +1772,32 @@ std::size_t extract_shoeboxes_from_volume(
     return n_valid;
 }
 
-void extract_wide_shoeboxes_slice_from_volume(
+std::size_t extract_shoeboxes_from_volume(
     dials::af::ref<Shoebox<ProfileFloatType>> self,
     std::size_t vol_addr,
     std::size_t static_mask_addr,
     std::size_t rejected_addr,
+    int tr_min,
+    int tr_max,
+    int frame0,
+    int frame1,
+    std::size_t H,
+    std::size_t W,
+    std::size_t valid_flags_addr)
+{
+    return extract_shoeboxes_from_volume_typed(
+        self, vol_addr, static_mask_addr, rejected_addr,
+        4, 0, tr_min, tr_max, frame0, frame1, H, W, valid_flags_addr
+    );
+}
+
+void extract_wide_shoeboxes_slice_from_volume_typed(
+    dials::af::ref<Shoebox<ProfileFloatType>> self,
+    std::size_t vol_addr,
+    std::size_t static_mask_addr,
+    std::size_t rejected_addr,
+    int dtype_code,
+    int invalid_top,
     int tr_min,
     int tr_max,
     int chunk_frame0,
@@ -1744,14 +1806,17 @@ void extract_wide_shoeboxes_slice_from_volume(
     std::size_t W,
     std::size_t valid_flags_addr)
 {
-    const int32_t* vol = reinterpret_cast<const int32_t*>(vol_addr);
+    const uint8_t* vol_bytes = reinterpret_cast<const uint8_t*>(vol_addr);
     const uint8_t* static_mask = reinterpret_cast<const uint8_t*>(static_mask_addr);
     const uint8_t* rejected = reinterpret_cast<const uint8_t*>(rejected_addr);
     uint8_t* valid_flags = reinterpret_cast<uint8_t*>(valid_flags_addr);
     std::int64_t n = static_cast<std::int64_t>(self.size());
     int yi = static_cast<int>(H);
     int xi = static_cast<int>(W);
-    std::size_t stride_f = H * W;
+    std::size_t elem_size = (dtype_code <= 2) ? 2 : 4;
+    std::size_t row_bytes = W * elem_size;
+    std::size_t stride_f_bytes = H * row_bytes;
+    int32_t inv_top_i32 = static_cast<int32_t>(invalid_top);
 
     parallel_for(n, [&](std::int64_t r) {
         auto& sbox = self[r];
@@ -1781,20 +1846,21 @@ void extract_wide_shoeboxes_slice_from_volume(
                 int z = f - z0;
                 int vf = f - chunk_frame0;
                 bool is_rej = (rejected[vf] != 0);
-                const int32_t* vol_f = vol + static_cast<std::size_t>(vf) * stride_f;
+                const uint8_t* vol_f = vol_bytes + static_cast<std::size_t>(vf) * stride_f_bytes;
                 for (int y = yb; y < ye; ++y) {
-                    const int32_t* vol_row = vol_f + static_cast<std::size_t>(y + y0) * W;
+                    const void* vol_row = vol_f + static_cast<std::size_t>(y + y0) * row_bytes;
                     const uint8_t* sm_row = static_mask + static_cast<std::size_t>(y + y0) * W;
                     float* sd_row = sdata + static_cast<std::size_t>(y) * s_stride_y;
                     uint8_t* smk_row = smask + static_cast<std::size_t>(y) * s_stride_y;
                     if (is_rej) {
                         for (int x = xb; x < xe; ++x) {
-                            sd_row[x] += static_cast<float>(vol_row[x + x0]);
+                            int32_t raw_val = read_raw_pixel_i32(vol_row, x + x0, dtype_code, inv_top_i32);
+                            sd_row[x] += static_cast<float>(raw_val);
                             smk_row[x] = 0;
                         }
                     } else {
                         for (int x = xb; x < xe; ++x) {
-                            int32_t raw_val = vol_row[x + x0];
+                            int32_t raw_val = read_raw_pixel_i32(vol_row, x + x0, dtype_code, inv_top_i32);
                             sd_row[x] += static_cast<float>(raw_val);
                             bool sv = (smk_row[x] & dials::model::Valid) != 0;
                             bool mv = (sm_row[x + x0] != 0) && (raw_val >= tr_min) && (raw_val <= tr_max);
@@ -1808,22 +1874,23 @@ void extract_wide_shoeboxes_slice_from_volume(
                 int z = f - z0;
                 int vf = f - chunk_frame0;
                 bool is_rej = (rejected[vf] != 0);
-                const int32_t* vol_f = vol + static_cast<std::size_t>(vf) * stride_f;
+                const uint8_t* vol_f = vol_bytes + static_cast<std::size_t>(vf) * stride_f_bytes;
                 float* sd_z = sdata + static_cast<std::size_t>(z) * s_stride_z;
                 uint8_t* smk_z = smask + static_cast<std::size_t>(z) * s_stride_z;
                 for (int y = yb; y < ye; ++y) {
-                    const int32_t* vol_row = vol_f + static_cast<std::size_t>(y + y0) * W;
+                    const void* vol_row = vol_f + static_cast<std::size_t>(y + y0) * row_bytes;
                     const uint8_t* sm_row = static_mask + static_cast<std::size_t>(y + y0) * W;
                     float* sd_row = sd_z + static_cast<std::size_t>(y) * s_stride_y;
                     uint8_t* smk_row = smk_z + static_cast<std::size_t>(y) * s_stride_y;
                     if (is_rej) {
                         for (int x = xb; x < xe; ++x) {
-                            sd_row[x] = static_cast<float>(vol_row[x + x0]);
+                            int32_t raw_val = read_raw_pixel_i32(vol_row, x + x0, dtype_code, inv_top_i32);
+                            sd_row[x] = static_cast<float>(raw_val);
                             smk_row[x] = 0;
                         }
                     } else {
                         for (int x = xb; x < xe; ++x) {
-                            int32_t raw_val = vol_row[x + x0];
+                            int32_t raw_val = read_raw_pixel_i32(vol_row, x + x0, dtype_code, inv_top_i32);
                             sd_row[x] = static_cast<float>(raw_val);
                             bool mv = (sm_row[x + x0] != 0) && (raw_val >= tr_min) && (raw_val <= tr_max);
                             smk_row[x] = mv ? dials::model::Valid : 0;
@@ -1833,6 +1900,25 @@ void extract_wide_shoeboxes_slice_from_volume(
             }
         }
     });
+}
+
+void extract_wide_shoeboxes_slice_from_volume(
+    dials::af::ref<Shoebox<ProfileFloatType>> self,
+    std::size_t vol_addr,
+    std::size_t static_mask_addr,
+    std::size_t rejected_addr,
+    int tr_min,
+    int tr_max,
+    int chunk_frame0,
+    int chunk_frame1,
+    std::size_t H,
+    std::size_t W,
+    std::size_t valid_flags_addr)
+{
+    extract_wide_shoeboxes_slice_from_volume_typed(
+        self, vol_addr, static_mask_addr, rejected_addr,
+        4, 0, tr_min, tr_max, chunk_frame0, chunk_frame1, H, W, valid_flags_addr
+    );
 }
 
 // 6. Parallel foreground/background mask calculation for GaussianRS
@@ -1927,8 +2013,8 @@ void parallel_compute_mask_3d_fast(
     }
 
     std::int64_t n = static_cast<std::int64_t>(shoeboxes.size());
-    std::vector<std::vector<double>> thread_dxy_bufs(20);
-    std::vector<std::vector<uint8_t>> thread_mv_bufs(20);
+    std::vector<std::vector<double>> thread_dxy_bufs(MAX_WORKER_THREADS);
+    std::vector<std::vector<uint8_t>> thread_mv_bufs(MAX_WORKER_THREADS);
     parallel_for(n, [&](std::int64_t idx, int tid) {
         auto& dxy_buf = thread_dxy_bufs[tid];
         auto& mv_buf = thread_mv_bufs[tid];
@@ -2390,7 +2476,7 @@ inline double quad_unit_square_intersection_area(
     return area * 0.5;
 }
 
-inline void run_transform_forward_fast(
+inline void run_transform_forward_raw(
     const dxtbx::model::Panel& panel,
     const PanelTransformInfo& pinfo,
     int scan_index0,
@@ -2401,7 +2487,10 @@ inline void run_transform_forward_fast(
     double n_sigma,
     std::size_t half_grid_size,
     const dials::algorithms::profile_model::gaussian_rs::CoordinateSystem& cs,
-    const Shoebox<ProfileFloatType>& sbox,
+    const scitbx::af::int6& bbox,
+    const float* sdata,
+    const float* sbkgrd,
+    const uint8_t* smask,
     bool use_bkgrd,
     bool compute_net,
     ThreadTransformScratch& scratch)
@@ -2421,7 +2510,6 @@ inline void run_transform_forward_fast(
     scratch.valid_kk_mask = 0;
     scratch.has_fg_pixels = false;
 
-    scitbx::af::int6 bbox = sbox.bbox;
     int x0 = bbox[0];
     int y0 = bbox[2];
     int j0 = bbox[4];
@@ -2511,9 +2599,6 @@ inline void run_transform_forward_fast(
         }
     }
 
-    const float* sdata = sbox.data.begin();
-    const float* sbkgrd = sbox.background.begin();
-    const uint8_t* smask = sbox.mask.begin();
     constexpr uint8_t fg_valid = Valid | Foreground;
     std::size_t stride_z = static_cast<std::size_t>(ny) * static_cast<std::size_t>(nx);
     std::size_t stride_y = static_cast<std::size_t>(nx);
@@ -2884,6 +2969,30 @@ inline void run_transform_forward_fast(
     }
 }
 
+inline void run_transform_forward_fast(
+    const dxtbx::model::Panel& panel,
+    const PanelTransformInfo& pinfo,
+    int scan_index0,
+    double phi0,
+    double dphi,
+    double sigma_b,
+    double sigma_m,
+    double n_sigma,
+    std::size_t half_grid_size,
+    const dials::algorithms::profile_model::gaussian_rs::CoordinateSystem& cs,
+    const Shoebox<ProfileFloatType>& sbox,
+    bool use_bkgrd,
+    bool compute_net,
+    ThreadTransformScratch& scratch)
+{
+    run_transform_forward_raw(
+        panel, pinfo, scan_index0, phi0, dphi, sigma_b, sigma_m, n_sigma,
+        half_grid_size, cs, sbox.bbox,
+        sbox.data.begin(), sbox.background.begin(), sbox.mask.begin(),
+        use_bkgrd, compute_net, scratch
+    );
+}
+
 // Exception-free 1D profile fitter over valid kk slices matching DIALS ProfileFitter<double> bit-for-bit
 inline bool fit_1d_noexcept_slices(
     const double* c_full_or_compact,
@@ -3023,11 +3132,12 @@ struct CachedTransformStore {
           valid_kk_mask(n, 0),
           tid_of_r(n, 0),
           slice_offset_of_r(n, 0),
-          thread_c_slices(20),
-          thread_b_slices(20)
+          thread_c_slices(MAX_WORKER_THREADS),
+          thread_b_slices(MAX_WORKER_THREADS)
     {
-        std::size_t est_slices_per_thread = (n / 20 + 64) * 2;
-        for (int t = 0; t < 20; ++t) {
+        int nt = num_worker_threads();
+        std::size_t est_slices_per_thread = (n / static_cast<std::size_t>(nt) + 64) * 2;
+        for (int t = 0; t < nt; ++t) {
             thread_c_slices[t].reserve(est_slices_per_thread * g_stride_k);
             thread_b_slices[t].reserve(est_slices_per_thread * g_stride_k);
         }
@@ -3093,7 +3203,7 @@ struct ParallelGaussianRS : public dials::algorithms::GaussianRSProfileModeller 
         bool* succ_ptr = success.begin();
 
         if (fit_method_ == ReciprocalSpace) {
-            std::vector<ThreadTransformScratch> thread_scratch(20);
+            std::vector<ThreadTransformScratch> thread_scratch(MAX_WORKER_THREADS);
             parallel_for(n, [&](std::int64_t i, int tid) {
                 intensity_val[i] = 0.0;
                 intensity_var[i] = -1.0;
@@ -3540,7 +3650,7 @@ struct ParallelGaussianRS : public dials::algorithms::GaussianRSProfileModeller 
         dials::af::shared<bool> success(panel.size(), false);
         bool* succ_ptr = success.begin();
 
-        std::vector<ThreadTransformScratch> thread_scratch(20);
+        std::vector<ThreadTransformScratch> thread_scratch(MAX_WORKER_THREADS);
         parallel_for(n, [&](std::int64_t i, int tid) {
             if (!store.was_processed[static_cast<std::size_t>(i)]) {
                 return;
@@ -3639,7 +3749,1011 @@ struct ParallelGaussianRS : public dials::algorithms::GaussianRSProfileModeller 
     void mark_finalized() {
         set_finalized(true);
     }
+
+    static void integrate_slab_from_volume_cols(
+        ParallelGaussianRS* self,
+        const dials::af::const_ref<std::size_t>& slab_ind,
+        boost::python::tuple cols,
+        boost::python::tuple params)
+    {
+        using namespace boost::python;
+        using namespace dials::algorithms;
+        using dials::model::Valid;
+        using dials::model::Background;
+        using dials::model::Foreground;
+        using dials::model::Overlapped;
+        using dials::model::BackgroundUsed;
+        using dials::algorithms::profile_model::gaussian_rs::CoordinateSystem;
+        using scitbx::vec2;
+        using scitbx::vec3;
+
+        dials::af::const_ref<std::size_t> panel_col = extract<dials::af::const_ref<std::size_t>>(cols[0]);
+        dials::af::const_ref<scitbx::af::int6> bbox_col = extract<dials::af::const_ref<scitbx::af::int6>>(cols[1]);
+        dials::af::const_ref<vec3<double>> s1_col = extract<dials::af::const_ref<vec3<double>>>(cols[2]);
+        dials::af::const_ref<vec3<double>> xyzcal_px_col = extract<dials::af::const_ref<vec3<double>>>(cols[3]);
+        dials::af::const_ref<vec3<double>> xyzcal_mm_col = extract<dials::af::const_ref<vec3<double>>>(cols[4]);
+        dials::af::const_ref<double> partiality_col = extract<dials::af::const_ref<double>>(cols[5]);
+        dials::af::ref<std::size_t> flags_col = extract<dials::af::ref<std::size_t>>(cols[6]);
+        dials::af::ref<double> bg_mean_col = extract<dials::af::ref<double>>(cols[7]);
+        dials::af::ref<double> int_sum_val_col = extract<dials::af::ref<double>>(cols[8]);
+        dials::af::ref<double> int_sum_var_col = extract<dials::af::ref<double>>(cols[9]);
+        dials::af::ref<double> bg_sum_val_col = extract<dials::af::ref<double>>(cols[10]);
+        dials::af::ref<double> bg_sum_var_col = extract<dials::af::ref<double>>(cols[11]);
+        dials::af::ref<vec3<double>> xyzobs_px_val_col = extract<dials::af::ref<vec3<double>>>(cols[12]);
+        dials::af::ref<vec3<double>> xyzobs_px_var_col = extract<dials::af::ref<vec3<double>>>(cols[13]);
+        dials::af::ref<vec3<double>> xyzobs_mm_val_col = extract<dials::af::ref<vec3<double>>>(cols[14]);
+        dials::af::ref<vec3<double>> xyzobs_mm_var_col = extract<dials::af::ref<vec3<double>>>(cols[15]);
+        dials::af::ref<int> nvalid_col = extract<dials::af::ref<int>>(cols[16]);
+        dials::af::ref<int> nbg_col = extract<dials::af::ref<int>>(cols[17]);
+        dials::af::ref<int> nbg_used_col = extract<dials::af::ref<int>>(cols[18]);
+        dials::af::ref<int> nforeg_col = extract<dials::af::ref<int>>(cols[19]);
+        dials::af::ref<double> int_prf_val_col = extract<dials::af::ref<double>>(cols[20]);
+        dials::af::ref<double> int_prf_var_col = extract<dials::af::ref<double>>(cols[21]);
+        dials::af::ref<double> prf_corr_col = extract<dials::af::ref<double>>(cols[22]);
+
+        const dxtbx::model::BeamBase& beam = extract<const dxtbx::model::BeamBase&>(params[0]);
+        const dxtbx::model::Detector& detector = extract<const dxtbx::model::Detector&>(params[1]);
+        const dxtbx::model::Goniometer& goniometer = extract<const dxtbx::model::Goniometer&>(params[2]);
+        const dxtbx::model::Scan& scan = extract<const dxtbx::model::Scan&>(params[3]);
+        std::size_t vol_addr = extract<std::size_t>(params[4]);
+        std::size_t static_mask_addr = extract<std::size_t>(params[5]);
+        std::size_t rejected_addr = extract<std::size_t>(params[6]);
+        int tr_min = extract<int>(params[7]);
+        int tr_max = extract<int>(params[8]);
+        int frame0 = extract<int>(params[9]);
+        int frame1 = extract<int>(params[10]);
+        std::size_t img_h = extract<std::size_t>(params[11]);
+        std::size_t img_w = extract<std::size_t>(params[12]);
+        int vol_dtype_code = extract<int>(params[13]);
+        int vol_invalid_top = extract<int>(params[14]);
+        double saturation = extract<double>(params[15]);
+        double delta_b = extract<double>(params[16]);
+        double valid_fg_threshold = extract<double>(params[17]);
+        int bg_alg_code = extract<int>(params[18]);
+        int bg_min_pixels = extract<int>(params[19]);
+        double bg_tuning_constant = extract<double>(params[20]);
+        std::size_t bg_max_iter = extract<std::size_t>(params[21]);
+        int px2mm_mode = extract<int>(params[22]);
+        double mu = extract<double>(params[23]);
+        double t0 = extract<double>(params[24]);
+        int mode = extract<int>(params[25]);
+        std::size_t cache_id = extract<std::size_t>(params[26]);
+        std::size_t prof_begin = extract<std::size_t>(params[27]);
+        std::size_t prof_end = extract<std::size_t>(params[28]);
+
+        std::int64_t n = static_cast<std::int64_t>(slab_ind.size());
+        if (n <= 0) return;
+
+        const void* vol_raw = reinterpret_cast<const void*>(vol_addr);
+        const uint8_t* static_mask = reinterpret_cast<const uint8_t*>(static_mask_addr);
+        const uint8_t* rejected = reinterpret_cast<const uint8_t*>(rejected_addr);
+        std::size_t frame_stride = img_h * img_w;
+        int H = static_cast<int>(img_h);
+        int W = static_cast<int>(img_w);
+        float sat_f = static_cast<float>(saturation);
+
+        vec3<double> s0 = beam.get_s0();
+        vec3<double> m2 = goniometer.get_rotation_axis();
+        double s0_length = s0.length();
+        double delta_b_r = 1.0 / delta_b;
+        double delta_b_r2 = delta_b_r * delta_b_r;
+        vec2<int> scan_arr_range = scan.get_array_range();
+        int scan_index0 = scan_arr_range[0];
+        int scan_index1 = scan_arr_range[1];
+        vec2<double> scan_osc = scan.get_oscillation();
+        double phi0 = scan_osc[0];
+        double dphi = scan_osc[1];
+        double arr0 = static_cast<double>(scan_index0);
+
+        std::vector<PanelTransformInfo> panel_infos = extract_panel_transform_infos(detector);
+        const PanelTransformInfo& pinfo0 = panel_infos[0];
+        double px_size_x = pinfo0.px_x;
+        double px_size_y = pinfo0.px_y;
+        double px_size_x2 = px_size_x * px_size_x;
+        double px_size_y2 = px_size_y * px_size_y;
+        double osc_w2 = dphi * dphi;
+        vec3<double> fast_axis = pinfo0.fast;
+        vec3<double> slow_axis = pinfo0.slow;
+        vec3<double> origin = pinfo0.origin;
+        vec3<double> n_vec = fast_axis.cross(slow_axis);
+        if (origin * n_vec < 0.0) {
+            n_vec = -n_vec;
+        }
+        constexpr double half_sq = 1.0 / 12.0;
+
+        double sb = 0.0, sm = 0.0, ns = 0.0;
+        std::size_t hgs = 0, g_dim = 0, g_stride_k = 0, g_vol = 0, n_prof = 0, prof_elems = 0;
+        std::vector<data_const_reference> prof_data;
+        std::vector<mask_const_reference> prof_mask;
+        std::vector<uint8_t> prof_valid;
+
+        if (self != nullptr) {
+            if (self->fit_method_ != ReciprocalSpace) {
+                throw DIALS_ERROR("DetectorSpace not supported in integrate_slab_from_volume_fast");
+            }
+            sb = self->sigma_b_;
+            sm = self->sigma_m_;
+            ns = self->n_sigma_;
+            hgs = self->grid_size_;
+            g_dim = 2 * hgs + 1;
+            g_stride_k = g_dim * g_dim;
+            g_vol = g_dim * g_stride_k;
+            n_prof = self->data_.size();
+            prof_elems = self->accessor_.size_1d();
+            if (mode == 1) {
+                prof_data.resize(n_prof);
+                prof_mask.resize(n_prof);
+                prof_valid.assign(n_prof, 0);
+                for (std::size_t k = 0; k < n_prof; ++k) {
+                    if (self->data_[k].size() != 0 && self->mask_[k].size() != 0) {
+                        prof_data[k] = self->data_[k].const_ref();
+                        prof_mask[k] = self->mask_[k].const_ref();
+                        prof_valid[k] = 1;
+                    }
+                }
+            }
+        }
+
+        std::shared_ptr<CachedTransformStore> global_store;
+        if (mode == 2) {
+            std::lock_guard<std::mutex> lock(g_transform_cache_mtx);
+            auto it = g_transform_caches.find(cache_id);
+            DIALS_ASSERT(it != g_transform_caches.end());
+            global_store = it->second;
+        }
+        std::unique_ptr<CachedTransformStore> local_slab_store;
+        if (mode == 3) {
+            local_slab_store = std::make_unique<CachedTransformStore>(
+                static_cast<std::size_t>(n), g_dim
+            );
+        }
+        CachedTransformStore* active_store = (mode == 2) ? global_store.get()
+                                           : (mode == 3) ? local_slab_store.get()
+                                           : nullptr;
+
+        int nt = num_worker_threads();
+        if (nt > n) nt = static_cast<int>(n);
+
+        struct ThreadSlabScratch {
+            std::vector<float> sb_data;
+            std::vector<float> sb_bg;
+            std::vector<uint8_t> sb_mask;
+            std::vector<double> dxy_buf;
+            std::vector<uint8_t> mv_buf;
+            ThreadTransformScratch trans;
+        };
+
+        std::vector<ThreadSlabScratch> thread_scratch(static_cast<std::size_t>(nt));
+        std::vector<std::vector<std::vector<double>>> thread_data;
+        std::vector<std::vector<std::size_t>> thread_n_refl;
+        if (mode == 0 || mode == 2 || mode == 3) {
+            thread_data.assign(
+                static_cast<std::size_t>(nt),
+                std::vector<std::vector<double>>(n_prof)
+            );
+            thread_n_refl.assign(
+                static_cast<std::size_t>(nt),
+                std::vector<std::size_t>(n_prof, 0)
+            );
+        }
+
+        constexpr uint8_t m_bg_val = Background | Valid;
+        constexpr uint8_t m_fg_val = Foreground | Valid;
+        constexpr uint8_t m_ovlp = Overlapped;
+        constexpr uint8_t m_used = BackgroundUsed;
+        constexpr uint8_t m_not_used = static_cast<uint8_t>(255 ^ m_used);
+        constexpr uint8_t m_bg_used_val = Valid | Background | BackgroundUsed;
+
+        std::atomic<std::int64_t> next_idx{0};
+        constexpr std::int64_t chunk = 16;
+
+        auto worker = [&](int tid) {
+            auto& sc = thread_scratch[static_cast<std::size_t>(tid)];
+            while (true) {
+                std::int64_t start = next_idx.fetch_add(chunk, std::memory_order_relaxed);
+                if (start >= n) break;
+                std::int64_t end = std::min(start + chunk, n);
+                for (std::int64_t i = start; i < end; ++i) {
+                    std::size_t r = slab_ind[static_cast<std::size_t>(i)];
+                    scitbx::af::int6 b = bbox_col[r];
+                    int x0 = b[0], x1 = b[1], y0 = b[2], y1 = b[3], z0 = b[4], z1 = b[5];
+                    int nx = x1 - x0, ny = y1 - y0, nz = z1 - z0;
+                    if (nx <= 0 || ny <= 0 || nz <= 0 || z0 < frame0 || z1 > frame1) {
+                        continue;
+                    }
+
+                    std::size_t slice_sz = static_cast<std::size_t>(ny) * static_cast<std::size_t>(nx);
+                    std::size_t sz = static_cast<std::size_t>(nz) * slice_sz;
+                    if (sc.sb_data.size() < sz) {
+                        sc.sb_data.resize(sz);
+                        sc.sb_bg.resize(sz);
+                        sc.sb_mask.resize(sz);
+                    }
+                    float* d_ptr = sc.sb_data.data();
+                    float* bg_ptr = sc.sb_bg.data();
+                    uint8_t* m_ptr = sc.sb_mask.data();
+                    std::size_t fl = flags_col[r];
+
+                    // Step A: Extract shoebox from volume + overload check
+                    bool ovl = false;
+                    for (int kz = 0; kz < nz; ++kz) {
+                        int f_rel = (z0 + kz) - frame0;
+                        bool f_rej = rejected[f_rel] != 0;
+                        std::size_t f_base = static_cast<std::size_t>(f_rel) * frame_stride;
+                        std::size_t z_off = static_cast<std::size_t>(kz) * slice_sz;
+                        for (int ky = 0; ky < ny; ++ky) {
+                            int iy = y0 + ky;
+                            std::size_t y_off = z_off + static_cast<std::size_t>(ky) * static_cast<std::size_t>(nx);
+                            if (iy < 0 || iy >= H) {
+                                for (int kx = 0; kx < nx; ++kx) {
+                                    d_ptr[y_off + kx] = 0.0f;
+                                    m_ptr[y_off + kx] = 0;
+                                }
+                                continue;
+                            }
+                            std::size_t row_base = f_base + static_cast<std::size_t>(iy) * img_w;
+                            const uint8_t* sm_row = static_mask + static_cast<std::size_t>(iy) * img_w;
+                            for (int kx = 0; kx < nx; ++kx) {
+                                int ix = x0 + kx;
+                                std::size_t out_idx = y_off + static_cast<std::size_t>(kx);
+                                if (ix < 0 || ix >= W) {
+                                    d_ptr[out_idx] = 0.0f;
+                                    m_ptr[out_idx] = 0;
+                                } else {
+                                    int32_t pv = read_raw_pixel_i32(
+                                        vol_raw, row_base + static_cast<std::size_t>(ix),
+                                        vol_dtype_code, vol_invalid_top
+                                    );
+                                    float fv = static_cast<float>(pv);
+                                    d_ptr[out_idx] = fv;
+                                    bool valid = (!f_rej) && (sm_row[ix] != 0) && (pv >= tr_min) && (pv <= tr_max);
+                                    if (fv > sat_f) {
+                                        valid = false;
+                                        ovl = true;
+                                    }
+                                    m_ptr[out_idx] = valid ? Valid : 0;
+                                }
+                            }
+                        }
+                    }
+                    if (ovl) {
+                        fl |= dials::af::Overloaded;
+                    }
+
+                    // Step B: 3D GaussianRS shoebox mask
+                    std::size_t p_idx = panel_col[r];
+                    const dxtbx::model::Panel& panel = detector[p_idx];
+                    const PanelTransformInfo& pinfo = panel_infos[p_idx];
+                    double frame = xyzcal_px_col[r][2];
+                    double phi = phi0 + (frame - scan_index0) * dphi;
+                    vec3<double> s1_r = s1_col[r];
+                    CoordinateSystem cs_mask(m2, s0, s1_r, phi);
+                    double s1_len = cs_mask.s1().length();
+                    vec3<double> scaled_e1 = cs_mask.e1_axis() * (1.0 / s1_len);
+                    vec3<double> scaled_e2 = cs_mask.e2_axis() * (1.0 / s1_len);
+
+                    std::size_t stride_x = static_cast<std::size_t>(nx + 1);
+                    std::size_t dxy_sz = static_cast<std::size_t>(ny + 1) * stride_x;
+                    if (sc.dxy_buf.size() < dxy_sz) {
+                        sc.dxy_buf.resize(dxy_sz);
+                    }
+                    if (pinfo.is_pure_simple) {
+                        for (int j = 0; j <= ny; ++j) {
+                            double my = static_cast<double>(y0 + j) * pinfo.px_y;
+                            vec3<double> row_base = pinfo.origin + pinfo.slow * my;
+                            for (int ix_c = 0; ix_c <= nx; ++ix_c) {
+                                double mx = static_cast<double>(x0 + ix_c) * pinfo.px_x;
+                                vec3<double> lab = row_base + pinfo.fast * mx;
+                                vec3<double> ds1 = lab.normalize() * s0_length - s1_r;
+                                double gx = scaled_e1 * ds1;
+                                double gy = scaled_e2 * ds1;
+                                sc.dxy_buf[static_cast<std::size_t>(j) * stride_x + ix_c] =
+                                    (gx * gx + gy * gy) * delta_b_r2;
+                            }
+                        }
+                    } else if (pinfo.is_pure_parallax) {
+                        vec2<double> shoebox_centroid_px = panel.get_ray_intersection_px(s1_r);
+                        double attenuation_length = panel.attenuation_length(shoebox_centroid_px);
+                        for (int j = 0; j <= ny; ++j) {
+                            double my = static_cast<double>(y0 + j) * pinfo.px_y;
+                            vec3<double> row_base = pinfo.origin + my * pinfo.slow;
+                            for (int ix_c = 0; ix_c <= nx; ++ix_c) {
+                                double mx = static_cast<double>(x0 + ix_c) * pinfo.px_x;
+                                vec3<double> s1_raw = row_base + mx * pinfo.fast;
+                                vec3<double> s1_n = s1_raw.normalize();
+                                double cx_p = mx - (s1_n * pinfo.fast) * attenuation_length;
+                                double cy_p = my - (s1_n * pinfo.slow) * attenuation_length;
+                                vec3<double> lab = pinfo.origin + cx_p * pinfo.fast + cy_p * pinfo.slow;
+                                vec3<double> ds1 = lab.normalize() * s0_length - s1_r;
+                                double gx = scaled_e1 * ds1;
+                                double gy = scaled_e2 * ds1;
+                                sc.dxy_buf[static_cast<std::size_t>(j) * stride_x + ix_c] =
+                                    (gx * gx + gy * gy) * delta_b_r2;
+                            }
+                        }
+                    } else {
+                        vec2<double> shoebox_centroid_px = panel.get_ray_intersection_px(s1_r);
+                        double attenuation_length = panel.attenuation_length(shoebox_centroid_px);
+                        for (int j = 0; j <= ny; ++j) {
+                            for (int ix_c = 0; ix_c <= nx; ++ix_c) {
+                                vec3<double> ds1 =
+                                    panel.get_pixel_lab_coord(vec2<double>(x0 + ix_c, y0 + j), attenuation_length).normalize() * s0_length - s1_r;
+                                double gx = scaled_e1 * ds1;
+                                double gy = scaled_e2 * ds1;
+                                sc.dxy_buf[static_cast<std::size_t>(j) * stride_x + ix_c] =
+                                    (gx * gx + gy * gy) * delta_b_r2;
+                            }
+                        }
+                    }
+
+                    int k_start = std::max(0, scan_index0 - z0);
+                    int k_end = std::min(nz, scan_index1 - z0);
+                    if (k_start < k_end) {
+                        if (sc.mv_buf.size() < slice_sz) {
+                            sc.mv_buf.resize(slice_sz);
+                        }
+                        for (int j = 0; j < ny; ++j) {
+                            const double* r0 = &sc.dxy_buf[static_cast<std::size_t>(j) * stride_x];
+                            const double* r1 = r0 + stride_x;
+                            uint8_t* mv_row = sc.mv_buf.data() + static_cast<std::size_t>(j) * nx;
+                            for (int ix_c = 0; ix_c < nx; ++ix_c) {
+                                double dxy = std::min(std::min(r0[ix_c], r1[ix_c]), std::min(r0[ix_c + 1], r1[ix_c + 1]));
+                                mv_row[ix_c] = (dxy <= 1.0) ? Foreground : Background;
+                            }
+                        }
+                        uint8_t* m_first = m_ptr + static_cast<std::size_t>(k_start) * slice_sz;
+                        int n_k = k_end - k_start;
+                        const uint8_t* mv_data = sc.mv_buf.data();
+                        for (int k = 0; k < n_k; ++k) {
+                            uint8_t* m_slice = m_first + static_cast<std::size_t>(k) * slice_sz;
+                            for (std::size_t p = 0; p < slice_sz; ++p) {
+                                m_slice[p] |= mv_data[p];
+                            }
+                        }
+                    }
+
+                    // Step C: Pre-background mask validation + foreground count
+                    if (mode != 0) {
+                        int nbackg = 0, nvalbg = 0, nforeg = 0, nvalfg = 0;
+                        for (std::size_t p = 0; p < sz; ++p) {
+                            uint8_t m = m_ptr[p];
+                            if (m & Background) {
+                                nbackg++;
+                                if ((m & m_bg_val) == m_bg_val) nvalbg++;
+                            }
+                            if (m & Foreground) {
+                                nforeg++;
+                                if ((m & m_fg_val) == m_fg_val) nvalfg++;
+                            }
+                        }
+                        if (nbackg > nvalbg) fl |= dials::af::BackgroundIncludesBadPixels;
+                        if (nforeg > nvalfg) fl |= dials::af::ForegroundIncludesBadPixels;
+                        double frac = static_cast<double>(nvalfg) / static_cast<double>(nforeg);
+                        if (frac < valid_fg_threshold) fl |= dials::af::DontIntegrate;
+                        nforeg_col[r] = nvalfg;
+                    }
+
+                    // Step D: GLM Background (constant3d or constant2d)
+                    if (bg_alg_code == 0) {
+                        int32_t h_r[128];
+                        std::memset(h_r, 0, sizeof(h_r));
+                        int max_bin = -1;
+                        int64_t cnt = 0;
+                        int64_t tail_cnt = 0;
+                        bool neg = false;
+                        for (std::size_t p = 0; p < sz; ++p) {
+                            uint8_t m = m_ptr[p];
+                            if (((m & m_bg_val) == m_bg_val) && ((m & m_ovlp) == 0)) {
+                                cnt++;
+                                float v = d_ptr[p];
+                                if (v < 0.0f) {
+                                    neg = true;
+                                } else {
+                                    int iv = static_cast<int>(v);
+                                    if (static_cast<float>(iv) == v && iv >= 0 && iv < 128) {
+                                        h_r[iv]++;
+                                        if (iv > max_bin) max_bin = iv;
+                                    } else {
+                                        tail_cnt++;
+                                    }
+                                }
+                            }
+                        }
+                        bool bg_ok = false;
+                        float m_val_f = 0.0f;
+                        if (cnt >= bg_min_pixels && !neg) {
+                            std::vector<double> tail;
+                            double med = 0.0;
+                            if (tail_cnt == 0) {
+                                int64_t target = cnt / 2;
+                                int64_t acc = 0;
+                                for (int k = 0; k <= max_bin; ++k) {
+                                    acc += h_r[k];
+                                    if (acc > target) {
+                                        med = static_cast<double>(k);
+                                        break;
+                                    }
+                                }
+                            } else {
+                                tail.reserve(static_cast<std::size_t>(tail_cnt));
+                                std::vector<double> tmp;
+                                tmp.reserve(static_cast<std::size_t>(cnt));
+                                for (std::size_t p = 0; p < sz; ++p) {
+                                    uint8_t m = m_ptr[p];
+                                    if (((m & m_bg_val) == m_bg_val) && ((m & m_ovlp) == 0)) {
+                                        float v = d_ptr[p];
+                                        double dv = static_cast<double>(v);
+                                        tmp.push_back(dv);
+                                        int iv = static_cast<int>(v);
+                                        if (!(static_cast<float>(iv) == v && iv >= 0 && iv < 128)) {
+                                            tail.push_back(dv);
+                                        }
+                                    }
+                                }
+                                std::nth_element(tmp.begin(), tmp.begin() + cnt / 2, tmp.end());
+                                med = tmp[cnt / 2];
+                            }
+                            if (med <= 0.0) med = 1.0;
+                            double m_val_d = 0.0;
+                            bg_ok = solve_robust_poisson_hist(
+                                h_r, max_bin, tail, cnt, med, bg_tuning_constant, 1e-3, bg_max_iter, m_val_d
+                            );
+                            if (bg_ok) {
+                                m_val_f = static_cast<float>(m_val_d);
+                            }
+                        }
+                        if (bg_ok) {
+                            std::fill(bg_ptr, bg_ptr + sz, m_val_f);
+                            for (std::size_t p = 0; p < sz; ++p) {
+                                uint8_t m = m_ptr[p];
+                                if (((m & m_bg_val) == m_bg_val) && ((m & m_ovlp) == 0)) {
+                                    m_ptr[p] = m | m_used;
+                                }
+                            }
+                            if (mode != 0) bg_mean_col[r] = static_cast<double>(m_val_f);
+                        } else {
+                            std::fill(bg_ptr, bg_ptr + sz, 0.0f);
+                            if (mode != 0) bg_mean_col[r] = 0.0;
+                            fl |= (dials::af::DontIntegrate | dials::af::FailedDuringBackgroundModelling);
+                        }
+                    } else {
+                        bool all_ok = true;
+                        double sum_bg = 0.0;
+                        int64_t total_used = 0;
+                        for (int kz = 0; kz < nz; ++kz) {
+                            std::size_t z_off = static_cast<std::size_t>(kz) * slice_sz;
+                            const float* dz = d_ptr + z_off;
+                            uint8_t* mz = m_ptr + z_off;
+                            float* bgz = bg_ptr + z_off;
+                            int32_t h_r[128];
+                            std::memset(h_r, 0, sizeof(h_r));
+                            int max_bin = -1;
+                            int64_t cnt = 0;
+                            int64_t tail_cnt = 0;
+                            bool neg = false;
+                            for (std::size_t p = 0; p < slice_sz; ++p) {
+                                uint8_t m = mz[p];
+                                if (((m & m_bg_val) == m_bg_val) && ((m & m_ovlp) == 0)) {
+                                    cnt++;
+                                    float v = dz[p];
+                                    if (v < 0.0f) {
+                                        neg = true;
+                                    } else {
+                                        int iv = static_cast<int>(v);
+                                        if (static_cast<float>(iv) == v && iv >= 0 && iv < 128) {
+                                            h_r[iv]++;
+                                            if (iv > max_bin) max_bin = iv;
+                                        } else {
+                                            tail_cnt++;
+                                        }
+                                    }
+                                }
+                            }
+                            if (cnt < bg_min_pixels || neg) {
+                                all_ok = false;
+                                break;
+                            }
+                            std::vector<double> tail;
+                            double med = 0.0;
+                            if (tail_cnt == 0) {
+                                int64_t target = cnt / 2;
+                                int64_t acc_c = 0;
+                                for (int bk = 0; bk <= max_bin; ++bk) {
+                                    acc_c += h_r[bk];
+                                    if (acc_c > target) {
+                                        med = static_cast<double>(bk);
+                                        break;
+                                    }
+                                }
+                            } else {
+                                tail.reserve(static_cast<std::size_t>(tail_cnt));
+                                std::vector<double> tmp;
+                                tmp.reserve(static_cast<std::size_t>(cnt));
+                                for (std::size_t p = 0; p < slice_sz; ++p) {
+                                    uint8_t m = mz[p];
+                                    if (((m & m_bg_val) == m_bg_val) && ((m & m_ovlp) == 0)) {
+                                        float v = dz[p];
+                                        double dv = static_cast<double>(v);
+                                        tmp.push_back(dv);
+                                        int iv = static_cast<int>(v);
+                                        if (!(static_cast<float>(iv) == v && iv >= 0 && iv < 128)) {
+                                            tail.push_back(dv);
+                                        }
+                                    }
+                                }
+                                std::nth_element(tmp.begin(), tmp.begin() + cnt / 2, tmp.end());
+                                med = tmp[cnt / 2];
+                            }
+                            if (med <= 0.0) med = 1.0;
+                            double m_val_d = 0.0;
+                            bool ok = solve_robust_poisson_hist(
+                                h_r, max_bin, tail, cnt, med, bg_tuning_constant, 1e-3, bg_max_iter, m_val_d
+                            );
+                            if (!ok) {
+                                all_ok = false;
+                                break;
+                            }
+                            float m_val_f = static_cast<float>(m_val_d);
+                            std::fill(bgz, bgz + slice_sz, m_val_f);
+                            for (std::size_t p = 0; p < slice_sz; ++p) {
+                                uint8_t m = mz[p];
+                                if (((m & m_bg_val) == m_bg_val) && ((m & m_ovlp) == 0)) {
+                                    mz[p] = m | m_used;
+                                }
+                            }
+                            sum_bg += static_cast<double>(m_val_f) * static_cast<double>(cnt);
+                            total_used += cnt;
+                        }
+                        if (all_ok && total_used > 0) {
+                            if (mode != 0) bg_mean_col[r] = sum_bg / static_cast<double>(total_used);
+                        } else {
+                            std::fill(bg_ptr, bg_ptr + sz, 0.0f);
+                            for (std::size_t p = 0; p < sz; ++p) {
+                                m_ptr[p] &= m_not_used;
+                            }
+                            if (mode != 0) bg_mean_col[r] = 0.0;
+                            fl |= (dials::af::DontIntegrate | dials::af::FailedDuringBackgroundModelling);
+                        }
+                    }
+
+                    // Step E: Summation + Centroid + Post-mask counts
+                    double sum_p = 0.0, sum_b = 0.0;
+                    int64_t fg_cnt = 0, bg_cnt = 0;
+                    int32_t bad_cnt = 0;
+                    int nv_post = 0, nb_post = 0, nbu_post = 0;
+                    for (std::size_t p = 0; p < sz; ++p) {
+                        uint8_t m = m_ptr[p];
+                        if (m & Valid) {
+                            nv_post++;
+                            if (m & Background) {
+                                nb_post++;
+                                if (m & BackgroundUsed) nbu_post++;
+                            }
+                        }
+                        if (m & Foreground) {
+                            if (((m & m_fg_val) == m_fg_val) && ((m & m_ovlp) == 0)) {
+                                sum_p += static_cast<double>(d_ptr[p]);
+                                sum_b += static_cast<double>(bg_ptr[p]);
+                                fg_cnt++;
+                            } else {
+                                bad_cnt++;
+                            }
+                        } else if ((m & m_bg_used_val) == m_bg_used_val) {
+                            bg_cnt++;
+                        }
+                    }
+
+                    if (bad_cnt == 0) {
+                        fl |= dials::af::IntegratedSum;
+                    } else {
+                        fl |= dials::af::FailedDuringSummation;
+                    }
+
+                    if (mode != 0) {
+                        double m_ratio = (bg_cnt > 0) ? (static_cast<double>(fg_cnt) / static_cast<double>(bg_cnt)) : 0.0;
+                        double ival = sum_p - sum_b;
+                        double bg_v = std::abs(sum_b) * (1.0 + m_ratio);
+                        int_sum_val_col[r] = ival;
+                        int_sum_var_col[r] = std::abs(ival) + bg_v;
+                        bg_sum_val_col[r] = sum_b;
+                        bg_sum_var_col[r] = bg_v;
+                        nvalid_col[r] = nv_post;
+                        nbg_col[r] = nb_post;
+                        nbg_used_col[r] = nbu_post;
+
+                        // Centroid
+                        double bx = static_cast<double>(x0);
+                        double by = static_cast<double>(y0);
+                        double bz = static_cast<double>(z0);
+                        double cx = static_cast<double>(x1 + x0) * 0.5;
+                        double cy = static_cast<double>(y1 + y0) * 0.5;
+                        double cz = static_cast<double>(z1 + z0) * 0.5;
+                        double vx = 0.0, vy = 0.0, vz = 0.0;
+                        int64_t c_cnt = 0;
+                        double sum_w = 0.0, sum_wsq = 0.0, sum_wx = 0.0, sum_wy = 0.0, sum_wz = 0.0;
+                        for (int kz = 0; kz < nz; ++kz) {
+                            double zc = static_cast<double>(kz) + 0.5;
+                            for (int ky = 0; ky < ny; ++ky) {
+                                double yc = static_cast<double>(ky) + 0.5;
+                                std::size_t row_off = (static_cast<std::size_t>(kz) * static_cast<std::size_t>(ny) + static_cast<std::size_t>(ky)) * static_cast<std::size_t>(nx);
+                                for (int kx = 0; kx < nx; ++kx) {
+                                    uint8_t m = m_ptr[row_off + kx];
+                                    if (((m & m_fg_val) == m_fg_val) && ((m & m_ovlp) == 0)) {
+                                        double val = static_cast<double>(d_ptr[row_off + kx]) - static_cast<double>(bg_ptr[row_off + kx]);
+                                        if (val > 0.0) {
+                                            double xc = static_cast<double>(kx) + 0.5;
+                                            c_cnt++;
+                                            sum_w += val;
+                                            sum_wsq += val * val;
+                                            sum_wx += val * xc;
+                                            sum_wy += val * yc;
+                                            sum_wz += val * zc;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if (c_cnt > 0 && sum_w > 0.0) {
+                            double inv_w = 1.0 / sum_w;
+                            double mean_x = sum_wx * inv_w;
+                            double mean_y = sum_wy * inv_w;
+                            double mean_z = sum_wz * inv_w;
+                            cx = mean_x + bx;
+                            cy = mean_y + by;
+                            cz = mean_z + bz;
+                            double denom = (sum_w * sum_w) - sum_wsq;
+                            if (c_cnt > 1 && denom > 0.0) {
+                                double sum_wdx2 = 0.0, sum_wdy2 = 0.0, sum_wdz2 = 0.0;
+                                for (int kz = 0; kz < nz; ++kz) {
+                                    double dz = (static_cast<double>(kz) + 0.5) - mean_z;
+                                    double dz2 = dz * dz;
+                                    for (int ky = 0; ky < ny; ++ky) {
+                                        double dy = (static_cast<double>(ky) + 0.5) - mean_y;
+                                        double dy2 = dy * dy;
+                                        std::size_t row_off = (static_cast<std::size_t>(kz) * static_cast<std::size_t>(ny) + static_cast<std::size_t>(ky)) * static_cast<std::size_t>(nx);
+                                        for (int kx = 0; kx < nx; ++kx) {
+                                            uint8_t m = m_ptr[row_off + kx];
+                                            if (((m & m_fg_val) == m_fg_val) && ((m & m_ovlp) == 0)) {
+                                                double val = static_cast<double>(d_ptr[row_off + kx]) - static_cast<double>(bg_ptr[row_off + kx]);
+                                                if (val > 0.0) {
+                                                    double dx = (static_cast<double>(kx) + 0.5) - mean_x;
+                                                    sum_wdx2 += val * (dx * dx);
+                                                    sum_wdy2 += val * dy2;
+                                                    sum_wdz2 += val * dz2;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                double scale = 1.0 / denom;
+                                vx = sum_wdx2 * scale + half_sq;
+                                vy = sum_wdy2 * scale + half_sq;
+                                vz = sum_wdz2 * scale + half_sq;
+                            }
+                        }
+                        xyzobs_px_val_col[r] = vec3<double>(cx, cy, cz);
+                        xyzobs_px_var_col[r] = vec3<double>(vx, vy, vz);
+
+                        double mx = cx * px_size_x;
+                        double my = cy * px_size_y;
+                        if (px2mm_mode == 1) {
+                            vec3<double> s1_c = origin + mx * fast_axis + my * slow_axis;
+                            double slen = s1_c.length();
+                            if (slen > 0.0) {
+                                vec3<double> s1_n = s1_c * (1.0 / slen);
+                                double cos_t = s1_n * n_vec;
+                                if (mu > 0.0 && cos_t != 0.0) {
+                                    double inv_mu = 1.0 / mu;
+                                    double t0_over_cos_t = t0 / cos_t;
+                                    double atten_o = inv_mu - (t0_over_cos_t + inv_mu) * std::exp(-mu * t0_over_cos_t);
+                                    mx -= (s1_n * fast_axis) * atten_o;
+                                    my -= (s1_n * slow_axis) * atten_o;
+                                }
+                            }
+                        }
+                        double mz = (dphi == 0.0 && phi0 == 0.0) ? 0.0 : (phi0 + (cz - arr0) * dphi);
+                        xyzobs_mm_val_col[r] = vec3<double>(mx, my, mz);
+                        xyzobs_mm_var_col[r] = vec3<double>(vx * px_size_x2, vy * px_size_y2, vz * osc_w2);
+                    }
+
+                    // Step F: GaussianRS Transform / Profile Modelling / Profile Fitting
+                    if (self != nullptr) {
+                        if (mode == 0) {
+                            bool full = partiality_col[r] > 0.99;
+                            bool integrated = (fl & dials::af::IntegratedSum) != 0;
+                            bool bbox_valid = (x0 >= 0 && y0 >= 0 && x1 <= pinfo.img_w && y1 <= pinfo.img_h);
+                            if (full && integrated && bbox_valid && bad_cnt == 0) {
+                                try {
+                                    CoordinateSystem cs(m2, s0, s1_r, xyzcal_mm_col[r][2]);
+                                    run_transform_forward_raw(
+                                        panel, pinfo, scan_index0, phi0, dphi, sb, sm, ns, hgs,
+                                        cs, b, d_ptr, bg_ptr, m_ptr, false, false, sc.trans
+                                    );
+                                    if (sc.trans.has_fg_pixels) {
+                                        const double* prof_ptr = sc.trans.profile.data();
+                                        double sum_data = 0.0;
+                                        for (std::size_t p_i = 0; p_i < prof_elems; ++p_i) {
+                                            sum_data += prof_ptr[p_i];
+                                        }
+                                        if (sum_data > 0.0) {
+                                            double inv_sum = 1.0 / sum_data;
+                                            auto& loc_data = thread_data[static_cast<std::size_t>(tid)];
+                                            auto& loc_n = thread_n_refl[static_cast<std::size_t>(tid)];
+                                            dials::af::shared<std::size_t> indices = self->sampler_->nearest_n(p_idx, xyzcal_px_col[r]);
+                                            for (std::size_t j = 0; j < indices.size(); ++j) {
+                                                std::size_t idx = indices[j];
+                                                double w = self->sampler_->weight(idx, p_idx, xyzcal_px_col[r]) * inv_sum;
+                                                auto& vec = loc_data[idx];
+                                                if (vec.empty()) {
+                                                    vec.assign(prof_elems, 0.0);
+                                                }
+                                                for (std::size_t p_i = 0; p_i < prof_elems; ++p_i) {
+                                                    vec[p_i] += w * prof_ptr[p_i];
+                                                }
+                                                loc_n[idx]++;
+                                            }
+                                        }
+                                    }
+                                } catch (...) {}
+                            }
+                        } else if (mode == 1) {
+                            int_prf_val_col[r] = 0.0;
+                            int_prf_var_col[r] = -1.0;
+                            prf_corr_col[r] = 0.0;
+                            fl &= ~dials::af::IntegratedPrf;
+                            bool fit_ok = false;
+                            if (!(fl & dials::af::DontIntegrate)) {
+                                try {
+                                    std::size_t index = self->sampler_->nearest(p_idx, xyzcal_px_col[r]);
+                                    if (index < n_prof && prof_valid[index]) {
+                                        CoordinateSystem cs(m2, s0, s1_r, xyzcal_mm_col[r][2]);
+                                        run_transform_forward_raw(
+                                            panel, pinfo, scan_index0, phi0, dphi, sb, sm, ns, hgs,
+                                            cs, b, d_ptr, bg_ptr, m_ptr, true, false, sc.trans
+                                        );
+                                        if (sc.trans.n_valid_kk > 0 && sc.trans.has_fg_pixels) {
+                                            double fit_i = 0.0, fit_v = -1.0, fit_c = 0.0;
+                                            if (fit_1d_noexcept_slices(
+                                                    sc.trans.profile.data(),
+                                                    sc.trans.background.data(),
+                                                    false,
+                                                    prof_mask[index].begin(),
+                                                    sc.trans.valid_kk_list,
+                                                    sc.trans.n_valid_kk,
+                                                    g_stride_k,
+                                                    prof_data[index].begin(),
+                                                    g_vol,
+                                                    1e-3, 100, sc.trans,
+                                                    fit_i, fit_v, fit_c)) {
+                                                int_prf_val_col[r] = fit_i;
+                                                int_prf_var_col[r] = fit_v;
+                                                prf_corr_col[r] = fit_c;
+                                                fl |= dials::af::IntegratedPrf;
+                                                fit_ok = true;
+                                            }
+                                        }
+                                    }
+                                } catch (...) {}
+                            }
+                            if (!fit_ok) {
+                                fl |= dials::af::FailedDuringProfileFitting;
+                            }
+                        } else if (mode == 2 || mode == 3) {
+                            std::size_t store_idx = (mode == 2) ? r : static_cast<std::size_t>(i);
+                            active_store->was_processed[store_idx] = 1;
+                            bool do_fit = (fl & dials::af::DontIntegrate) == 0;
+                            bool is_ref = ((fl & dials::af::ReferenceSpot) != 0)
+                                          && (partiality_col[r] > 0.99)
+                                          && ((fl & dials::af::IntegratedSum) != 0)
+                                          && (x0 >= 0 && y0 >= 0 && x1 <= pinfo.img_w && y1 <= pinfo.img_h)
+                                          && (bad_cnt == 0);
+                            if (do_fit || is_ref) {
+                                try {
+                                    CoordinateSystem cs(m2, s0, s1_r, xyzcal_mm_col[r][2]);
+                                    run_transform_forward_raw(
+                                        panel, pinfo, scan_index0, phi0, dphi, sb, sm, ns, hgs,
+                                        cs, b, d_ptr, bg_ptr, m_ptr, true, is_ref, sc.trans
+                                    );
+                                    if (is_ref) {
+                                        if (mode == 3) {
+                                            fl |= dials::af::UsedInModelling;
+                                        }
+                                        if (sc.trans.has_fg_pixels) {
+                                            const double* net_ptr = sc.trans.net_profile.data();
+                                            double sum_data = 0.0;
+                                            for (std::size_t p_i = 0; p_i < prof_elems; ++p_i) {
+                                                sum_data += net_ptr[p_i];
+                                            }
+                                            if (sum_data > 0.0) {
+                                                double inv_sum = 1.0 / sum_data;
+                                                auto& loc_data = thread_data[static_cast<std::size_t>(tid)];
+                                                auto& loc_n = thread_n_refl[static_cast<std::size_t>(tid)];
+                                                dials::af::shared<std::size_t> indices = self->sampler_->nearest_n(p_idx, xyzcal_px_col[r]);
+                                                for (std::size_t j = 0; j < indices.size(); ++j) {
+                                                    std::size_t idx = indices[j];
+                                                    double w = self->sampler_->weight(idx, p_idx, xyzcal_px_col[r]) * inv_sum;
+                                                    auto& vec = loc_data[idx];
+                                                    if (vec.empty()) {
+                                                        vec.assign(prof_elems, 0.0);
+                                                    }
+                                                    for (std::size_t p_i = 0; p_i < prof_elems; ++p_i) {
+                                                        vec[p_i] += w * net_ptr[p_i];
+                                                    }
+                                                    loc_n[idx]++;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if (do_fit && sc.trans.has_fg_pixels && sc.trans.n_valid_kk > 0) {
+                                        auto& c_store = active_store->thread_c_slices[static_cast<std::size_t>(tid)];
+                                        auto& b_store = active_store->thread_b_slices[static_cast<std::size_t>(tid)];
+                                        uint32_t sl_off = static_cast<uint32_t>(c_store.size() / g_stride_k);
+                                        std::size_t add_elems = static_cast<std::size_t>(sc.trans.n_valid_kk) * g_stride_k;
+                                        std::size_t old_sz = c_store.size();
+                                        c_store.resize(old_sz + add_elems);
+                                        b_store.resize(old_sz + add_elems);
+                                        double* c_dst = c_store.data() + old_sz;
+                                        double* b_dst = b_store.data() + old_sz;
+                                        const double* prof_ptr = sc.trans.profile.data();
+                                        const double* bg_t_ptr = sc.trans.background.data();
+                                        for (int idx_kk = 0; idx_kk < sc.trans.n_valid_kk; ++idx_kk) {
+                                            std::size_t kk_off = static_cast<std::size_t>(sc.trans.valid_kk_list[idx_kk]) * g_stride_k;
+                                            std::memcpy(
+                                                c_dst + static_cast<std::size_t>(idx_kk) * g_stride_k,
+                                                prof_ptr + kk_off,
+                                                g_stride_k * sizeof(double)
+                                            );
+                                            std::memcpy(
+                                                b_dst + static_cast<std::size_t>(idx_kk) * g_stride_k,
+                                                bg_t_ptr + kk_off,
+                                                g_stride_k * sizeof(double)
+                                            );
+                                        }
+                                        active_store->valid_kk_mask[store_idx] = sc.trans.valid_kk_mask;
+                                        active_store->tid_of_r[store_idx] = static_cast<uint8_t>(tid);
+                                        active_store->slice_offset_of_r[store_idx] = sl_off;
+                                    }
+                                } catch (...) {}
+                            }
+                        }
+                    }
+
+                    if (mode != 0) {
+                        flags_col[r] = fl;
+                    }
+                }
+            }
+        };
+
+        std::vector<std::thread> pool;
+        pool.reserve(static_cast<std::size_t>(nt - 1));
+        for (int t = 1; t < nt; ++t) {
+            pool.emplace_back(worker, t);
+        }
+        worker(0);
+        for (auto& th : pool) {
+            th.join();
+        }
+
+        if (self != nullptr && (mode == 0 || mode == 2 || mode == 3)) {
+            for (std::size_t idx = 0; idx < n_prof; ++idx) {
+                std::size_t tot_n = 0;
+                for (int t = 0; t < nt; ++t) {
+                    tot_n += thread_n_refl[static_cast<std::size_t>(t)][idx];
+                }
+                if (tot_n == 0) continue;
+                if (self->data_[idx].size() == 0) {
+                    self->data_[idx] = data_type(self->accessor_, 0.0);
+                    self->mask_[idx] = mask_type(self->accessor_, true);
+                }
+                double* dst = self->data_[idx].begin();
+                for (int t = 0; t < nt; ++t) {
+                    const auto& vec = thread_data[static_cast<std::size_t>(t)][idx];
+                    if (!vec.empty()) {
+                        for (std::size_t p_i = 0; p_i < prof_elems; ++p_i) {
+                            dst[p_i] += vec[p_i];
+                        }
+                    }
+                }
+                self->n_reflections_[idx] += tot_n;
+            }
+        }
+
+        if (self != nullptr && mode == 3) {
+            std::size_t end_idx = std::min(prof_end, self->data_.size());
+            for (std::size_t idx = prof_begin; idx < end_idx; ++idx) {
+                if (self->data_[idx].size() != 0) {
+                    self->finalize(idx);
+                }
+            }
+            prof_data.resize(n_prof);
+            prof_mask.resize(n_prof);
+            prof_valid.assign(n_prof, 0);
+            for (std::size_t k = 0; k < n_prof; ++k) {
+                if (self->data_[k].size() != 0 && self->mask_[k].size() != 0) {
+                    prof_data[k] = self->data_[k].const_ref();
+                    prof_mask[k] = self->mask_[k].const_ref();
+                    prof_valid[k] = 1;
+                }
+            }
+            std::vector<ThreadTransformScratch> fit_scratch(MAX_WORKER_THREADS);
+            parallel_for(n, [&](std::int64_t i, int tid) {
+                std::size_t si = static_cast<std::size_t>(i);
+                if (!local_slab_store->was_processed[si]) {
+                    return;
+                }
+                std::size_t r = slab_ind[si];
+                int_prf_val_col[r] = 0.0;
+                int_prf_var_col[r] = -1.0;
+                prf_corr_col[r] = 0.0;
+                flags_col[r] &= ~dials::af::IntegratedPrf;
+                if (flags_col[r] & dials::af::DontIntegrate) {
+                    flags_col[r] |= dials::af::FailedDuringProfileFitting;
+                    return;
+                }
+                uint32_t vmask = local_slab_store->valid_kk_mask[si];
+                if (vmask == 0) {
+                    flags_col[r] |= dials::af::FailedDuringProfileFitting;
+                    return;
+                }
+                try {
+                    std::size_t index = self->sampler_->nearest(panel_col[r], xyzcal_px_col[r]);
+                    if (index >= n_prof || !prof_valid[index]) {
+                        flags_col[r] |= dials::af::FailedDuringProfileFitting;
+                        return;
+                    }
+                    data_const_reference p = prof_data[index];
+                    mask_const_reference mask1 = prof_mask[index];
+                    auto& scratch = fit_scratch[tid];
+                    int n_vkk = 0;
+                    for (int kk = 0; kk < static_cast<int>(g_dim); ++kk) {
+                        if (vmask & (1u << kk)) {
+                            scratch.valid_kk_list[n_vkk++] = kk;
+                        }
+                    }
+                    uint8_t src_tid = local_slab_store->tid_of_r[si];
+                    std::size_t byte_off = static_cast<std::size_t>(local_slab_store->slice_offset_of_r[si]) * g_stride_k;
+                    const double* c_compact = local_slab_store->thread_c_slices[src_tid].data() + byte_off;
+                    const double* b_compact = local_slab_store->thread_b_slices[src_tid].data() + byte_off;
+                    double fit_i = 0.0, fit_v = -1.0, fit_c = 0.0;
+                    if (fit_1d_noexcept_slices(
+                            c_compact, b_compact, true,
+                            mask1.begin(), scratch.valid_kk_list, n_vkk,
+                            g_stride_k, p.begin(), g_vol,
+                            1e-3, 100, scratch,
+                            fit_i, fit_v, fit_c)) {
+                        int_prf_val_col[r] = fit_i;
+                        int_prf_var_col[r] = fit_v;
+                        prf_corr_col[r] = fit_c;
+                        flags_col[r] |= dials::af::IntegratedPrf;
+                    } else {
+                        flags_col[r] |= dials::af::FailedDuringProfileFitting;
+                    }
+                } catch (...) {
+                    flags_col[r] |= dials::af::FailedDuringProfileFitting;
+                }
+            });
+        }
+    }
 };
+
+void integrate_slab_from_volume_fast(
+    boost::python::object fitter_obj,
+    const dials::af::const_ref<std::size_t>& slab_ind,
+    boost::python::tuple cols,
+    boost::python::tuple params)
+{
+    ParallelGaussianRS* grs_ptr = nullptr;
+    if (!fitter_obj.is_none()) {
+        dials::algorithms::MultiExpProfileModeller& fitter =
+            boost::python::extract<dials::algorithms::MultiExpProfileModeller&>(fitter_obj);
+        DIALS_ASSERT(fitter.size() == 1);
+        auto* grs = dynamic_cast<dials::algorithms::GaussianRSProfileModeller*>(fitter[0].get());
+        DIALS_ASSERT(grs != nullptr);
+        grs_ptr = static_cast<ParallelGaussianRS*>(grs);
+    }
+    ParallelGaussianRS::integrate_slab_from_volume_cols(grs_ptr, slab_ind, cols, params);
+}
 
 dials::af::shared<bool> parallel_model_and_fit_circular_slab(
     dials::algorithms::MultiExpProfileModeller& fitter,
@@ -4418,7 +5532,10 @@ BOOST_PYTHON_MODULE(_shoebox_pack_ext)
     def("extract_summation_totals", &dials_gpu::extract_summation_totals);
     def("compute_summation_fast", &dials_gpu::compute_summation_fast);
     def("extract_shoeboxes_from_volume", &dials_gpu::extract_shoeboxes_from_volume);
+    def("extract_shoeboxes_from_volume_typed", &dials_gpu::extract_shoeboxes_from_volume_typed);
     def("extract_wide_shoeboxes_slice_from_volume", &dials_gpu::extract_wide_shoeboxes_slice_from_volume);
+    def("extract_wide_shoeboxes_slice_from_volume_typed", &dials_gpu::extract_wide_shoeboxes_slice_from_volume_typed);
+    def("integrate_slab_from_volume_fast", &dials_gpu::integrate_slab_from_volume_fast);
     def("parallel_compute_mask", &dials_gpu::parallel_compute_mask);
     def("parallel_compute_mask_vec3", &dials_gpu::parallel_compute_mask_vec3);
     def("parallel_compute_mask_3d_fast", &dials_gpu::parallel_compute_mask_3d_fast);
